@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.20] - 2026-05-05
+
+X0X-0026..0029 multi-day daemon stability fixes consumed end-to-end. Aligns
+all 11 saorsa-gossip-* deps to v0.5.31 (workspace-lockstep bump that ships
+the X0X-0026 + X0X-0027 fixes in saorsa-gossip-pubsub).
+
+### Fixed
+
+- **`saorsa-gossip-pubsub 0.5.31` (X0X-0026)**: `/diagnostics/gossip`
+  `pubsub_stages.peer_scores` no longer observes an empty array during
+  membership/cache rebuild windows. `stage_stats` falls back to the last
+  complete peer_scores snapshot when the topics lock is contended;
+  `set_topic_peers` emits structured rebuild start/end logs.
+- **`saorsa-gossip-pubsub 0.5.31` (X0X-0027)**: cache cleaner sleeps on an
+  adaptive 10s..120s interval based on observed suppression-list growth.
+  Removes expired non-inflight suppression diagnostics + expired excluded
+  peer-cooling entries. New diagnostics: cleanup interval / growth /
+  current / removed counters in pubsub stage diagnostics.
+- **`x0x` daemon (X0X-0028)**: discoverable group-card cache TTL-pruned
+  and capped at 8192 cards across discovery/metadata/import/create/get/list
+  paths. Stale withdrawals no longer evict newer cards. Direct peer
+  diagnostics + lifecycle registries prune idle disconnected entries to a
+  peer-scaled bound (`MAX(1024, connected_len * 2)`) while always retaining
+  connected peers. 24h idle TTL on disconnected entries. Inline pruning;
+  no separate cleanup task.
+- **`x0x` daemon (X0X-0029)**: each `/direct/events` subscriber now has a
+  bounded drop-oldest queue (custom `DirectSubscriberQueue` with VecDeque +
+  Notify, capacity-bounded). Slow clients keep their stream open but lose
+  oldest buffered events under pressure. New `subscriber_events_evicted`
+  counter on `/diagnostics/dm`. Also: VPS test runner result queue is
+  bounded (1024) and prunes results older than 5 minutes before enqueueing.
+  `docs/local-apps.md` documents direct-event backpressure semantics.
+
 ### Changed
 
 - **`tests/launch_readiness.py` broad-launch gate**: replace the absolute

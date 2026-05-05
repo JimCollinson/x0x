@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import queue
 import sys
 import unittest
 from pathlib import Path
@@ -65,6 +66,35 @@ class X0xTestRunnerTests(unittest.TestCase):
             client.unsubscribed,
         )
         self.assertNotEqual(first_ids, runner._subscription_ids)
+
+    def test_result_queue_drops_oldest_when_full(self) -> None:
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner("nyc", client)
+        runner._send_q = queue.Queue(maxsize=2)
+
+        runner._enqueue_result({"kind": "send_result", "request_id": "old"})
+        runner._enqueue_result({"kind": "send_result", "request_id": "middle"})
+        runner._enqueue_result({"kind": "send_result", "request_id": "new"})
+
+        queued = [runner._send_q.get_nowait()[0]["request_id"] for _ in range(2)]
+        self.assertEqual(["middle", "new"], queued)
+
+    def test_result_queue_prunes_stale_entries(self) -> None:
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner("nyc", client)
+        runner._send_q = queue.Queue(maxsize=4)
+        stale_ts = (
+            self.runner_mod.now_ms()
+            - ((self.runner_mod.RESULT_QUEUE_MAX_AGE_SECS + 1) * 1000)
+        )
+        runner._send_q.put_nowait(
+            ({"kind": "send_result", "request_id": "stale", "ts_ms": stale_ts}, None)
+        )
+
+        runner._enqueue_result({"kind": "send_result", "request_id": "fresh"})
+
+        queued = [runner._send_q.get_nowait()[0]["request_id"]]
+        self.assertEqual(["fresh"], queued)
 
 
 if __name__ == "__main__":

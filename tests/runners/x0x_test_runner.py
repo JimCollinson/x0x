@@ -71,6 +71,8 @@ TEST_DM_RETRY_MAX = 3
 # trades ~100-500 ms of extra latency for resilience to mid-session
 # QUIC churn.
 RESULT_DM_ACK_MS: Optional[int] = None
+RESULT_QUEUE_MAX = 1024
+RESULT_QUEUE_MAX_AGE_SECS = 300
 
 
 def now_ms() -> int:
@@ -257,7 +259,7 @@ class TestRunner:
         # (last-resort fallback for orchestrators that don't include
         # an anchor address).
         self._send_q: "queue.Queue[Tuple[Dict[str, Any], Optional[str]]]" = (
-            queue.Queue()
+            queue.Queue(maxsize=RESULT_QUEUE_MAX)
         )
         self._agent_id: Optional[str] = None
         self._machine_id: Optional[str] = None
@@ -442,7 +444,63 @@ class TestRunner:
         body.setdefault("agent_id", self._agent_id)
         body.setdefault("machine_id", self._machine_id)
         body.setdefault("ts_ms", now_ms())
-        self._send_q.put((body, target_aid))
+        current_ms = body.get("ts_ms")
+        if not isinstance(current_ms, int):
+            current_ms = now_ms()
+            body["ts_ms"] = current_ms
+        self._prune_stale_results(current_ms)
+        item = (body, target_aid)
+        try:
+            self._send_q.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        try:
+            dropped, _ = self._send_q.get_nowait()
+            self.log.warning(
+                "dropping oldest queued result after result buffer filled: "
+                "kind=%s request_id=%s",
+                dropped.get("kind"),
+                dropped.get("request_id"),
+            )
+        except queue.Empty:
+            pass
+        try:
+            self._send_q.put_nowait(item)
+        except queue.Full:
+            self.log.error(
+                "dropping current result because result buffer remained full: "
+                "kind=%s request_id=%s",
+                body.get("kind"),
+                body.get("request_id"),
+            )
+
+    def _prune_stale_results(self, now_ms_value: int) -> None:
+        cutoff_ms = now_ms_value - (RESULT_QUEUE_MAX_AGE_SECS * 1000)
+        kept = []
+        dropped = 0
+        while True:
+            try:
+                item = self._send_q.get_nowait()
+            except queue.Empty:
+                break
+            envelope, _ = item
+            ts_ms = envelope.get("ts_ms")
+            if isinstance(ts_ms, int) and ts_ms < cutoff_ms:
+                dropped += 1
+            else:
+                kept.append(item)
+        for item in kept:
+            try:
+                self._send_q.put_nowait(item)
+            except queue.Full:
+                dropped += 1
+        if dropped:
+            self.log.warning(
+                "dropped %d stale queued results older than %ds",
+                dropped,
+                RESULT_QUEUE_MAX_AGE_SECS,
+            )
 
     # ─── control-topic listener ────────────────────────────────────────
     def _control_listener_loop(self) -> None:

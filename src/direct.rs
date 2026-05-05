@@ -61,11 +61,11 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, MachineId};
 use crate::trust::TrustDecision;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 
 /// Stream type byte for direct messages (distinct from gossip: 0, 1, 2).
 pub const DIRECT_MESSAGE_STREAM_TYPE: u8 = 0x10;
@@ -197,44 +197,122 @@ pub fn dm_payload_digest_hex(bytes: &[u8]) -> String {
     hex[..16].to_string()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectSubscriberPush {
+    Delivered,
+    DeliveredWithEviction,
+    Closed,
+}
+
+#[derive(Debug)]
+struct DirectSubscriberQueue {
+    queue: Mutex<VecDeque<DirectMessage>>,
+    notify: Notify,
+    closed: AtomicBool,
+    capacity: usize,
+}
+
+impl DirectSubscriberQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            queue: Mutex::new(VecDeque::with_capacity(capacity)),
+            notify: Notify::new(),
+            closed: AtomicBool::new(false),
+            capacity,
+        }
+    }
+
+    fn push_drop_oldest(&self, msg: DirectMessage) -> DirectSubscriberPush {
+        if self.closed.load(Ordering::Relaxed) {
+            return DirectSubscriberPush::Closed;
+        }
+        let mut queue = match self.queue.lock() {
+            Ok(queue) => queue,
+            Err(e) => {
+                tracing::error!("direct subscriber queue poisoned: {e}");
+                return DirectSubscriberPush::Closed;
+            }
+        };
+        if self.closed.load(Ordering::Relaxed) {
+            return DirectSubscriberPush::Closed;
+        }
+        let evicted = if queue.len() >= self.capacity {
+            queue.pop_front();
+            true
+        } else {
+            false
+        };
+        queue.push_back(msg);
+        drop(queue);
+        self.notify.notify_one();
+        if evicted {
+            DirectSubscriberPush::DeliveredWithEviction
+        } else {
+            DirectSubscriberPush::Delivered
+        }
+    }
+
+    fn pop_front(&self) -> Option<DirectMessage> {
+        match self.queue.lock() {
+            Ok(mut queue) => queue.pop_front(),
+            Err(e) => {
+                tracing::error!("direct subscriber queue poisoned: {e}");
+                None
+            }
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self.notify.notify_waiters();
+    }
+}
+
 /// Receiver for direct messages.
 ///
-/// Each receiver owns an independent bounded mpsc queue. Cloning a receiver
+/// Each receiver owns an independent bounded queue. Cloning a receiver
 /// creates a fresh subscription rather than sharing cursor state, preserving
 /// the old broadcast-style "every subscriber sees every future message"
-/// semantics without tokio broadcast's global lag/drop behaviour.
+/// semantics without tokio broadcast's global lag/drop behaviour. A slow
+/// receiver keeps its stream open, but its oldest buffered direct events are
+/// evicted once the queue reaches capacity.
 #[derive(Debug)]
 pub struct DirectMessageReceiver {
     id: Option<u64>,
-    rx: mpsc::Receiver<DirectMessage>,
-    subscribers: Arc<Mutex<HashMap<u64, mpsc::Sender<DirectMessage>>>>,
+    queue: Arc<DirectSubscriberQueue>,
+    subscribers: Arc<Mutex<HashMap<u64, Arc<DirectSubscriberQueue>>>>,
     next_subscriber_id: Arc<AtomicU64>,
     capacity: usize,
 }
 
 impl DirectMessageReceiver {
     /// Create and register a new receiver in the shared subscriber registry.
-    pub(crate) fn new(
-        subscribers: Arc<Mutex<HashMap<u64, mpsc::Sender<DirectMessage>>>>,
+    fn new(
+        subscribers: Arc<Mutex<HashMap<u64, Arc<DirectSubscriberQueue>>>>,
         next_subscriber_id: Arc<AtomicU64>,
         capacity: usize,
     ) -> Self {
-        let (tx, rx) = mpsc::channel(capacity);
+        let queue = Arc::new(DirectSubscriberQueue::new(capacity));
         let id = next_subscriber_id.fetch_add(1, Ordering::Relaxed);
         let registered = match subscribers.lock() {
             Ok(mut guard) => {
-                guard.insert(id, tx);
+                guard.insert(id, Arc::clone(&queue));
                 Some(id)
             }
             Err(e) => {
                 tracing::error!("direct subscriber registry poisoned: {e}");
+                queue.close();
                 None
             }
         };
 
         Self {
             id: registered,
-            rx,
+            queue,
             subscribers,
             next_subscriber_id,
             capacity,
@@ -246,14 +324,23 @@ impl DirectMessageReceiver {
     /// Returns `None` if this subscriber was dropped because it fell behind,
     /// the daemon is shutting down, or the channel closed.
     pub async fn recv(&mut self) -> Option<DirectMessage> {
-        self.rx.recv().await
+        loop {
+            let notified = self.queue.notify.notified();
+            if let Some(msg) = self.queue.pop_front() {
+                return Some(msg);
+            }
+            if self.queue.is_closed() {
+                return None;
+            }
+            notified.await;
+        }
     }
 
     /// Try to receive a message without blocking.
     ///
     /// Returns `None` if no message is available or channel is closed.
     pub fn try_recv(&mut self) -> Option<DirectMessage> {
-        self.rx.try_recv().ok()
+        self.queue.pop_front()
     }
 }
 
@@ -278,6 +365,7 @@ impl Drop for DirectMessageReceiver {
             }
             Err(e) => tracing::error!("direct subscriber registry poisoned on drop: {e}"),
         }
+        self.queue.close();
     }
 }
 
@@ -295,6 +383,7 @@ struct DirectDiagnosticsCounters {
     incoming_trust_rejected: AtomicU64,
     incoming_delivered_to_subscribe: AtomicU64,
     subscriber_channel_lagged: AtomicU64,
+    subscriber_events_evicted: AtomicU64,
     subscriber_channel_closed: AtomicU64,
 }
 
@@ -329,6 +418,9 @@ pub struct DmDiagnosticsStats {
     pub incoming_signature_failed: u64,
     pub incoming_trust_rejected: u64,
     pub incoming_delivered_to_subscribe: u64,
+    /// Number of oldest buffered events evicted from slow subscriber queues.
+    pub subscriber_events_evicted: u64,
+    /// Backward-compatible alias for slow-subscriber pressure events.
     pub subscriber_channel_lagged: u64,
     pub subscriber_channel_closed: u64,
 }
@@ -368,7 +460,7 @@ pub struct DirectMessaging {
     connected_agents: Arc<RwLock<HashMap<AgentId, MachineId>>>,
 
     /// Per-subscriber queues for received direct messages.
-    subscribers: Arc<Mutex<HashMap<u64, mpsc::Sender<DirectMessage>>>>,
+    subscribers: Arc<Mutex<HashMap<u64, Arc<DirectSubscriberQueue>>>>,
 
     /// Monotonic id source for subscriber queues.
     next_subscriber_id: Arc<AtomicU64>,
@@ -396,19 +488,23 @@ impl DirectMessaging {
     /// Create a new DirectMessaging instance.
     #[must_use]
     pub fn new() -> Self {
-        // Each subscribe_direct() caller now gets an independent queue. This
-        // preserves fan-out semantics without tokio::sync::broadcast's
-        // behaviour of making a lagging receiver skip old messages. If a
-        // subscriber fills its own queue we drop that subscriber explicitly and
-        // count it in diagnostics instead of silently dropping messages for it.
-        let (internal_tx, internal_rx) = mpsc::channel(DIRECT_SUBSCRIBER_BUFFER);
+        Self::with_subscriber_capacity(DIRECT_SUBSCRIBER_BUFFER)
+    }
+
+    fn with_subscriber_capacity(subscriber_capacity: usize) -> Self {
+        let subscriber_capacity = subscriber_capacity.max(1);
+        // Each subscribe_direct() caller gets an independent queue. This
+        // preserves fan-out semantics without tokio::sync::broadcast's global
+        // lag/drop behaviour. If a subscriber fills its own queue, the oldest
+        // buffered event in that subscriber queue is evicted and counted.
+        let (internal_tx, internal_rx) = mpsc::channel(subscriber_capacity);
 
         Self {
             machine_to_agent: Arc::new(RwLock::new(HashMap::new())),
             connected_agents: Arc::new(RwLock::new(HashMap::new())),
             subscribers: Arc::new(Mutex::new(HashMap::new())),
             next_subscriber_id: Arc::new(AtomicU64::new(1)),
-            subscriber_capacity: DIRECT_SUBSCRIBER_BUFFER,
+            subscriber_capacity,
             diagnostics: Arc::new(DirectDiagnosticsCounters::default()),
             peer_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
@@ -676,6 +772,10 @@ impl DirectMessaging {
                 .diagnostics
                 .subscriber_channel_lagged
                 .load(Ordering::Relaxed),
+            subscriber_events_evicted: self
+                .diagnostics
+                .subscriber_events_evicted
+                .load(Ordering::Relaxed),
             subscriber_channel_closed: self
                 .diagnostics
                 .subscriber_channel_closed
@@ -747,9 +847,9 @@ impl DirectMessaging {
     /// caller based on the identity discovery cache and contact store.
     ///
     /// Returns the number of subscribers that successfully received the
-    /// message. Subscribers whose queues were full or closed are removed
-    /// from the registry and counted in [`DmDiagnosticsStats`] but do not
-    /// contribute to the returned count.
+    /// message. Slow subscribers keep their streams open, but when a queue
+    /// is full the oldest event in that subscriber's queue is evicted and
+    /// counted in [`DmDiagnosticsStats`].
     pub async fn handle_incoming(
         &self,
         machine_id: MachineId,
@@ -778,18 +878,26 @@ impl DirectMessaging {
         let subscribers = self.subscriber_snapshot();
         let mut delivered = 0_u64;
         let mut remove_ids = Vec::new();
-        for (id, tx) in subscribers {
-            match tx.try_send(msg.clone()) {
-                Ok(()) => {
+        for (id, queue) in subscribers {
+            match queue.push_drop_oldest(msg.clone()) {
+                DirectSubscriberPush::Delivered => {
                     delivered = delivered.saturating_add(1);
                 }
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                DirectSubscriberPush::DeliveredWithEviction => {
                     self.diagnostics
                         .subscriber_channel_lagged
                         .fetch_add(1, Ordering::Relaxed);
-                    remove_ids.push(id);
+                    self.diagnostics
+                        .subscriber_events_evicted
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(
+                        subscriber_id = id,
+                        capacity = self.subscriber_capacity,
+                        "direct subscriber queue full; evicted oldest buffered event"
+                    );
+                    delivered = delivered.saturating_add(1);
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                DirectSubscriberPush::Closed => {
                     self.diagnostics
                         .subscriber_channel_closed
                         .fetch_add(1, Ordering::Relaxed);
@@ -852,7 +960,7 @@ impl DirectMessaging {
         }
     }
 
-    fn subscriber_snapshot(&self) -> Vec<(u64, mpsc::Sender<DirectMessage>)> {
+    fn subscriber_snapshot(&self) -> Vec<(u64, Arc<DirectSubscriberQueue>)> {
         match self.subscribers.lock() {
             Ok(guard) => guard.iter().map(|(id, tx)| (*id, tx.clone())).collect(),
             Err(e) => {
@@ -1061,20 +1169,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lagging_subscriber_is_dropped_not_global_broadcast_lag() {
-        let dm = DirectMessaging::new();
-        let _lagging_rx = dm.subscribe();
+    async fn dm_subscriber_bounded_drop_oldest_keeps_stream_alive() {
+        let dm = DirectMessaging::with_subscriber_capacity(2);
+        let mut lagging_rx = dm.subscribe();
         let sender = AgentId([5u8; 32]);
         let machine_id = MachineId([6u8; 32]);
 
-        for idx in 0..=DIRECT_SUBSCRIBER_BUFFER {
+        for idx in 0_u64..=2 {
             dm.handle_incoming(machine_id, sender, idx.to_be_bytes().to_vec(), true, None)
                 .await;
         }
 
         let snap = dm.diagnostics_snapshot();
         assert_eq!(snap.stats.subscriber_channel_lagged, 1);
-        assert_eq!(snap.subscriber_count, 0);
+        assert_eq!(snap.stats.subscriber_events_evicted, 1);
+        assert_eq!(snap.subscriber_count, 1);
+
+        let first = lagging_rx.recv().await.unwrap();
+        assert_eq!(first.payload, 1_u64.to_be_bytes().to_vec());
+        let second = lagging_rx.recv().await.unwrap();
+        assert_eq!(second.payload, 2_u64.to_be_bytes().to_vec());
     }
 
     #[test]

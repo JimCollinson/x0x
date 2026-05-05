@@ -176,6 +176,18 @@ Full API reference: [api-reference.md](api-reference.md)
 
 Use `x0x routes` to print all endpoints from a running daemon.
 
+## Direct Event Backpressure
+
+Each `/direct/events` client gets its own bounded event queue. If a client stops
+reading or falls behind, x0xd keeps the stream alive but evicts the oldest
+buffered direct-message events for that client. Newer events continue to arrive,
+and `/diagnostics/dm` exposes `stats.subscriber_events_evicted` so local apps can
+detect that they missed older events.
+
+Applications that need durable processing should persist their own cursor or
+acknowledgement state. The daemon's direct-event stream is a live delivery
+surface, not an unbounded durable inbox.
+
 ## Named Instances
 
 One daemon is the recommended setup. Named instances exist for development and advanced use cases (pseudonymous personas):

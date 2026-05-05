@@ -451,6 +451,147 @@ struct AppState {
     groups_diagnostics: Arc<x0x::groups::GroupsDiagnostics>,
 }
 
+/// Hard upper bound for the discoverable group-card bridge cache. This cache
+/// is populated from untrusted discovery surfaces, so it must not grow without
+/// bound even if every incoming card is syntactically valid.
+const GROUP_CARD_CACHE_CAP: usize = 8_192;
+
+fn group_card_expiry_millis(card: &x0x::groups::GroupCard) -> u64 {
+    if card.expires_at > card.issued_at {
+        card.expires_at
+    } else {
+        card.issued_at
+            .saturating_add(x0x::groups::GroupCard::default_ttl_secs().saturating_mul(1_000))
+    }
+}
+
+fn group_card_is_expired(card: &x0x::groups::GroupCard, now_ms: u64) -> bool {
+    group_card_expiry_millis(card) < now_ms
+}
+
+fn prune_expired_group_cards(cache: &mut HashMap<String, x0x::groups::GroupCard>, now_ms: u64) {
+    cache.retain(|_, card| !group_card_is_expired(card, now_ms));
+}
+
+fn enforce_group_card_cache_cap(cache: &mut HashMap<String, x0x::groups::GroupCard>) {
+    if cache.len() <= GROUP_CARD_CACHE_CAP {
+        return;
+    }
+
+    let remove_count = cache.len().saturating_sub(GROUP_CARD_CACHE_CAP);
+    let mut victims: Vec<(String, u64, u64, u64)> = cache
+        .iter()
+        .map(|(key, card)| {
+            (
+                key.clone(),
+                group_card_expiry_millis(card),
+                card.issued_at,
+                card.revision,
+            )
+        })
+        .collect();
+    victims.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    for (key, _, _, _) in victims.into_iter().take(remove_count) {
+        cache.remove(&key);
+    }
+}
+
+fn prune_and_bound_group_card_cache(
+    cache: &mut HashMap<String, x0x::groups::GroupCard>,
+    now_ms: u64,
+) {
+    prune_expired_group_cards(cache, now_ms);
+    enforce_group_card_cache_cap(cache);
+}
+
+fn cache_group_card_if_newer(
+    cache: &mut HashMap<String, x0x::groups::GroupCard>,
+    key: String,
+    card: x0x::groups::GroupCard,
+) -> bool {
+    let should_insert = match cache.get(&key) {
+        Some(existing) => card.supersedes(existing),
+        None => true,
+    };
+    if should_insert {
+        cache.insert(key, card);
+    }
+    should_insert
+}
+
+fn remove_group_card_if_not_stale(
+    cache: &mut HashMap<String, x0x::groups::GroupCard>,
+    card: &x0x::groups::GroupCard,
+) -> bool {
+    let should_remove = match cache.get(&card.group_id) {
+        Some(existing) => {
+            card.revision > existing.revision
+                || (card.revision == existing.revision && card.issued_at >= existing.issued_at)
+        }
+        None => false,
+    };
+    if should_remove {
+        cache.remove(&card.group_id);
+    }
+    should_remove
+}
+
+fn group_card_supersedes_group_info(
+    card: &x0x::groups::GroupCard,
+    info: &x0x::groups::GroupInfo,
+) -> bool {
+    card.revision > info.state_revision
+        || (card.revision == info.state_revision && card.updated_at >= info.updated_at)
+}
+
+fn apply_withdrawn_group_card_to_group_info(
+    info: &mut x0x::groups::GroupInfo,
+    card: &x0x::groups::GroupCard,
+) -> bool {
+    if !card.withdrawn || !group_card_supersedes_group_info(card, info) {
+        return false;
+    }
+
+    info.name = card.name.clone();
+    info.description = card.description.clone();
+    info.policy = x0x::groups::GroupPolicy::from(&card.policy_summary);
+    info.created_at = card.created_at;
+    info.updated_at = card.updated_at;
+    if let Some(metadata_topic) = card.metadata_topic.clone() {
+        info.metadata_topic = metadata_topic;
+    }
+    info.state_revision = card.revision;
+    if !card.state_hash.is_empty() {
+        info.state_hash = card.state_hash.clone();
+    }
+    info.prev_state_hash = card.prev_state_hash.clone();
+    info.withdrawn = true;
+    if info
+        .genesis
+        .as_ref()
+        .is_none_or(|genesis| genesis.group_id != card.group_id)
+    {
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            card.group_id.clone(),
+            card.owner_agent_id.clone(),
+            card.created_at,
+            String::new(),
+        ));
+    }
+    info.members_v2
+        .entry(card.owner_agent_id.clone())
+        .or_insert_with(|| {
+            x0x::groups::GroupMember::new_owner(card.owner_agent_id.clone(), None, card.created_at)
+        });
+    true
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket types
 // ---------------------------------------------------------------------------
@@ -5487,16 +5628,8 @@ async fn spawn_global_discovery_listener(state: Arc<AppState>) {
                         // authority).
                         if card.withdrawn {
                             let mut cache = state.group_card_cache.write().await;
-                            let should_evict = cache
-                                .get(&card.group_id)
-                                .map(|existing| {
-                                    card.revision > existing.revision
-                                        || (card.revision == existing.revision
-                                            && card.issued_at >= existing.issued_at)
-                                })
-                                .unwrap_or(true);
-                            if should_evict {
-                                cache.remove(&card.group_id);
+                            prune_expired_group_cards(&mut cache, now_millis_u64());
+                            if remove_group_card_if_not_stale(&mut cache, &card) {
                                 tracing::info!(
                                     group_id = %card.group_id,
                                     revision = card.revision,
@@ -5519,10 +5652,12 @@ async fn spawn_global_discovery_listener(state: Arc<AppState>) {
                         // immediately (independent of TTL). On ties, higher
                         // issued_at wins.
                         let mut cache = state.group_card_cache.write().await;
-                        let should_insert = match cache.get(&card.group_id) {
-                            Some(existing) => card.supersedes(existing),
-                            None => true,
-                        };
+                        prune_expired_group_cards(&mut cache, now_millis_u64());
+                        let should_insert = cache_group_card_if_newer(
+                            &mut cache,
+                            card.group_id.clone(),
+                            card.clone(),
+                        );
                         if should_insert {
                             tracing::info!(
                                 group_id = %card.group_id,
@@ -5531,7 +5666,7 @@ async fn spawn_global_discovery_listener(state: Arc<AppState>) {
                                 "D.3: caching discovered group card (signed={})",
                                 !card.signature.is_empty()
                             );
-                            cache.insert(card.group_id.clone(), card);
+                            enforce_group_card_cache_cap(&mut cache);
                         } else {
                             tracing::debug!(
                                 group_id = %card.group_id,
@@ -5786,11 +5921,12 @@ async fn handle_directory_message(
                     && card.policy_summary.discoverability
                         != x0x::groups::GroupDiscoverability::Hidden
                 {
-                    state
-                        .group_card_cache
-                        .write()
-                        .await
-                        .insert(card.group_id.clone(), (*card).clone());
+                    let mut cache = state.group_card_cache.write().await;
+                    prune_expired_group_cards(&mut cache, now_millis_u64());
+                    if cache_group_card_if_newer(&mut cache, card.group_id.clone(), (*card).clone())
+                    {
+                        enforce_group_card_cache_cap(&mut cache);
+                    }
                 }
                 tracing::info!(
                     group_id = %card.group_id,
@@ -5977,18 +6113,20 @@ async fn spawn_listed_to_contacts_listener(state: Arc<AppState>) {
                         continue;
                     }
                     if card.withdrawn {
-                        state.group_card_cache.write().await.remove(&card.group_id);
-                        tracing::info!(
-                            group_id = %card.group_id,
-                            "C.2/LTC: evicted withdrawn card from contact cache"
-                        );
+                        let mut cache = state.group_card_cache.write().await;
+                        prune_expired_group_cards(&mut cache, now_millis_u64());
+                        if remove_group_card_if_not_stale(&mut cache, &card) {
+                            tracing::info!(
+                                group_id = %card.group_id,
+                                "C.2/LTC: evicted withdrawn card from contact cache"
+                            );
+                        }
                         continue;
                     }
                     let mut cache = state.group_card_cache.write().await;
-                    let insert = match cache.get(&card.group_id) {
-                        Some(existing) => card.supersedes(existing),
-                        None => true,
-                    };
+                    prune_expired_group_cards(&mut cache, now_millis_u64());
+                    let insert =
+                        cache_group_card_if_newer(&mut cache, card.group_id.clone(), card.clone());
                     if insert {
                         tracing::info!(
                             group_id = %card.group_id,
@@ -5996,7 +6134,7 @@ async fn spawn_listed_to_contacts_listener(state: Arc<AppState>) {
                             revision = card.revision,
                             "C.2/LTC: cached ListedToContacts card from contact"
                         );
-                        cache.insert(card.group_id.clone(), card);
+                        enforce_group_card_cache_cap(&mut cache);
                     }
                 }
             }
@@ -6109,11 +6247,14 @@ async fn refresh_group_card_cache_from_info(
     info: &x0x::groups::GroupInfo,
 ) {
     let mut cache = state.group_card_cache.write().await;
+    let now_ms = now_millis_u64();
+    prune_expired_group_cards(&mut cache, now_ms);
     let stable_key = info.stable_group_id().to_string();
     match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
         Ok(Some(card)) => {
-            cache.insert(key.to_string(), card.clone());
-            cache.insert(stable_key, card);
+            cache_group_card_if_newer(&mut cache, key.to_string(), card.clone());
+            cache_group_card_if_newer(&mut cache, stable_key, card);
+            enforce_group_card_cache_cap(&mut cache);
         }
         Ok(None) => {
             cache.remove(key);
@@ -6140,11 +6281,14 @@ async fn maybe_publish_group_card_after_state_change(state: &AppState, group_id:
             publish_group_card_to_discovery(state, group_id).await;
         } else {
             let mut cache = state.group_card_cache.write().await;
+            prune_expired_group_cards(&mut cache, now_millis_u64());
             cache.remove(group_id);
             cache.remove(info.stable_group_id());
         }
     } else {
-        state.group_card_cache.write().await.remove(group_id);
+        let mut cache = state.group_card_cache.write().await;
+        prune_expired_group_cards(&mut cache, now_millis_u64());
+        cache.remove(group_id);
     }
 }
 
@@ -6739,11 +6883,19 @@ async fn apply_named_group_metadata_event(
             if sender_hex != creator_hex {
                 return false;
             }
-            state
-                .group_card_cache
-                .write()
-                .await
-                .insert(card.group_id.clone(), card);
+            if card.group_id != info.stable_group_id() {
+                return false;
+            }
+            if !card.signature.is_empty() && card.verify_signature().is_err() {
+                return false;
+            }
+            let mut cache = state.group_card_cache.write().await;
+            prune_expired_group_cards(&mut cache, now_millis_u64());
+            if card.withdrawn {
+                remove_group_card_if_not_stale(&mut cache, &card);
+            } else if cache_group_card_if_newer(&mut cache, card.group_id.clone(), card) {
+                enforce_group_card_cache_cap(&mut cache);
+            }
             false
         }
         NamedGroupMetadataEvent::GroupMetadataUpdated {
@@ -7283,8 +7435,10 @@ async fn create_named_group(
                     Ok(Some(card)) => {
                         let stable_group_id = info.stable_group_id().to_string();
                         let mut cache = state.group_card_cache.write().await;
-                        cache.insert(group_id_hex.clone(), card.clone());
-                        cache.insert(stable_group_id, card);
+                        prune_expired_group_cards(&mut cache, now_millis_u64());
+                        cache_group_card_if_newer(&mut cache, group_id_hex.clone(), card.clone());
+                        cache_group_card_if_newer(&mut cache, stable_group_id, card);
+                        enforce_group_card_cache_cap(&mut cache);
                         drop(cache);
                         let state_for_card = Arc::clone(&state);
                         let group_id_for_card = group_id_hex.clone();
@@ -8693,7 +8847,9 @@ async fn leave_group(
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     state.named_groups.write().await.remove(&id);
-    state.group_card_cache.write().await.remove(&id);
+    let mut cache = state.group_card_cache.write().await;
+    prune_expired_group_cards(&mut cache, now_millis_u64());
+    cache.remove(&id);
     state.mls_groups.write().await.remove(&id);
     save_named_groups(&state).await;
     save_mls_groups(&state).await;
@@ -9688,7 +9844,8 @@ async fn discover_groups(
     // not by the cache's internal key. The cache may legitimately contain
     // the same signed card under both the local MLS id and the stable group id.
     {
-        let card_cache = state.group_card_cache.read().await;
+        let mut card_cache = state.group_card_cache.write().await;
+        prune_and_bound_group_card_cache(&mut card_cache, now_millis_u64());
         for card in card_cache.values() {
             merge_card(card);
         }
@@ -9890,7 +10047,8 @@ async fn get_group_card(
 ) -> impl IntoResponse {
     // Prefer cached card; fall back to synthesising from a locally-owned group.
     {
-        let cache = state.group_card_cache.read().await;
+        let mut cache = state.group_card_cache.write().await;
+        prune_and_bound_group_card_cache(&mut cache, now_millis_u64());
         if let Some(card) = cache.get(&id) {
             return Json(serde_json::to_value(card).unwrap_or(serde_json::Value::Null))
                 .into_response();
@@ -9945,6 +10103,27 @@ async fn import_group_card(
     }
     let group_id = card.group_id.clone();
 
+    if card.withdrawn {
+        let mut cache = state.group_card_cache.write().await;
+        prune_expired_group_cards(&mut cache, now_millis_u64());
+        remove_group_card_if_not_stale(&mut cache, &card);
+        drop(cache);
+
+        let mut groups = state.named_groups.write().await;
+        let marked_withdrawn = groups
+            .get_mut(&group_id)
+            .map(|info| apply_withdrawn_group_card_to_group_info(info, &card))
+            .unwrap_or(false);
+        drop(groups);
+        if marked_withdrawn {
+            save_named_groups(&state).await;
+        }
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "group_id": group_id, "withdrawn": true })),
+        );
+    }
+
     // Parse owner hex into an AgentId for the stub.
     let creator = match parse_agent_id_hex(&card.owner_agent_id) {
         Ok(id) => id,
@@ -9959,11 +10138,13 @@ async fn import_group_card(
     // Full policy is reconstructed from the card summary — all five axes round-trip.
     let policy = x0x::groups::GroupPolicy::from(&card.policy_summary);
 
-    state
-        .group_card_cache
-        .write()
-        .await
-        .insert(group_id.clone(), card.clone());
+    {
+        let mut cache = state.group_card_cache.write().await;
+        prune_expired_group_cards(&mut cache, now_millis_u64());
+        if cache_group_card_if_newer(&mut cache, group_id.clone(), card.clone()) {
+            enforce_group_card_cache_cap(&mut cache);
+        }
+    }
 
     // Create or refresh a local stub GroupInfo keyed by the authority's
     // stable group id from the card.
@@ -14042,10 +14223,156 @@ mod tests {
         x0x::upgrade::manifest::encode_signed_manifest(&manifest_json, b"test-signature")
     }
 
+    fn sample_group_card(group_id: &str, revision: u64, issued_at: u64) -> x0x::groups::GroupCard {
+        x0x::groups::GroupCard {
+            group_id: group_id.to_string(),
+            name: format!("Group {group_id}"),
+            description: String::new(),
+            avatar_url: None,
+            banner_url: None,
+            tags: Vec::new(),
+            policy_summary: x0x::groups::GroupPolicySummary {
+                discoverability: x0x::groups::GroupDiscoverability::PublicDirectory,
+                admission: x0x::groups::GroupAdmission::RequestAccess,
+                confidentiality: x0x::groups::GroupConfidentiality::MlsEncrypted,
+                read_access: x0x::groups::GroupReadAccess::MembersOnly,
+                write_access: x0x::groups::GroupWriteAccess::MembersOnly,
+            },
+            owner_agent_id: "ff".repeat(32),
+            admin_count: 1,
+            member_count: 1,
+            created_at: issued_at,
+            updated_at: issued_at,
+            request_access_enabled: true,
+            metadata_topic: None,
+            revision,
+            state_hash: format!("state-{revision}"),
+            prev_state_hash: None,
+            issued_at,
+            expires_at: issued_at + 1_000,
+            authority_agent_id: String::new(),
+            authority_public_key: String::new(),
+            withdrawn: false,
+            signature: String::new(),
+        }
+    }
+
     fn version_newer_than_current() -> String {
         let mut version = semver::Version::parse(x0x::VERSION).expect("current version is semver");
         version.patch += 1;
         version.to_string()
+    }
+
+    #[test]
+    fn group_card_cache_prunes_expired_cards() {
+        let mut cache = HashMap::new();
+        cache.insert(
+            "expired".to_string(),
+            sample_group_card("expired", 1, 1_000),
+        );
+        cache.insert("fresh".to_string(), sample_group_card("fresh", 1, 3_000));
+
+        prune_expired_group_cards(&mut cache, 2_001);
+
+        assert!(!cache.contains_key("expired"));
+        assert!(cache.contains_key("fresh"));
+    }
+
+    #[test]
+    fn group_card_cache_cap_evicts_earliest_expiry() {
+        let mut cache = HashMap::new();
+        cache.insert("earliest".to_string(), sample_group_card("earliest", 1, 1));
+        for idx in 0..GROUP_CARD_CACHE_CAP {
+            let group_id = format!("group-{idx}");
+            cache.insert(
+                group_id.clone(),
+                sample_group_card(&group_id, 1, 10_000 + idx as u64),
+            );
+        }
+
+        enforce_group_card_cache_cap(&mut cache);
+
+        assert_eq!(cache.len(), GROUP_CARD_CACHE_CAP);
+        assert!(!cache.contains_key("earliest"));
+    }
+
+    #[test]
+    fn group_card_cache_insert_preserves_higher_revision() {
+        let mut cache = HashMap::new();
+        let high = sample_group_card("same", 3, 1_000);
+        let low = sample_group_card("same", 2, 2_000);
+
+        assert!(cache_group_card_if_newer(
+            &mut cache,
+            "same".to_string(),
+            high.clone()
+        ));
+        assert!(!cache_group_card_if_newer(
+            &mut cache,
+            "same".to_string(),
+            low
+        ));
+
+        assert_eq!(
+            cache.get("same").expect("card retained").revision,
+            high.revision
+        );
+    }
+
+    #[test]
+    fn group_card_cache_stale_withdrawal_does_not_evict_newer_card() {
+        let mut cache = HashMap::new();
+        let current = sample_group_card("same", 3, 2_000);
+        let mut stale_withdrawal = sample_group_card("same", 2, 3_000);
+        stale_withdrawal.withdrawn = true;
+
+        cache.insert("same".to_string(), current.clone());
+
+        assert!(!remove_group_card_if_not_stale(
+            &mut cache,
+            &stale_withdrawal
+        ));
+        assert_eq!(
+            cache.get("same").expect("newer card retained").revision,
+            current.revision
+        );
+    }
+
+    #[test]
+    fn withdrawn_group_card_marks_existing_stub_without_regressing_newer_stub() {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "old".to_string(),
+            String::new(),
+            AgentId([1; 32]),
+            "same".to_string(),
+            x0x::groups::GroupPolicy::from(&sample_group_card("same", 1, 1_000).policy_summary),
+        );
+        info.state_revision = 1;
+        info.updated_at = 1_000;
+        info.withdrawn = false;
+
+        let mut withdrawal = sample_group_card("same", 2, 2_000);
+        withdrawal.withdrawn = true;
+
+        assert!(apply_withdrawn_group_card_to_group_info(
+            &mut info,
+            &withdrawal
+        ));
+        assert!(info.withdrawn);
+        assert_eq!(info.state_revision, 2);
+        assert_eq!(info.state_hash, "state-2");
+
+        let mut newer_info = info.clone();
+        newer_info.withdrawn = false;
+        newer_info.state_revision = 3;
+        newer_info.updated_at = 3_000;
+
+        assert!(!apply_withdrawn_group_card_to_group_info(
+            &mut newer_info,
+            &withdrawal
+        ));
+        assert!(!newer_info.withdrawn);
+        assert_eq!(newer_info.state_revision, 3);
     }
 
     #[test]

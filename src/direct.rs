@@ -61,7 +61,7 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, MachineId};
 use crate::trust::TrustDecision;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -79,6 +79,14 @@ pub const MAX_DIRECT_PAYLOAD_SIZE: usize = 16 * 1024 * 1024;
 /// one slow SSE/WebSocket/file-transfer consumer cannot force drops for every
 /// other consumer.
 const DIRECT_SUBSCRIBER_BUFFER: usize = 8192;
+
+/// Keep direct diagnostics for recently active disconnected peers for at most
+/// this long. Connected peers are always retained.
+const DIRECT_DIAGNOSTICS_IDLE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Minimum retained direct peer/lifecycle diagnostics entries before old idle
+/// records are evicted. The effective cap also scales with connected peers.
+const DIRECT_DIAGNOSTICS_MIN_RETAIN: usize = 1024;
 
 /// A direct message received from another agent.
 ///
@@ -171,6 +179,10 @@ fn now_unix_ms_lossy() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn direct_diagnostics_retain_limit(connected_len: usize) -> usize {
+    DIRECT_DIAGNOSTICS_MIN_RETAIN.max(connected_len.saturating_mul(2))
 }
 
 fn dm_path_label(path: DmPath) -> &'static str {
@@ -398,10 +410,17 @@ struct DirectPeerDiagnosticsState {
     preferred_path: Option<&'static str>,
 }
 
+impl DirectPeerDiagnosticsState {
+    fn last_activity_ms(&self) -> Option<u64> {
+        self.last_send_at_ms.max(self.last_recv_at_ms)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct DirectLifecycleState {
     generation: Option<u64>,
     blocked_reason: Option<String>,
+    last_updated_at_ms: Option<u64>,
 }
 
 /// Global direct-message diagnostics exposed by `/diagnostics/dm`.
@@ -940,7 +959,13 @@ impl DirectMessaging {
         match self.lifecycle.lock() {
             Ok(mut guard) => {
                 let state = guard.entry(machine_id).or_default();
+                state.last_updated_at_ms = Some(now_unix_ms_lossy());
                 update(state);
+                if guard.len() > DIRECT_DIAGNOSTICS_MIN_RETAIN {
+                    if let Some(connected) = self.connected_machine_snapshot() {
+                        Self::prune_lifecycle_locked(&mut guard, &connected);
+                    }
+                }
             }
             Err(e) => tracing::error!("direct lifecycle registry poisoned: {e}"),
         }
@@ -955,8 +980,91 @@ impl DirectMessaging {
             Ok(mut guard) => {
                 let peer = guard.entry(agent_id).or_default();
                 update(peer);
+                if guard.len() > DIRECT_DIAGNOSTICS_MIN_RETAIN {
+                    if let Some(connected) = self.connected_agent_snapshot() {
+                        Self::prune_peer_diagnostics_locked(&mut guard, &connected);
+                    }
+                }
             }
             Err(e) => tracing::error!("direct peer diagnostics registry poisoned: {e}"),
+        }
+    }
+
+    fn connected_agent_snapshot(&self) -> Option<HashSet<AgentId>> {
+        match self.connected_agents.try_read() {
+            Ok(guard) => Some(guard.keys().copied().collect()),
+            Err(_) => None,
+        }
+    }
+
+    fn connected_machine_snapshot(&self) -> Option<HashSet<MachineId>> {
+        match self.connected_agents.try_read() {
+            Ok(guard) => Some(guard.values().copied().collect()),
+            Err(_) => None,
+        }
+    }
+
+    fn prune_peer_diagnostics_locked(
+        guard: &mut HashMap<AgentId, DirectPeerDiagnosticsState>,
+        connected: &HashSet<AgentId>,
+    ) {
+        let limit = direct_diagnostics_retain_limit(connected.len());
+        if guard.len() <= limit {
+            return;
+        }
+
+        let now = now_unix_ms_lossy();
+        guard.retain(|agent_id, state| {
+            connected.contains(agent_id)
+                || state
+                    .last_activity_ms()
+                    .is_some_and(|last| now.saturating_sub(last) <= DIRECT_DIAGNOSTICS_IDLE_TTL_MS)
+        });
+
+        if guard.len() <= limit {
+            return;
+        }
+        let mut idle: Vec<(AgentId, u64)> = guard
+            .iter()
+            .filter(|(agent_id, _)| !connected.contains(agent_id))
+            .map(|(agent_id, state)| (*agent_id, state.last_activity_ms().unwrap_or(0)))
+            .collect();
+        idle.sort_by_key(|(_, last)| *last);
+        let remove_count = guard.len().saturating_sub(limit).min(idle.len());
+        for (agent_id, _) in idle.into_iter().take(remove_count) {
+            guard.remove(&agent_id);
+        }
+    }
+
+    fn prune_lifecycle_locked(
+        guard: &mut HashMap<MachineId, DirectLifecycleState>,
+        connected: &HashSet<MachineId>,
+    ) {
+        let limit = direct_diagnostics_retain_limit(connected.len());
+        if guard.len() <= limit {
+            return;
+        }
+
+        let now = now_unix_ms_lossy();
+        guard.retain(|machine_id, state| {
+            connected.contains(machine_id)
+                || state
+                    .last_updated_at_ms
+                    .is_some_and(|last| now.saturating_sub(last) <= DIRECT_DIAGNOSTICS_IDLE_TTL_MS)
+        });
+
+        if guard.len() <= limit {
+            return;
+        }
+        let mut idle: Vec<(MachineId, u64)> = guard
+            .iter()
+            .filter(|(machine_id, _)| !connected.contains(machine_id))
+            .map(|(machine_id, state)| (*machine_id, state.last_updated_at_ms.unwrap_or(0)))
+            .collect();
+        idle.sort_by_key(|(_, last)| *last);
+        let remove_count = guard.len().saturating_sub(limit).min(idle.len());
+        for (machine_id, _) in idle.into_iter().take(remove_count) {
+            guard.remove(&machine_id);
         }
     }
 
@@ -1211,6 +1319,43 @@ mod tests {
 
         dm.record_lifecycle_established(machine_id, Some(3));
         assert!(dm.lifecycle_block_reason(&machine_id).is_none());
+    }
+
+    #[test]
+    fn direct_diagnostics_prune_idle_entries_to_scaled_bound() {
+        fn agent_id_from_u32(id: u32) -> AgentId {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&id.to_be_bytes());
+            AgentId(bytes)
+        }
+
+        let now = now_unix_ms_lossy();
+        let connected = agent_id_from_u32(1);
+        let mut connected_set = HashSet::new();
+        connected_set.insert(connected);
+
+        let mut guard = HashMap::new();
+        guard.insert(
+            connected,
+            DirectPeerDiagnosticsState {
+                last_recv_at_ms: Some(0),
+                ..DirectPeerDiagnosticsState::default()
+            },
+        );
+        for id in 2..1100 {
+            guard.insert(
+                agent_id_from_u32(id),
+                DirectPeerDiagnosticsState {
+                    last_recv_at_ms: Some(now),
+                    ..DirectPeerDiagnosticsState::default()
+                },
+            );
+        }
+
+        DirectMessaging::prune_peer_diagnostics_locked(&mut guard, &connected_set);
+
+        assert!(guard.len() <= DIRECT_DIAGNOSTICS_MIN_RETAIN);
+        assert!(guard.contains_key(&connected));
     }
 
     #[test]

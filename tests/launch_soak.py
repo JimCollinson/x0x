@@ -32,7 +32,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 LOG = logging.getLogger("launch_soak")
 
@@ -46,6 +46,148 @@ def _int_field(row: Dict[str, str], key: str, default: int = 0) -> int:
         return int(row.get(key, "") or default)
     except ValueError:
         return default
+
+
+CONTINUOUS_COUNTER_PATHS = {
+    "dispatcher_completed": ("dispatcher", "pubsub", "completed"),
+    "dispatcher_timed_out": ("dispatcher", "pubsub", "timed_out"),
+    "recv_pump_dropped_full": ("recv_pump", "pubsub", "dropped_full"),
+    "per_peer_timeout_count": ("pubsub_stages", "republish_per_peer_timeout"),
+}
+
+
+def _nested_int(data: Dict[str, Any], path: tuple[str, ...]) -> int:
+    cur: Any = data
+    for part in path:
+        if not isinstance(cur, dict):
+            return 0
+        cur = cur.get(part, 0)
+    try:
+        return int(cur or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def load_counter_snapshot(path: Path) -> Optional[Dict[str, int]]:
+    """Load the monotonic counters needed for continuous soak accounting."""
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception as exc:
+        LOG.warning("failed to parse diagnostics snapshot %s: %s", path, exc)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return {
+        name: _nested_int(raw, counter_path)
+        for name, counter_path in CONTINUOUS_COUNTER_PATHS.items()
+    }
+
+
+def _diagnostic_nodes(window_dir: Path) -> List[str]:
+    diag_dir = window_dir / "diagnostics" / "baseline"
+    if not diag_dir.exists():
+        return []
+    nodes = set()
+    for suffix in ("-pre.json", "-post.json"):
+        for path in diag_dir.glob(f"*{suffix}"):
+            nodes.add(path.name[: -len(suffix)])
+    return sorted(nodes)
+
+
+def annotate_continuous_window(
+    window_dir: Path,
+    row: Dict[str, str],
+    previous_post: Dict[str, Dict[str, int]],
+) -> Dict[str, str]:
+    """Annotate one row with deltas from the previous successful post sample.
+
+    The per-window launch_readiness deltas only cover the short scenario
+    execution. A soak needs continuous counter movement across the full
+    interval, and a missing pre-snapshot must not be treated as zero.
+    """
+    diag_dir = window_dir / "diagnostics" / "baseline"
+    nodes = sorted(set(previous_post) | set(_diagnostic_nodes(window_dir)))
+    if not nodes:
+        return row
+
+    sum_disp_to = 0
+    max_disp_to = 0
+    sum_drop_full = 0
+    max_drop_full = 0
+    sum_pp_to = 0
+    max_pp_to = 0
+    sum_completed = 0
+    gaps: List[str] = []
+    unaccounted: List[str] = []
+
+    for node in nodes:
+        pre = load_counter_snapshot(diag_dir / f"{node}-pre.json")
+        post = load_counter_snapshot(diag_dir / f"{node}-post.json")
+        baseline = previous_post.get(node) or pre
+
+        if post is None:
+            gaps.append(f"{node}:post")
+            unaccounted.append(f"{node}:post")
+            continue
+        if baseline is None:
+            gaps.append(f"{node}:baseline")
+            unaccounted.append(f"{node}:baseline")
+            previous_post[node] = post
+            continue
+
+        if pre is None:
+            gaps.append(f"{node}:pre")
+
+        reset_fields = [
+            field for field, value in post.items()
+            if value < int(baseline.get(field, 0) or 0)
+        ]
+        if reset_fields:
+            gaps.append(f"{node}:counter_reset")
+            unaccounted.append(f"{node}:counter_reset")
+
+        delta_disp = max(0, post["dispatcher_timed_out"] - baseline["dispatcher_timed_out"])
+        delta_drop = max(0, post["recv_pump_dropped_full"] - baseline["recv_pump_dropped_full"])
+        delta_pp = max(0, post["per_peer_timeout_count"] - baseline["per_peer_timeout_count"])
+        delta_completed = max(0, post["dispatcher_completed"] - baseline["dispatcher_completed"])
+
+        sum_disp_to += delta_disp
+        max_disp_to = max(max_disp_to, delta_disp)
+        sum_drop_full += delta_drop
+        max_drop_full = max(max_drop_full, delta_drop)
+        sum_pp_to += delta_pp
+        max_pp_to = max(max_pp_to, delta_pp)
+        sum_completed += delta_completed
+        previous_post[node] = post
+
+    row["continuous_max_disp_to_delta"] = str(max_disp_to)
+    row["continuous_sum_disp_to_delta"] = str(sum_disp_to)
+    row["continuous_max_drop_full_delta"] = str(max_drop_full)
+    row["continuous_sum_drop_full_delta"] = str(sum_drop_full)
+    row["continuous_max_pp_to_delta"] = str(max_pp_to)
+    row["continuous_sum_pp_to_delta"] = str(sum_pp_to)
+    row["continuous_sum_dispatcher_completed_delta"] = str(sum_completed)
+    row["continuous_snapshot_gaps"] = ";".join(gaps)
+    row["continuous_unaccounted_gaps"] = ";".join(unaccounted)
+    return row
+
+
+def annotate_continuous_rows(soak_dir: Path, rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    previous_post: Dict[str, Dict[str, int]] = {}
+    annotated: List[Dict[str, str]] = []
+    for idx, row in enumerate(rows, 1):
+        copied = dict(row)
+        annotate_continuous_window(soak_dir / "windows" / f"{idx:03d}", copied, previous_post)
+        annotated.append(copied)
+    return annotated
+
+
+def _counter_field(row: Dict[str, str], continuous_key: str, legacy_key: str) -> int:
+    if continuous_key in row:
+        return _int_field(row, continuous_key)
+    return _int_field(row, legacy_key)
 
 
 def discover_windows_summary(window_dir: Path) -> Dict[str, str]:
@@ -169,19 +311,32 @@ def run_window(
 
 def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool:
     """Write final summary.md. Returns True iff the soak-level gate passed."""
+    rows = annotate_continuous_rows(soak_dir, rows)
     pass_count = sum(1 for r in rows if r["verdict"] == "GO")
     fail_count = sum(1 for r in rows if r["verdict"] == "NO-GO")
     missing_count = sum(1 for r in rows if r["verdict"] == "MISSING")
     total = len(rows)
 
     cumulative_disp_to = sum(
-        _int_field(r, "sum_disp_to_delta", _int_field(r, "max_disp_to_delta"))
+        _counter_field(r, "continuous_sum_disp_to_delta", "sum_disp_to_delta")
         for r in rows
     )
     cumulative_drop_full = sum(
-        _int_field(r, "sum_drop_full_delta", _int_field(r, "max_drop_full_delta"))
+        _counter_field(r, "continuous_sum_drop_full_delta", "sum_drop_full_delta")
         for r in rows
     )
+    cumulative_completed = sum(
+        _int_field(r, "continuous_sum_dispatcher_completed_delta")
+        for r in rows
+    )
+    cumulative_pp_to = sum(
+        _counter_field(r, "continuous_sum_pp_to_delta", "max_pp_to_delta")
+        for r in rows
+    )
+    unaccounted_gap_windows = [
+        idx for idx, row in enumerate(rows, 1)
+        if row.get("continuous_unaccounted_gaps")
+    ]
     dispatcher_limit = SOAK_MAX_DISPATCHER_TIMED_OUT_DELTA_PER_12H
     drop_limit = SOAK_MAX_RECV_PUMP_DROPPED_FULL_DELTA
 
@@ -198,6 +353,11 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         messages = [m.strip() for m in raw.split(" || ") if m.strip()]
         return bool(messages) and all("dispatcher_timed_out delta" in m for m in messages)
 
+    def _ratio_str(numerator: int, denominator: int) -> str:
+        if denominator <= 0:
+            return "n/a"
+        return f"{numerator / denominator:.8f}"
+
     effective_failed: List[int] = []
     tolerated_dispatcher_windows: List[int] = []
     for idx, row in enumerate(rows, 1):
@@ -206,7 +366,7 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         if (
             row["verdict"] == "NO-GO"
             and _phase_a_ok(row)
-            and _int_field(row, "max_drop_full_delta") == 0
+            and _counter_field(row, "continuous_max_drop_full_delta", "max_drop_full_delta") == 0
             and _only_dispatcher_timeout_violations(row)
         ):
             tolerated_dispatcher_windows.append(idx)
@@ -217,6 +377,7 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         total > 0
         and missing_count == 0
         and not effective_failed
+        and not unaccounted_gap_windows
         and cumulative_disp_to <= dispatcher_limit
         and cumulative_drop_full <= drop_limit
     )
@@ -230,27 +391,35 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         "",
         "## Cumulative SLO totals",
         "",
-        f"- dispatcher.timed_out delta across all windows × all nodes: **{cumulative_disp_to}** "
+        "- Counter source: **continuous post-to-post diagnostics deltas when available; "
+        "legacy scenario deltas only when diagnostics are absent**",
+        f"- dispatcher.timed_out delta across the continuous soak × all nodes: **{cumulative_disp_to}** "
         f"(gate ≤ {dispatcher_limit}/12h)",
-        f"- recv_pump.dropped_full delta across all windows × all nodes: **{cumulative_drop_full}** "
+        f"- recv_pump.dropped_full delta across the continuous soak × all nodes: **{cumulative_drop_full}** "
         f"(gate ≤ {drop_limit})",
+        f"- dispatcher.pubsub.completed delta across the continuous soak × all nodes: **{cumulative_completed}**",
+        f"- dispatcher.timed_out / dispatcher.completed: **{_ratio_str(cumulative_disp_to, cumulative_completed)}**",
+        f"- republish_per_peer_timeout / dispatcher.completed: **{_ratio_str(cumulative_pp_to, cumulative_completed)}**",
         f"- tolerated dispatcher-only windows: **{','.join(str(i) for i in tolerated_dispatcher_windows) or 'none'}**",
         f"- effective failed windows: **{','.join(str(i) for i in effective_failed) or 'none'}**",
+        f"- unaccounted telemetry-gap windows: **{','.join(str(i) for i in unaccounted_gap_windows) or 'none'}**",
         "",
         "## Per-window timeline",
         "",
-        "| # | start_unix | verdict | effective | phase_a | max_disp_to | sum_disp_to | max_drop_full | sum_drop_full | max_pp_to | max_suppressed | max_suppressed_ratio | max_workers | violations |",
-        "|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| # | start_unix | verdict | effective | phase_a | scenario_sum_disp_to | continuous_sum_disp_to | scenario_sum_drop_full | continuous_sum_drop_full | scenario_max_pp_to | continuous_max_pp_to | max_suppressed | max_suppressed_ratio | max_workers | telemetry_gaps | violations |",
+        "|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|",
     ]
     for i, r in enumerate(rows, 1):
         effective = "FAIL" if i in effective_failed else "PASS"
         lines.append(
             f"| {i} | {r.get('start_unix','?')} | {r['verdict']} | {effective} | "
             f"{r['phase_a_received']}/{r['phase_a_sent']} | "
-            f"{r['max_disp_to_delta']} | {r.get('sum_disp_to_delta', '?')} | "
-            f"{r['max_drop_full_delta']} | {r.get('sum_drop_full_delta', '?')} | "
-            f"{r['max_pp_to_delta']} | {r['max_suppressed']} | "
+            f"{r.get('sum_disp_to_delta', '?')} | {r.get('continuous_sum_disp_to_delta', '?')} | "
+            f"{r.get('sum_drop_full_delta', '?')} | {r.get('continuous_sum_drop_full_delta', '?')} | "
+            f"{r['max_pp_to_delta']} | {r.get('continuous_max_pp_to_delta', '?')} | "
+            f"{r['max_suppressed']} | "
             f"{r.get('max_suppressed_ratio', '?')} | {r['max_workers']} | "
+            f"{r.get('continuous_snapshot_gaps') or 'none'} | "
             f"{r['violations']} |"
         )
     (soak_dir / "summary.md").write_text("\n".join(lines))
@@ -305,10 +474,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             "window", "start_unix", "verdict", "phase_a_received", "phase_a_sent",
             "max_disp_to_delta", "sum_disp_to_delta",
             "max_drop_full_delta", "sum_drop_full_delta", "max_pp_to_delta",
+            "continuous_max_disp_to_delta", "continuous_sum_disp_to_delta",
+            "continuous_max_drop_full_delta", "continuous_sum_drop_full_delta",
+            "continuous_max_pp_to_delta", "continuous_sum_pp_to_delta",
+            "continuous_sum_dispatcher_completed_delta",
+            "continuous_snapshot_gaps", "continuous_unaccounted_gaps",
             "max_suppressed", "max_suppressed_ratio", "max_workers", "violations",
         ])
 
     soak_start = time.time()
+    continuous_previous_post: Dict[str, Dict[str, int]] = {}
     for i in range(1, target_windows + 1):
         if interrupted["flag"]:
             break
@@ -320,6 +495,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         info = discover_windows_summary(window_dir)
         info["start_unix"] = str(int(window_start))
         info["window_rc"] = str(rc)
+        annotate_continuous_window(window_dir, info, continuous_previous_post)
         rows.append(info)
 
         with timeline_path.open("a", newline="") as f:
@@ -329,15 +505,26 @@ def main(argv: Optional[List[str]] = None) -> int:
                 info["phase_a_received"], info["phase_a_sent"],
                 info["max_disp_to_delta"], info["sum_disp_to_delta"],
                 info["max_drop_full_delta"], info["sum_drop_full_delta"],
-                info["max_pp_to_delta"], info["max_suppressed"],
+                info["max_pp_to_delta"],
+                info.get("continuous_max_disp_to_delta", ""),
+                info.get("continuous_sum_disp_to_delta", ""),
+                info.get("continuous_max_drop_full_delta", ""),
+                info.get("continuous_sum_drop_full_delta", ""),
+                info.get("continuous_max_pp_to_delta", ""),
+                info.get("continuous_sum_pp_to_delta", ""),
+                info.get("continuous_sum_dispatcher_completed_delta", ""),
+                info.get("continuous_snapshot_gaps", ""),
+                info.get("continuous_unaccounted_gaps", ""),
+                info["max_suppressed"],
                 info["max_suppressed_ratio"], info["max_workers"], info["violations"],
             ])
 
         LOG.info(
-            "window %d/%d: verdict=%s phase_a=%s/%s disp_to=%s drop_full=%s pp_to=%s suppressed=%s",
+            "window %d/%d: verdict=%s phase_a=%s/%s scenario_disp_to=%s continuous_disp_to=%s drop_full=%s pp_to=%s suppressed=%s",
             i, target_windows, info["verdict"],
             info["phase_a_received"], info["phase_a_sent"],
-            info["max_disp_to_delta"], info["max_drop_full_delta"],
+            info["max_disp_to_delta"], info.get("continuous_sum_disp_to_delta", "?"),
+            info.get("continuous_sum_drop_full_delta", info["max_drop_full_delta"]),
             info["max_pp_to_delta"], info["max_suppressed"],
         )
 

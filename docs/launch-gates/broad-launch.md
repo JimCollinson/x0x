@@ -97,16 +97,28 @@ threshold itself may need revisiting. Until then the gate is doing
 exactly what it should: catching the difference between healthy
 steady-state and elevated cooling pressure.
 
+Do not tune these bars by repeatedly fitting them to this six-node VPS
+mesh. The product has to run on residential, mobile, asymmetric, and
+hostile-path networks, so launch evidence must prefer normalized rates,
+bounded growth, and adaptive recovery over operator-selected constants.
+The fixed bootstrap-mesh numbers are investigation triggers, not a
+portable model of all future user connections.
+
 ## Required additional evidence (beyond harness)
 
 The harness gives you a snapshot. The broad-launch gate also needs:
 
 - A **12h+ soak** of the full bootstrap mesh with this build, captured
   as a per-node CSV under `proofs/launch-readiness-soak-<run-id>/`.
-  Phase A directed pairs and `recv_pump.pubsub.dropped_full` remain
-  strict. A dispatcher-only transient is accepted at the soak level when
-  cumulative `dispatcher.pubsub.timed_out` across all nodes is ≤ 5 per
-  12h and every affected window is otherwise clean.
+  The soak summary must use continuous post-to-post diagnostics deltas,
+  not only the short scenario pre/post window. Phase A directed pairs
+  and `recv_pump.pubsub.dropped_full` remain strict. The current
+  dispatcher-only cap is a conservative bootstrap-mesh investigation
+  trigger: a raw count above it should not be "fixed" by retuning to the
+  VPS fleet without also checking normalized
+  `dispatcher.timed_out / dispatcher.completed`, per-node-hour rates,
+  telemetry gaps, queue/backlog growth, and whether delivery or drops
+  degraded.
 - One **high-RTT slow-peer scenario** with `high_rtt_peer` against a
   non-anchor node, writing
   `scenarios/high_rtt_peer/peer-score-trajectory.json` and proving that

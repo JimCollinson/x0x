@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -25,6 +26,40 @@ class LaunchSoakSummaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.soak = load_launch_soak()
+
+    def write_diag(
+        self,
+        window_dir: Path,
+        node: str,
+        sample: str,
+        *,
+        completed: int = 0,
+        timed_out: int = 0,
+        dropped_full: int = 0,
+        per_peer_timeout: int = 0,
+    ) -> None:
+        diag_dir = window_dir / "diagnostics" / "baseline"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "dispatcher": {
+                "pubsub": {
+                    "completed": completed,
+                    "timed_out": timed_out,
+                }
+            },
+            "recv_pump": {
+                "pubsub": {
+                    "dropped_full": dropped_full,
+                }
+            },
+            "pubsub_stages": {
+                "republish_per_peer_timeout": per_peer_timeout,
+            },
+        }
+        (diag_dir / f"{node}-{sample}.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
 
     def test_discover_summary_sums_per_node_dispatcher_deltas(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -59,6 +94,78 @@ class LaunchSoakSummaryTests(unittest.TestCase):
         self.assertEqual("40", row["max_suppressed"])
         self.assertEqual("0.020000", row["max_suppressed_ratio"])
         self.assertIn("dispatcher_timed_out delta", row["violation_messages"])
+
+    def test_continuous_deltas_bridge_missing_pre_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            soak_dir = Path(tmp)
+            window_1 = soak_dir / "windows" / "001"
+            window_2 = soak_dir / "windows" / "002"
+            self.write_diag(
+                window_1,
+                "singapore",
+                "pre",
+                completed=1000,
+                timed_out=4,
+                per_peer_timeout=15056,
+            )
+            self.write_diag(
+                window_1,
+                "singapore",
+                "post",
+                completed=1100,
+                timed_out=4,
+                per_peer_timeout=15098,
+            )
+            self.write_diag(
+                window_2,
+                "singapore",
+                "post",
+                completed=1500,
+                timed_out=4,
+                per_peer_timeout=15282,
+            )
+
+            rows = self.soak.annotate_continuous_rows(soak_dir, [{}, {}])
+
+        self.assertEqual("0", rows[1]["continuous_sum_disp_to_delta"])
+        self.assertEqual("184", rows[1]["continuous_max_pp_to_delta"])
+        self.assertIn("singapore:pre", rows[1]["continuous_snapshot_gaps"])
+        self.assertEqual("", rows[1]["continuous_unaccounted_gaps"])
+
+    def test_write_summary_prefers_continuous_totals_over_scenario_artifact(self) -> None:
+        rows = [
+            {
+                "verdict": "NO-GO",
+                "start_unix": "1",
+                "phase_a_received": "30",
+                "phase_a_sent": "30",
+                "max_disp_to_delta": "4",
+                "sum_disp_to_delta": "4",
+                "continuous_max_disp_to_delta": "0",
+                "continuous_sum_disp_to_delta": "0",
+                "max_drop_full_delta": "0",
+                "sum_drop_full_delta": "0",
+                "continuous_max_drop_full_delta": "0",
+                "continuous_sum_drop_full_delta": "0",
+                "max_pp_to_delta": "15282",
+                "continuous_max_pp_to_delta": "184",
+                "max_suppressed": "154",
+                "max_suppressed_ratio": "0.113924",
+                "max_workers": "32",
+                "violations": "1",
+                "violation_messages": "singapore: dispatcher_timed_out delta 4 > gate 0",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            passed = self.soak.write_summary(Path(tmp), "broad-launch", rows)
+            md = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+
+        self.assertTrue(passed)
+        self.assertIn(
+            "dispatcher.timed_out delta across the continuous soak × all nodes: **0**",
+            md,
+        )
+        self.assertIn("| 1 | 1 | NO-GO | PASS | 30/30 | 4 | 0 |", md)
 
     def test_write_summary_tolerates_small_dispatcher_only_soak_delta(self) -> None:
         rows = [

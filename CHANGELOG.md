@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.23] - 2026-05-06
+
+X0X-0031 hardening on top of the 0.19.22 X0X-0030 rework. The 0.19.22
+pre-warm baseline showed catastrophic raw-QUIC `send_with_receive_ack`
+failures across the fleet at 7-12 min uptime, exposed by the harness
+fix #3 that switched Phase A to test raw QUIC explicitly. Four
+hardening changes address the residual:
+
+### Fixed
+
+- **`x0x` `src/network.rs`**: 60s successful-liveness cooldown
+  (`PRE_SEND_LIVENESS_COOLDOWN`). After a successful probe completes,
+  the same peer is not re-probed for 60s — eliminates the
+  "probe-after-every-send" amplification when many concurrent sends fire
+  at the same peer.
+- **`x0x` `src/network.rs`**: bounded concurrent repairs via
+  `Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS = 16)`. Daemon-local
+  cap on probe/reconnect parallelism prevents probe storms even under
+  heavy concurrent send load. Hot healthy sends bypass the lock entirely.
+- **`x0x` `src/network.rs`**: race-safe single-flight per peer.
+  `Arc::strong_count(lock) > 2` rechecks under the map lock guard
+  resolve the race where two callers could both decide they own the
+  repair. Idle lock entries are pruned safely.
+- **`x0x` `src/dm_send.rs`**: `wait_for_ack_or_backoff` races the
+  retry-backoff sleep against ACK arrival. If the ACK arrives during
+  backoff (after the attempt's send-with-receive-ack timeout but before
+  the next republish would fire), it short-circuits and returns the ACK
+  outcome — preventing duplicate republishes that amplify mesh load
+  under congestion.
+
+Correctness basis: RFC 9002 (QUIC loss recovery, bounded recovery work),
+RFC 8085 (UDP usage guidelines, no retry amplification under
+congestion).
+
+### Verified
+
+- 665/665 nextest pass (5 new unit tests for cooldown + backoff paths),
+  29/29 Python tests, `cargo clippy --all-targets --all-features
+  -- -D warnings` clean, fmt clean.
+
 ## [v0.19.22] - 2026-05-06
 
 X0X-0030 mitigation rework. The 0.19.21 fix introduced an unbounded

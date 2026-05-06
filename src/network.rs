@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 
 /// Ant-quic PeerId type alias
@@ -80,6 +80,15 @@ const PRE_SEND_LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Reconnect budget used after a failed pre-send probe.
 const PRE_SEND_RECONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Minimum interval between successful app-level liveness checks for a peer.
+const PRE_SEND_LIVENESS_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Bound for lazy liveness bookkeeping in long-lived daemons.
+const LIVENESS_STATE_MAX_PEERS: usize = 1024;
+
+/// Maximum concurrent lazy liveness repairs per daemon.
+const MAX_CONCURRENT_LIVENESS_REPAIRS: usize = 16;
 
 /// Capacity for the PubSub inbound gossip channel.
 const GOSSIP_PUBSUB_RECV_CAPACITY: usize = 10_000;
@@ -805,6 +814,10 @@ pub struct NetworkNode {
     /// maintenance tasks from repeatedly disconnecting/reconnecting the same
     /// stale connection.
     liveness_locks: Arc<Mutex<HashMap<AntPeerId, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Last time a peer completed an app-level liveness check or reconnect.
+    liveness_last_ready: Arc<Mutex<HashMap<AntPeerId, Instant>>>,
+    /// Daemon-local cap for concurrent pre-send probe/reconnect work.
+    liveness_repair_semaphore: Arc<Semaphore>,
 }
 
 impl NetworkNode {
@@ -886,6 +899,8 @@ impl NetworkNode {
             peer_id,
             bootstrap_cache,
             liveness_locks: Arc::new(Mutex::new(HashMap::new())),
+            liveness_last_ready: Arc::new(Mutex::new(HashMap::new())),
+            liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
         };
 
         network_node.spawn_receiver();
@@ -1080,10 +1095,18 @@ impl NetworkNode {
             })
     }
 
-    fn peer_needs_pre_send_probe(health: &ant_quic::ConnectionHealth, idle_for: Duration) -> bool {
-        !health.connected
-            || health.reader_task_active != Some(true)
-            || idle_for >= PRE_SEND_LIVENESS_IDLE_THRESHOLD
+    fn peer_needs_pre_send_probe(
+        health: &ant_quic::ConnectionHealth,
+        idle_for: Duration,
+        last_ready_elapsed: Option<Duration>,
+    ) -> bool {
+        if !health.connected || health.reader_task_active != Some(true) {
+            return true;
+        }
+        if last_ready_elapsed.is_some_and(|elapsed| elapsed < PRE_SEND_LIVENESS_COOLDOWN) {
+            return false;
+        }
+        idle_for >= PRE_SEND_LIVENESS_IDLE_THRESHOLD
     }
 
     async fn refresh_peer_connection(
@@ -1183,6 +1206,52 @@ impl NetworkNode {
             .clone())
     }
 
+    fn maybe_remove_liveness_lock(&self, peer_id: &AntPeerId, lock: &Arc<tokio::sync::Mutex<()>>) {
+        if Arc::strong_count(lock) > 2 {
+            return;
+        }
+        let Ok(mut locks) = self.liveness_locks.lock() else {
+            return;
+        };
+        if Arc::strong_count(lock) > 2 {
+            return;
+        }
+        let should_remove = match locks.get(peer_id) {
+            Some(stored) => Arc::ptr_eq(stored, lock),
+            None => false,
+        };
+        if should_remove {
+            locks.remove(peer_id);
+        }
+    }
+
+    fn peer_liveness_ready_elapsed(&self, peer_id: &AntPeerId) -> NetworkResult<Option<Duration>> {
+        let ready = self.liveness_last_ready.lock().map_err(|_| {
+            NetworkError::NodeCreation("peer liveness cooldown map poisoned".to_string())
+        })?;
+        let now = Instant::now();
+        Ok(ready
+            .get(peer_id)
+            .map(|last_ready| now.saturating_duration_since(*last_ready)))
+    }
+
+    fn remember_peer_send_ready(&self, peer_id: AntPeerId) -> NetworkResult<()> {
+        let mut ready = self.liveness_last_ready.lock().map_err(|_| {
+            NetworkError::NodeCreation("peer liveness cooldown map poisoned".to_string())
+        })?;
+        let now = Instant::now();
+        if ready.len() >= LIVENESS_STATE_MAX_PEERS && !ready.contains_key(&peer_id) {
+            ready.retain(|_, last_ready| {
+                now.saturating_duration_since(*last_ready) <= PRE_SEND_LIVENESS_COOLDOWN
+            });
+            if ready.len() >= LIVENESS_STATE_MAX_PEERS {
+                return Ok(());
+            }
+        }
+        ready.insert(peer_id, now);
+        Ok(())
+    }
+
     async fn peer_needs_send_readiness_repair(&self, peer_id: &AntPeerId) -> NetworkResult<bool> {
         let Some((_fallback_addr, idle_for)) = self.connected_peer_snapshot(peer_id).await else {
             return Ok(true);
@@ -1192,7 +1261,12 @@ impl NetworkNode {
             .connection_health(*peer_id)
             .await
             .ok_or_else(|| NetworkError::NodeCreation("Node not initialized".to_string()))?;
-        Ok(Self::peer_needs_pre_send_probe(&health, idle_for))
+        let last_ready_elapsed = self.peer_liveness_ready_elapsed(peer_id)?;
+        Ok(Self::peer_needs_pre_send_probe(
+            &health,
+            idle_for,
+            last_ready_elapsed,
+        ))
     }
 
     async fn ensure_peer_send_ready(&self, peer_id: &AntPeerId) -> NetworkResult<()> {
@@ -1201,18 +1275,30 @@ impl NetworkNode {
         }
 
         let lock = self.liveness_lock_for_peer(*peer_id)?;
-        let _guard = lock.lock().await;
+        let guard = lock.lock().await;
+        let permit = self
+            .liveness_repair_semaphore
+            .acquire()
+            .await
+            .map_err(|_| {
+                NetworkError::NodeCreation("peer liveness repair semaphore closed".to_string())
+            })?;
 
-        if !self.peer_needs_send_readiness_repair(peer_id).await? {
-            return Ok(());
-        }
-
-        self.ensure_peer_send_ready_inner(peer_id).await
+        let result = if !self.peer_needs_send_readiness_repair(peer_id).await? {
+            Ok(())
+        } else {
+            self.ensure_peer_send_ready_inner(peer_id).await
+        };
+        drop(permit);
+        drop(guard);
+        self.maybe_remove_liveness_lock(peer_id, &lock);
+        result
     }
 
     async fn ensure_peer_send_ready_inner(&self, peer_id: &AntPeerId) -> NetworkResult<()> {
         let Some((fallback_addr, idle_for)) = self.connected_peer_snapshot(peer_id).await else {
             self.connect_cached_peer(*peer_id).await?;
+            self.remember_peer_send_ready(*peer_id)?;
             return Ok(());
         };
 
@@ -1220,7 +1306,8 @@ impl NetworkNode {
             .connection_health(*peer_id)
             .await
             .ok_or_else(|| NetworkError::NodeCreation("Node not initialized".to_string()))?;
-        if !Self::peer_needs_pre_send_probe(&health, idle_for) {
+        let last_ready_elapsed = self.peer_liveness_ready_elapsed(peer_id)?;
+        if !Self::peer_needs_pre_send_probe(&health, idle_for, last_ready_elapsed) {
             return Ok(());
         }
 
@@ -1237,16 +1324,18 @@ impl NetworkNode {
                         rtt_ms = rtt.as_millis() as u64,
                         "pre-send liveness probe succeeded"
                     );
+                    self.remember_peer_send_ready(*peer_id)?;
                     return Ok(());
                 }
                 Some(Err(e)) => {
-                    return self
-                        .refresh_peer_connection(
-                            peer_id,
-                            fallback_addr,
-                            format!("probe failed: {e}"),
-                        )
-                        .await;
+                    self.refresh_peer_connection(
+                        peer_id,
+                        fallback_addr,
+                        format!("probe failed: {e}"),
+                    )
+                    .await?;
+                    self.remember_peer_send_ready(*peer_id)?;
+                    return Ok(());
                 }
                 None => {
                     return Err(NetworkError::NodeCreation(
@@ -1261,7 +1350,9 @@ impl NetworkNode {
             fallback_addr,
             "connection health not send-ready".to_string(),
         )
-        .await
+        .await?;
+        self.remember_peer_send_ready(*peer_id)?;
+        Ok(())
     }
 
     /// Connect to a cached peer using its expected peer ID.
@@ -2301,7 +2392,8 @@ mod tests {
 
         assert!(!NetworkNode::peer_needs_pre_send_probe(
             &health,
-            Duration::from_secs(1)
+            Duration::from_secs(1),
+            None
         ));
     }
 
@@ -2315,7 +2407,38 @@ mod tests {
 
         assert!(NetworkNode::peer_needs_pre_send_probe(
             &health,
-            PRE_SEND_LIVENESS_IDLE_THRESHOLD
+            PRE_SEND_LIVENESS_IDLE_THRESHOLD,
+            None
+        ));
+    }
+
+    #[test]
+    fn pre_send_probe_not_needed_during_liveness_cooldown() {
+        let health = ant_quic::ConnectionHealth {
+            connected: true,
+            reader_task_active: Some(true),
+            ..Default::default()
+        };
+
+        assert!(!NetworkNode::peer_needs_pre_send_probe(
+            &health,
+            PRE_SEND_LIVENESS_IDLE_THRESHOLD.saturating_mul(10),
+            Some(Duration::from_secs(5))
+        ));
+    }
+
+    #[test]
+    fn pre_send_probe_needed_after_liveness_cooldown_expires() {
+        let health = ant_quic::ConnectionHealth {
+            connected: true,
+            reader_task_active: Some(true),
+            ..Default::default()
+        };
+
+        assert!(NetworkNode::peer_needs_pre_send_probe(
+            &health,
+            PRE_SEND_LIVENESS_IDLE_THRESHOLD,
+            Some(PRE_SEND_LIVENESS_COOLDOWN)
         ));
     }
 
@@ -2329,7 +2452,23 @@ mod tests {
 
         assert!(NetworkNode::peer_needs_pre_send_probe(
             &health,
-            Duration::from_secs(1)
+            Duration::from_secs(1),
+            Some(Duration::from_secs(5))
+        ));
+    }
+
+    #[test]
+    fn pre_send_probe_needed_for_disconnected_peer_during_cooldown() {
+        let health = ant_quic::ConnectionHealth {
+            connected: false,
+            reader_task_active: Some(true),
+            ..Default::default()
+        };
+
+        assert!(NetworkNode::peer_needs_pre_send_probe(
+            &health,
+            Duration::from_secs(1),
+            Some(Duration::from_secs(5))
         ));
     }
 

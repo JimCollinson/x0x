@@ -11,7 +11,7 @@ use crate::identity::{AgentId, MachineId};
 
 use bytes::Bytes;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot::error::TryRecvError;
 
 pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
@@ -150,8 +150,17 @@ pub async fn send_via_gossip(
             Err(_) => {
                 if attempt < config.max_retries {
                     let delay = config.backoff.delay(config.timeout_per_attempt, attempt);
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
+                    if let Some(outcome) = wait_for_ack_or_backoff(&mut rx, delay).await? {
+                        tracing::info!(
+                            target: "dm.trace",
+                            stage = "outbound_send_returned_ok",
+                            request_id = %hex::encode(request_id),
+                            recipient = %hex::encode(recipient_agent_id.as_bytes()),
+                            attempt,
+                            ack_observed = "during_backoff",
+                        );
+                        guard.mark_resolved();
+                        return ack_outcome_to_receipt(outcome, request_id, attempt);
                     }
                 }
             }
@@ -194,6 +203,22 @@ impl InFlightGuard {
 
     fn mark_resolved(&mut self) {
         self.resolved = true;
+    }
+}
+
+async fn wait_for_ack_or_backoff(
+    rx: &mut tokio::sync::oneshot::Receiver<DmAckOutcome>,
+    delay: Duration,
+) -> Result<Option<DmAckOutcome>, DmError> {
+    if delay.is_zero() {
+        return Ok(None);
+    }
+    match tokio::time::timeout(delay, rx).await {
+        Ok(Ok(outcome)) => Ok(Some(outcome)),
+        Ok(Err(_)) => Err(DmError::PublishFailed(
+            "in-flight ACK registry replaced our waiter".to_string(),
+        )),
+        Err(_) => Ok(None),
     }
 }
 
@@ -253,5 +278,36 @@ fn receipt_for_path(path: DmPath) -> DmReceipt {
         accepted_at: Instant::now(),
         retries_used: 0,
         path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn backoff_wait_returns_late_ack_before_retry() {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let _ = tx.send(DmAckOutcome::Accepted);
+        });
+
+        let outcome = wait_for_ack_or_backoff(&mut rx, Duration::from_secs(1))
+            .await
+            .expect("backoff wait should not fail");
+
+        assert_eq!(outcome, Some(DmAckOutcome::Accepted));
+    }
+
+    #[tokio::test]
+    async fn backoff_wait_times_out_without_ack() {
+        let (_tx, mut rx) = tokio::sync::oneshot::channel();
+
+        let outcome = wait_for_ack_or_backoff(&mut rx, Duration::from_millis(1))
+            .await
+            .expect("backoff timeout is not an error");
+
+        assert_eq!(outcome, None);
     }
 }

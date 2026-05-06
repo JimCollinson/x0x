@@ -2204,22 +2204,16 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     ) -> anyhow::Result<()> {
         let ant_peer = gossip_to_ant_peer_id(&peer);
 
-        // If not connected, or if an existing quiet connection looks stale,
-        // establish a fresh path before spending the caller's send timeout.
-        if let Err(e) = self.ensure_peer_send_ready(&ant_peer).await {
-            return Err(anyhow::anyhow!(
-                "Peer {:?} not send-ready after liveness repair: {}",
-                peer,
-                e,
-            ));
-        }
-
         // Prepare message: [stream_type_byte | data]
         let mut buf = Vec::with_capacity(1 + data.len());
         buf.push(stream_type.to_byte());
         buf.extend_from_slice(&data);
 
         // Send via ant-quic Node
+        //
+        // Do not run `ensure_peer_send_ready` here. Saorsa-gossip wraps
+        // per-peer sends in a small timeout; a multi-second liveness repair on
+        // this path turns healthy gossip degradation into a timeout/log storm.
         let node_guard = self.node.read().await;
         let node = node_guard
             .as_ref()

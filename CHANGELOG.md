@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.24] - 2026-05-06
+
+X0X-0031 hardening narrowed to the right path. The 0.19.23 release put
+multi-second liveness repair on the generic gossip send path; saorsa-
+gossip wraps per-peer sends in a 750ms timeout, so our 2s probe + 3s
+reconnect overran the gossip budget and turned healthy degradation into
+a timeout/log storm. The 0.19.23 pre-warm showed the same raw-QUIC ACK
+failure pattern + helsinki/nuremberg burning CPU in
+systemd-journald/rsyslogd from timeout log spam.
+
+### Fixed
+
+- **`x0x` `src/network.rs`** (`send_to_peer`): removed
+  `ensure_peer_send_ready` from the gossip transport send path. Gossip
+  has its own scoring/cooling/budget chain (X0X-0010..14) that's bounded
+  by the per-peer budget; layering a multi-second probe-or-reconnect on
+  top breaks the budget invariant. Liveness repair remains on raw direct
+  sends and `send_with_receive_ack` only — those paths *do* benefit
+  from probe before spending the caller's 12s DM timeout.
+
+Correctness basis: gossip's congestion behaviour is its own concern;
+the daemon-level liveness repair is the right tool for raw QUIC paths
+that don't have an upstream budget. References: RFC 9000, RFC 8085,
+RFC 9308, libp2p Gossipsub v1.1.
+
+### Verified
+
+- 665/665 nextest pass, 29/29 Python tests, `cargo clippy --all-targets
+  --all-features -- -D warnings` clean, fmt clean.
+
 ## [v0.19.23] - 2026-05-06
 
 X0X-0031 hardening on top of the 0.19.22 X0X-0030 rework. The 0.19.22

@@ -3093,7 +3093,42 @@ impl Agent {
         // until a raw probe/send path observes the live connection.
         let ant_peer_id = ant_quic::PeerId(machine_id.0);
         let machine_prefix = network::hex_prefix(&machine_id.0, 4);
-        let connected = network.is_connected(&ant_peer_id).await;
+        let mut connected = network.is_connected(&ant_peer_id).await;
+
+        // X0X-0033: when machine_id is known (resolved from cache or registry)
+        // but ant-quic isn't currently connected, the X0X-0031 send-readiness
+        // hardening (single-flight per peer + bounded concurrency, falling
+        // through to bootstrap-cache redial) used to sit behind this check
+        // unreachable from the raw path. Drive it explicitly here so the raw
+        // direct path attempts repair before bailing with AgentNotConnected.
+        // Skip when resolution == "post_connect" (last-resort branch already
+        // invoked connect_to_agent above).
+        let mut repair_outcome: Option<&'static str> = None;
+        if !connected && resolution != "post_connect" {
+            const REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+            let outcome = match tokio::time::timeout(
+                REPAIR_TIMEOUT,
+                network.ensure_peer_send_ready(&ant_peer_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => "repaired",
+                Ok(Err(_)) => "repair_failed",
+                Err(_) => "repair_timeout",
+            };
+            repair_outcome = Some(outcome);
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "send",
+                %agent_prefix,
+                %machine_prefix,
+                resolution,
+                outcome,
+                "send-readiness repair on disconnected peer"
+            );
+            connected = network.is_connected(&ant_peer_id).await;
+        }
+
         if connected {
             if let Some(reason) = self.direct_messaging.lifecycle_block_reason(&machine_id) {
                 tracing::warn!(
@@ -3102,6 +3137,7 @@ impl Agent {
                     %agent_prefix,
                     %machine_prefix,
                     resolution,
+                    ?repair_outcome,
                     reason = %reason,
                     "ignoring stale lifecycle block because ant-quic reports a live connection"
                 );
@@ -3116,6 +3152,7 @@ impl Agent {
                     %agent_prefix,
                     %machine_prefix,
                     resolution,
+                    ?repair_outcome,
                     outcome = "err_peer_disconnected",
                     reason = %reason,
                     dur_ms = send_start.elapsed().as_millis() as u64,
@@ -3131,10 +3168,11 @@ impl Agent {
                 %agent_prefix,
                 %machine_prefix,
                 resolution,
+                ?repair_outcome,
                 outcome = "err_not_connected",
                 bytes,
                 dur_ms = send_start.elapsed().as_millis() as u64,
-                "machine_id resolved but peer not currently connected"
+                "machine_id resolved but peer not currently connected after repair attempt"
             );
             return Err(error::NetworkError::AgentNotConnected(agent_id.0));
         }

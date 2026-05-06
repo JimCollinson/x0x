@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.26] - 2026-05-06
+
+X0X-0033 fix. The X0X-0031 send-readiness hardening
+(`NetworkNode::ensure_peer_send_ready` — single-flight per-peer mutex,
+bounded global concurrency, fall-through to bootstrap-cache redial)
+was effectively dead code on the raw direct-message path:
+`Agent::send_direct_raw_quic` short-circuited to `AgentNotConnected`
+when the machine_id was known but ant-quic's live connection table
+didn't currently hold the peer, never reaching `send_direct` where the
+hardening lives. External review (verified against `src/lib.rs:3044-3140`,
+`src/network.rs:1272-1296`) ranked this as the strongest first cause of
+the persistent Phase A pre-warm NO-GO results across releases 0.19.22 →
+0.19.25 (5/8 anchor command DM failures presented as `peer disconnected:
+agent not connected: <singapore>`, with anchor having an active QUIC
+connection elsewhere but transiently torn down to the destination).
+
+### Changed
+
+- **`x0x` `src/network.rs`**: `NetworkNode::ensure_peer_send_ready` is now
+  `pub` (was crate-private). Documented as the bounded single-flight
+  readiness primitive driven from both gossip and raw-DM send paths.
+- **`x0x` `src/lib.rs`**: `Agent::send_direct_raw_quic` now drives
+  `ensure_peer_send_ready` explicitly when machine_id is known but
+  `is_connected()` reports false, wrapped in a 3 s `tokio::time::timeout`,
+  re-checks `is_connected()` after repair, and only then decides whether
+  to send or return `AgentNotConnected`. Skipped when `resolution ==
+  "post_connect"` to avoid double-attempt with the existing `(None, None)`
+  fallback to `connect_to_agent`.
+
+### Added
+
+- **Telemetry**: `x0x::direct` warn-level logs gain a `repair_outcome`
+  field — `repaired | repair_failed | repair_timeout` — observable when
+  the new repair path fires on a disconnected peer. Existing log fields
+  (`agent_prefix`, `machine_prefix`, `resolution`, `outcome`, `dur_ms`)
+  retained.
+
+### Verified
+
+- `cargo fmt --all -- --check` clean.
+- `cargo clippy --all-features --all-targets -- -D warnings` clean.
+- `cargo nextest run --all-features` — full suite pass.
+
 ## [v0.19.25] - 2026-05-06
 
 X0X-0032 fix consumed end-to-end. Pairs with ant-quic 0.27.7 which

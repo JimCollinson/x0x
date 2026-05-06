@@ -1269,7 +1269,18 @@ impl NetworkNode {
         ))
     }
 
-    async fn ensure_peer_send_ready(&self, peer_id: &AntPeerId) -> NetworkResult<()> {
+    /// Drive a bounded single-flight readiness repair for a peer.
+    ///
+    /// Called from both gossip and raw-DM send paths when the peer's
+    /// connection looks idle, broken, or absent. Per-peer mutex
+    /// (`liveness_lock_for_peer`) plus a global semaphore
+    /// (`liveness_repair_semaphore`, see X0X-0031) keep concurrent fanout from
+    /// stampeding the same peer with simultaneous reconnects. When
+    /// `connected_peer_snapshot` returns `None` (peer not in the live table at
+    /// all, e.g. dropped after idle), the inner repair drops into
+    /// `connect_cached_peer`, which dials cached addresses from the bootstrap
+    /// cache.
+    pub async fn ensure_peer_send_ready(&self, peer_id: &AntPeerId) -> NetworkResult<()> {
         if !self.peer_needs_send_readiness_repair(peer_id).await? {
             return Ok(());
         }

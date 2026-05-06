@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.25] - 2026-05-06
+
+X0X-0032 fix consumed end-to-end. Pairs with ant-quic 0.27.7 which
+introduces bounded admission for `send_with_receive_ack` (100ms wait
+on `data_tx.reserve()` + Backpressured rejection variant). x0x now
+treats receive backpressure as a first-class signal with gossip
+fallback, not an opaque timeout.
+
+### Changed
+
+- **`Cargo.toml`**: ant-quic 0.27.5 → 0.27.7. Picks up
+  `ReceiveRejectReason::Backpressured` and bounded admission window in
+  the reader-task ACK emission path.
+
+### Added
+
+- **`x0x` `src/error.rs`**: `NetworkError::RemoteReceiveBackpressured`.
+- **`x0x` `src/dm.rs`**: `DmError::ReceiverBackpressured`.
+- **Raw-QUIC receive-ACK backpressure → gossip fallback**: when
+  `send_with_receive_ack` returns `RemoteReceiveBackpressured` and a
+  gossip-pubsub path is available, x0x falls back automatically.
+- **`/direct/send`** without fallback: returns 503 with
+  `receiver_backpressured` error code, distinct from
+  `peer_disconnected`. Local apps can choose retry/fallback/surface
+  semantics per their use case.
+
+### Verified
+
+- 666/666 nextest pass (new `raw_quic_receive` regression test), 29/29
+  Python tests, `cargo clippy --all-targets --all-features -- -D warnings`
+  clean, fmt clean.
+
 ## [v0.19.24] - 2026-05-06
 
 X0X-0031 hardening narrowed to the right path. The 0.19.23 release put

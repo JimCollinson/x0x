@@ -11536,6 +11536,9 @@ async fn direct_send(
                 x0x::dm::DmError::PeerDisconnected { .. } => {
                     (StatusCode::BAD_GATEWAY, "peer_disconnected")
                 }
+                x0x::dm::DmError::ReceiverBackpressured { .. } => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "receiver_backpressured")
+                }
                 x0x::dm::DmError::LocalGossipUnavailable(_) => {
                     (StatusCode::SERVICE_UNAVAILABLE, "local_gossip_unavailable")
                 }

@@ -175,6 +175,10 @@ pub enum NetworkError {
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
 
+    /// Remote receive pipeline is alive but currently unable to admit payloads.
+    #[error("remote receive pipeline backpressured: {0}")]
+    RemoteReceiveBackpressured(String),
+
     /// Connection attempt timed out.
     #[error("connection timeout to peer {peer_id:?} after {timeout:?}")]
     ConnectionTimeout {

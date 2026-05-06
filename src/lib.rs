@@ -3170,9 +3170,14 @@ impl Agent {
                 .await
             {
                 Some(Ok(())) => Ok(dm::DmPath::RawQuicAcked),
-                Some(Err(e)) => Err(error::NetworkError::ConnectionFailed(format!(
-                    "send_with_receive_ack failed: {e}"
-                ))),
+                Some(Err(e)) => {
+                    let reason = format!("send_with_receive_ack failed: {e}");
+                    if Self::raw_quic_ack_receive_backpressured(&reason) {
+                        Err(error::NetworkError::RemoteReceiveBackpressured(reason))
+                    } else {
+                        Err(error::NetworkError::ConnectionFailed(reason))
+                    }
+                }
                 None => Err(error::NetworkError::NodeCreation(
                     "network node not initialized".to_string(),
                 )),
@@ -3262,11 +3267,16 @@ impl Agent {
             {
                 !gossip_available
             }
+            error::NetworkError::RemoteReceiveBackpressured(_) => !gossip_available,
             error::NetworkError::ConnectionClosed(_)
             | error::NetworkError::ConnectionReset(_)
             | error::NetworkError::NotConnected(_) => !gossip_available,
             _ => false,
         }
+    }
+
+    fn raw_quic_ack_receive_backpressured(reason: &str) -> bool {
+        reason.contains("Remote receive pipeline rejected payload: Backpressured")
     }
 
     fn map_raw_quic_dm_error(err: error::NetworkError) -> dm::DmError {
@@ -3285,6 +3295,9 @@ impl Agent {
                     || reason.starts_with("send_with_receive_ack failed:") =>
             {
                 dm::DmError::PeerDisconnected { reason }
+            }
+            error::NetworkError::RemoteReceiveBackpressured(reason) => {
+                dm::DmError::ReceiverBackpressured { reason }
             }
             error::NetworkError::PayloadTooLarge { size, max } => {
                 dm::DmError::PayloadTooLarge { len: size, max }
@@ -7578,6 +7591,26 @@ mod tests {
             Agent::raw_quic_error_should_stop_fallback(&err, false),
             "without a gossip capability, the raw ACK failure remains terminal"
         );
+    }
+
+    #[test]
+    fn raw_quic_receive_backpressure_falls_back_when_gossip_available() {
+        let err = error::NetworkError::RemoteReceiveBackpressured(
+            "send_with_receive_ack failed: Remote receive pipeline rejected payload: Backpressured"
+                .to_string(),
+        );
+        assert!(
+            !Agent::raw_quic_error_should_stop_fallback(&err, true),
+            "receiver congestion should allow gossip fallback"
+        );
+        assert!(
+            Agent::raw_quic_error_should_stop_fallback(&err, false),
+            "without a gossip capability, receiver congestion remains terminal"
+        );
+        assert!(matches!(
+            Agent::map_raw_quic_dm_error(err),
+            dm::DmError::ReceiverBackpressured { .. }
+        ));
     }
 
     #[test]

@@ -255,6 +255,14 @@ pub enum DmError {
         reason: String,
     },
 
+    /// The recipient's receive pipeline is live but congested. Safe to retry
+    /// with backoff or use a store-and-forward fallback; do not reconnect.
+    #[error("receiver backpressured: {reason}")]
+    ReceiverBackpressured {
+        /// Transport-provided backpressure detail.
+        reason: String,
+    },
+
     /// Recipient's agent accepted the envelope but their trust policy
     /// rejected the sender.
     #[error("recipient rejected: {reason}")]

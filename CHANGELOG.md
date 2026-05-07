@@ -4,6 +4,50 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.30] - 2026-05-07
+
+Workspace lockstep bump consuming ant-quic 0.27.11 + saorsa-gossip 0.5.35.
+Targets the slow-drift residual under sustained mesh stress that the 4 h
+soak surfaced (Phase A 24-26/30 hovering, suppressed/known monotonically
+0.108 → 0.213 across 16 windows).
+
+ant-quic 0.27.11 ships X0X-0036 part 2:
+- ACK-v2 request + response streams marked **high QUIC stream priority**;
+  probes marked **scavenger** so they don't compete with DM ACK traffic.
+- New 500 ms receiver-side `send_ack_bidi_response` write+finish timeout —
+  slow/stuck response writes now recorded at the receiver instead of buried
+  as opaque sender-side ACK timeout.
+- Per-peer / per-connection / per-minute ACK stage diagnostics:
+  p50/p95/p99/p999/max latency for sender open_bi / request write /
+  request finish / sender response read / receiver demux / receiver
+  admission / receiver response write+finish, plus outcome counters
+  (accepted, rejected, timeout, invalid response, connection close).
+  Exposed via `Node::ack_diagnostics()`.
+
+### Added
+
+- `GET /diagnostics/ack` and `x0x diagnostics ack`, exposing ant-quic ACK-v2
+  per-stage latency buckets and outcome counters for X0X-0036 part 2. The
+  endpoint returns `ok`, plus an `ack` snapshot with rolling per-peer,
+  per-connection, per-minute diagnostics.
+
+### Changed
+
+- **`Cargo.toml`**: `ant-quic` 0.27.10 → 0.27.11; all 11 `saorsa-gossip-*`
+  crates 0.5.34 → 0.5.35.
+
+### Verified
+
+- `cargo fmt + clippy --all-features --all-targets -D warnings` clean.
+- `cargo nextest run --all-features` — full suite pass.
+- Cross-compile to `x86_64-unknown-linux-gnu` clean.
+
+### Migration
+
+Wire-compatible with 0.19.29 (no protocol changes; only stream priority
+and per-stream timeouts inside ant-quic). Mixed 0.19.29 ↔ 0.19.30 mesh
+is safe.
+
 ## [v0.19.29] - 2026-05-07
 
 Workspace lockstep bump consuming ant-quic 0.27.10 + saorsa-gossip 0.5.34.

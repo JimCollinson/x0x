@@ -1896,6 +1896,7 @@ async fn main() -> Result<()> {
         // Network diagnostics
         .route("/network/bootstrap-cache", get(bootstrap_cache_stats))
         .route("/diagnostics/connectivity", get(connectivity_diagnostics))
+        .route("/diagnostics/ack", get(ack_diagnostics))
         .route("/diagnostics/gossip", get(gossip_diagnostics))
         .route("/diagnostics/dm", get(dm_diagnostics))
         .route("/diagnostics/groups", get(groups_diagnostics))
@@ -12568,6 +12569,30 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({ "ok": false, "error": "node status unavailable" })),
+        ),
+    }
+}
+
+/// GET /diagnostics/ack — ACK-v2 per-stage latency and outcome diagnostics.
+async fn ack_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(network) = state.agent.network() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "network not initialized" })),
+        );
+    };
+
+    match network.ack_diagnostics().await {
+        Some(snapshot) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "ack": snapshot,
+            })),
+        ),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "ok": false, "error": "ACK diagnostics unavailable" })),
         ),
     }
 }

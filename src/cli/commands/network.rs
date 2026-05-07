@@ -103,6 +103,18 @@ pub async fn diagnostics_connectivity(client: &DaemonClient) -> Result<()> {
     Ok(())
 }
 
+/// `x0x diagnostics ack` — GET /diagnostics/ack
+///
+/// Prints ACK-v2 per-stage latency buckets and outcome counters. This splits
+/// the old opaque "ACK timeout" class into sender open/write/finish/read and
+/// receiver demux/admission/response-write stages.
+pub async fn diagnostics_ack(client: &DaemonClient) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client.get("/diagnostics/ack").await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x diagnostics gossip` — GET /diagnostics/gossip
 ///
 /// Prints PubSub drop-detection counters. Non-zero `decode_to_delivery_drops`

@@ -978,7 +978,7 @@ async fn daemon_api_complete_task() {
 }
 
 // ===========================================================================
-// Network (4)
+// Network (5)
 // ===========================================================================
 
 #[tokio::test]
@@ -1014,6 +1014,25 @@ async fn daemon_api_diagnostics_connectivity() {
     assert!(r["port_mapping"].is_object());
     assert!(r["mdns"].is_object());
     assert!(r["connections"].is_object());
+}
+
+#[tokio::test]
+#[ignore]
+async fn daemon_api_diagnostics_ack() {
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/diagnostics/ack"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    assert!(r["ack"].is_object());
+    assert!(r["ack"]["generated_at_unix_ms"].is_number());
+    assert!(r["ack"]["retention_minutes"].is_number());
+    assert!(r["ack"]["peers"].is_array());
 }
 
 #[tokio::test]

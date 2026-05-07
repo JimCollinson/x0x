@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 129,
+  "endpoint_count": 130,
   "endpoints": [
     {
       "category": "status",
@@ -133,6 +133,13 @@
       "description": "Ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS)",
       "method": "GET",
       "path": "/diagnostics/connectivity"
+    },
+    {
+      "category": "network",
+      "cli_name": "diagnostics ack",
+      "description": "ACK-v2 per-stage latency buckets and outcome counters",
+      "method": "GET",
+      "path": "/diagnostics/ack"
     },
     {
       "category": "network",

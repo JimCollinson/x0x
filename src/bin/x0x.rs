@@ -343,6 +343,8 @@ enum PeerSub {
 enum DiagnosticsSub {
     /// Print the ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS).
     Connectivity,
+    /// Print ACK-v2 stage latency buckets and outcome counters.
+    Ack,
     /// Print PubSub drop-detection counters (publish/deliver deltas).
     Gossip,
     /// Print direct-message counters, fan-out health, and per-peer state.
@@ -1148,6 +1150,7 @@ async fn run(
             DiagnosticsSub::Connectivity => {
                 commands::network::diagnostics_connectivity(&client).await
             }
+            DiagnosticsSub::Ack => commands::network::diagnostics_ack(&client).await,
             DiagnosticsSub::Gossip => commands::network::diagnostics_gossip(&client).await,
             DiagnosticsSub::Dm => commands::network::diagnostics_dm(&client).await,
             DiagnosticsSub::Groups => commands::network::diagnostics_groups(&client).await,

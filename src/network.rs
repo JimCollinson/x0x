@@ -976,6 +976,12 @@ impl NetworkNode {
         Some(node.status().await)
     }
 
+    /// Snapshot ACK-v2 per-stage latency and outcome diagnostics.
+    pub async fn ack_diagnostics(&self) -> Option<ant_quic::AckDiagnosticsSnapshot> {
+        let node = self.node.read().await.as_ref().cloned()?;
+        Some(node.ack_diagnostics())
+    }
+
     /// Active liveness probe for a peer (ant-quic 0.27.2 #173).
     ///
     /// Sends a lightweight probe envelope, waits for the remote reader's

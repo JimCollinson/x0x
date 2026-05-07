@@ -186,6 +186,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Get,
+        path: "/diagnostics/ack",
+        cli_name: "diagnostics ack",
+        description: "ACK-v2 per-stage latency buckets and outcome counters",
+        category: "network",
+    },
+    EndpointDef {
+        method: Method::Get,
         path: "/diagnostics/gossip",
         cli_name: "diagnostics gossip",
         description: "PubSub drop-detection counters (publish/deliver deltas)",

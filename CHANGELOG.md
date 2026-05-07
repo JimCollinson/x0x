@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.29] - 2026-05-07
+
+Workspace lockstep bump consuming ant-quic 0.27.10 + saorsa-gossip 0.5.34.
+ant-quic 0.27.10 ships X0X-0036 part 1: probe scavenger priority + per-peer
+single-flight + result cache + global concurrency cap (4) + 30 s receive
+suppression so real ACK-v2 traffic satisfies liveness without redundant
+probe round-trips. New `EndpointError::ProbeOverBudget` distinguishes
+local throttling from peer death.
+
+Targets the load-coupled ACK starvation x0x's W1→W2 soak collapse exposed
+(W1 30/28 then W2 24/21 with pp_to 60→473, suppressed 220→384). The cure
+is to prevent control-plane probes from competing with data-plane DM/ACK-v2
+sends, not to widen the 3 s ACK budget.
+
+### Changed
+
+- **`Cargo.toml`**: `ant-quic` 0.27.9 → 0.27.10; all 11 `saorsa-gossip-*`
+  crates 0.5.33 → 0.5.34. No source changes in x0x itself.
+- **`tests/local_vps_probe.py`**: receive-side check rewritten to use the
+  long-lived `/direct/events` SSE stream (`DirectEventWatcher`). Replaces
+  earlier polling against a non-existent `/direct/recv` endpoint. The
+  `v2l_recv` probe field is now meaningful.
+
+### Verified
+
+- `cargo fmt + clippy --all-features --all-targets -D warnings` clean.
+- `cargo nextest run --all-features` — full suite pass.
+- Cross-compile to `x86_64-unknown-linux-gnu` clean.
+
+### Migration
+
+Wire-compatible with 0.19.28 (no protocol changes, only scheduling /
+priority changes inside ant-quic). Mixed 0.19.28 ↔ 0.19.29 mesh is safe.
+
 ## [v0.19.28] - 2026-05-07
 
 Workspace lockstep bump consuming ant-quic 0.27.9 + saorsa-gossip 0.5.33.

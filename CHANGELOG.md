@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.27] - 2026-05-07
+
+Workspace lockstep bump consuming ant-quic 0.27.8 + saorsa-gossip 0.5.32.
+Pairs with X0X-0034 hypothesis testing — ant-quic 0.27.8 ships the bidi-stream
+ACK protocol (`ANQAckB2`/`ANQAckR2` replacing the 0.27.7 dual uni-stream
+`ANQAckP1`/`ANQAckC1`) plus a 5 s `SUPERSEDED_READER_DRAIN_GRACE` window so
+in-flight ACK request/response streams drain before reader-task cancellation.
+Direct fix for the supersede-race signature x0x's pre-warm 26 + 26b
+reproduced (6 × ACK timeout + 2 × Connection closed: ReaderExit per run, all
+on the X0X-0033-fixed mesh).
+
+### Changed
+
+- **`Cargo.toml`**: `ant-quic` 0.27.7 → 0.27.8; all 11 `saorsa-gossip-*`
+  crates 0.5.31 → 0.5.32. No source changes in x0x itself; the 0.19.26
+  X0X-0033 single-flight repair stays unchanged.
+
+### Verified
+
+- `cargo fmt + clippy --all-features --all-targets -D warnings` clean.
+- `cargo nextest run --all-features` — full suite pass.
+- Cross-compile to `x86_64-unknown-linux-gnu` clean.
+
+### Migration
+
+ant-quic 0.27.8's wire protocol change is gated by a renamed transport
+parameter (`ack_receive_v1` → `ack_receive_v2`). Mixed-version meshes
+(0.27.7 ↔ 0.27.8) cannot exchange ACK-requested payloads; the sender sees
+`EndpointError::NotSupported` and x0x's gossip fallback applies. Brief
+mismatch during fleet rollout is expected and survivable.
+
 ## [v0.19.26] - 2026-05-06
 
 X0X-0033 fix. The X0X-0031 send-readiness hardening

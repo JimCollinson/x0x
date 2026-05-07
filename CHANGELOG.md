@@ -4,6 +4,41 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.31] - 2026-05-07
+
+Workspace lockstep bump consuming ant-quic 0.27.12 + saorsa-gossip 0.5.36.
+ant-quic 0.27.12 ships **X0X-0037**: duplicate-safe ACK-v2 timeout retry.
+Targets the residual "sender ACK timed out after receiver delivered"
+false-negative class observed in the 0.19.30 4 h soak (sender response_read
+p99 2.7-2.8 s near the 3 s budget; W4 had sent=28 received=30, proving
+false-negative).
+
+### Added
+
+- Launch-readiness runs now capture `/diagnostics/ack` pre/post snapshots
+  under `diagnostics_ack/<scenario>/`. This keeps ACK-stage evidence alongside
+  the existing gossip snapshots without confusing the soak continuous-counter
+  parser.
+
+### Changed
+
+- **`Cargo.toml`**: `ant-quic` 0.27.11 → 0.27.12; all 11 `saorsa-gossip-*`
+  crates 0.5.35 → 0.5.36. No source changes in x0x daemon itself.
+
+### Verified
+
+- `cargo fmt + clippy --all-features --all-targets -D warnings` clean.
+- `cargo nextest run --all-features` — full suite pass.
+- Cross-compile to `x86_64-unknown-linux-gnu` clean.
+
+### Migration
+
+ant-quic 0.27.12's wire protocol bump (B2 `ANQAckB2` → B3 `ANQAckB3`) is
+incompatible with 0.27.11. Mixed-version mesh: receiver returns
+`Rejected(InvalidEnvelope)` on wrong magic (clean rejection — no hang),
+sender falls back via x0x's existing gossip path. Brief ACK-degraded
+window during rolling deploy (~5 min) is expected and survivable.
+
 ## [v0.19.30] - 2026-05-07
 
 Workspace lockstep bump consuming ant-quic 0.27.11 + saorsa-gossip 0.5.35.

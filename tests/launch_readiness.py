@@ -115,43 +115,14 @@ def redact_auth_tokens(text: str) -> str:
     return AUTH_BEARER_RE.sub("Bearer [REDACTED]", text)
 
 
-# ── Diagnostics fetcher ────────────────────────────────────────────────
 def fetch_diagnostics(node: str, ip: str, token: str, timeout: int = 12) -> Dict[str, Any]:
     """Fetch /diagnostics/gossip via SSH (avoids opening per-node tunnels)."""
-    cmd = (
-        f"curl -s --max-time {timeout} "
-        f"-H 'Authorization: Bearer {token}' "
-        f"http://127.0.0.1:12600/diagnostics/gossip"
-    )
-    try:
-        proc = subprocess.run(
-            [
-                "ssh",
-                "-o", "ControlMaster=no",
-                "-o", "ControlPath=none",
-                "-o", "BatchMode=yes",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", f"ConnectTimeout={timeout}",
-                f"root@{ip}",
-                cmd,
-            ],
-            capture_output=True,
-            timeout=timeout + 10,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise TimeoutError(
-            f"ssh+curl timed out for {node} after {timeout + 10}s"
-        ) from e
-    if proc.returncode != 0:
-        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            f"ssh+curl failed for {node}: rc={proc.returncode} "
-            f"stderr={redact_auth_tokens(stderr)}"
-        )
-    body = proc.stdout.decode("utf-8", errors="replace").strip()
-    if not body:
-        raise RuntimeError(f"empty diagnostics body from {node}")
-    return json.loads(body)
+    return fetch_remote_json(node, ip, token, "/diagnostics/gossip", timeout)
+
+
+def fetch_ack_diagnostics(node: str, ip: str, token: str, timeout: int = 12) -> Dict[str, Any]:
+    """Fetch /diagnostics/ack via SSH."""
+    return fetch_remote_json(node, ip, token, "/diagnostics/ack", timeout)
 
 
 def fetch_diagnostics_local(base_url: str, token: str, timeout: int = 12) -> Dict[str, Any]:
@@ -1483,6 +1454,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         LOG.info("=== scenario: %s ===", sname)
         scen_diag_dir = proof_dir / "diagnostics" / sname
         scen_diag_dir.mkdir(exist_ok=True)
+        scen_ack_diag_dir = proof_dir / "diagnostics_ack" / sname
+        scen_ack_diag_dir.mkdir(parents=True, exist_ok=True)
         # Pre-snapshot.
         pre_counters: Dict[str, Dict[str, int]] = {}
         for node, (ip, token) in nodes.items():
@@ -1493,6 +1466,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             except Exception as e:
                 LOG.warning("pre-snapshot %s failed: %s", node, e)
                 pre_counters[node] = {}
+            try:
+                ack_diag = fetch_ack_diagnostics(node, ip, token)
+                (scen_ack_diag_dir / f"{node}-pre.json").write_text(
+                    json.dumps(ack_diag, indent=2)
+                )
+            except Exception as e:
+                LOG.warning("pre ACK snapshot %s failed: %s", node, e)
 
         sr = SCENARIOS[sname](ctx)
 
@@ -1506,6 +1486,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             except Exception as e:
                 LOG.warning("post-snapshot %s failed: %s", node, e)
                 post_counters[node] = {}
+            try:
+                ack_diag = fetch_ack_diagnostics(node, ip, token)
+                (scen_ack_diag_dir / f"{node}-post.json").write_text(
+                    json.dumps(ack_diag, indent=2)
+                )
+            except Exception as e:
+                LOG.warning("post ACK snapshot %s failed: %s", node, e)
 
         deltas: Dict[str, Dict[str, int]] = {}
         for node in nodes:

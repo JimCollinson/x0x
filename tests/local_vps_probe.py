@@ -56,12 +56,23 @@ def log(msg: str) -> None:
 
 
 def ssh_run(ip: str, cmd: str, timeout: float = 12.0) -> tuple[int, str]:
-    """Run a shell command on a VPS via SSH; return (exit_code, stdout)."""
-    proc = subprocess.run(
-        ["ssh", *SSH_OPTS, f"root@{ip}", cmd],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    return proc.returncode, proc.stdout
+    """Run a shell command on a VPS via SSH; return (exit_code, stdout).
+
+    On timeout or any subprocess failure, return (124, "") so callers see a
+    non-zero exit code instead of crashing the probe. SSH timeouts are an
+    expected hazard during a 4 h soak (transient mesh stress, route flaps);
+    the probe must keep recording instead of dying.
+    """
+    try:
+        proc = subprocess.run(
+            ["ssh", *SSH_OPTS, f"root@{ip}", cmd],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return proc.returncode, proc.stdout
+    except subprocess.TimeoutExpired:
+        return 124, ""
+    except Exception:
+        return 1, ""
 
 
 def ssh_get_token(ip: str) -> str:

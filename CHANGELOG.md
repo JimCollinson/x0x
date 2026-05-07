@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.28] - 2026-05-07
+
+Workspace lockstep bump consuming ant-quic 0.27.9 + saorsa-gossip 0.5.33.
+ant-quic 0.27.9 ships the X0X-0035 fix (ACK-v2 / relay-CONNECT-UDP bidi
+accept-race resolved via prefix-peek demux on both sides). The
+`invalid ACK-v2 response envelope` failure class observed in the 0.19.27
+30-min soak (5 + 4 = 9 across two windows) targets exactly this race.
+
+### Changed
+
+- **`Cargo.toml`**: `ant-quic` 0.27.8 → 0.27.9; all 11 `saorsa-gossip-*`
+  crates 0.5.32 → 0.5.33. No source changes in x0x itself.
+
+### Verified
+
+- `cargo fmt + clippy --all-features --all-targets -D warnings` clean.
+- `cargo nextest run --all-features` — full suite pass.
+- Cross-compile to `x86_64-unknown-linux-gnu` clean.
+
+### Migration
+
+Wire-compatible with 0.19.27 (same ACK-v2 magic + transport parameter).
+Mixed 0.19.27 ↔ 0.19.28 mesh is safe.
+
 ## [v0.19.27] - 2026-05-07
 
 Workspace lockstep bump consuming ant-quic 0.27.8 + saorsa-gossip 0.5.32.

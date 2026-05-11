@@ -235,6 +235,101 @@ class LaunchReadinessGateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.lr.parse_partition_pair("sfo,moon", "nyc", nodes)
 
+    def test_broad_launch_dispatcher_timeout_strict_zero_passes_at_zero(self) -> None:
+        deltas = {
+            "nyc": {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+            }
+        }
+        posts = {"nyc": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100}}
+        scenario = self.lr.ScenarioResult(
+            name="fanout_burst",
+            duration_secs=1.0,
+        )
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertTrue(passed)
+        self.assertEqual([], violations)
+
+    def test_broad_launch_dispatcher_timeout_strict_zero_fails_at_one(self) -> None:
+        deltas = {
+            "helsinki": {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 1,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+            }
+        }
+        posts = {
+            "helsinki": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100}
+        }
+        scenario = self.lr.ScenarioResult(name="fanout_burst", duration_secs=1.0)
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertFalse(passed)
+        self.assertTrue(
+            any("dispatcher_timed_out delta" in v for v in violations),
+            violations,
+        )
+
+    def test_broad_launch_phase_a_strict_thirty_passes_at_thirty(self) -> None:
+        deltas = {
+            "nyc": {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+            }
+        }
+        posts = {"nyc": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100}}
+        scenario = self.lr.ScenarioResult(
+            name="baseline",
+            duration_secs=1.0,
+            extra_metrics={"phase_a_received": 30, "phase_a_sent": 30},
+        )
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertTrue(passed)
+        self.assertEqual([], violations)
+
+    def test_broad_launch_phase_a_strict_thirty_fails_at_twenty_nine(self) -> None:
+        deltas = {
+            "nyc": {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+            }
+        }
+        posts = {"nyc": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100}}
+        scenario = self.lr.ScenarioResult(
+            name="baseline",
+            duration_secs=1.0,
+            extra_metrics={"phase_a_received": 29, "phase_a_sent": 29},
+        )
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertFalse(passed)
+        self.assertTrue(
+            any("phase A received" in v for v in violations),
+            violations,
+        )
+
     def test_dispatcher_timeout_exempt_nodes_are_scenario_scoped(self) -> None:
         deltas = {
             "sfo": {

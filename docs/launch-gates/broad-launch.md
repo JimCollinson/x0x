@@ -8,6 +8,47 @@ recv-pump drops, suppression ratio, Phase A delivery, and restart
 recovery. Per-peer timeout and suppression handling are intentionally
 scale-aware rather than stricter absolute counts.
 
+## Two-layer evaluation model
+
+Broad-launch certification has **two distinct layers** that evaluate
+the mesh on different timescales:
+
+1. **`launch_readiness.py` — per-window strict gate.** A single
+   15-minute scenario window is treated as an investigation trigger:
+   any `dispatcher_timed_out` event, any recv-pump drop, any Phase A
+   pair miss, or any `data_tx` high-water event in that window =
+   per-window NO-GO. This layer surfaces transient regressions early,
+   not certifies the release.
+
+2. **`launch_soak.py` — aggregate multi-burn-rate certification.**
+   This is the actual broad-launch certifier. It runs `launch_readiness.py`
+   on a 15-minute cadence for hours, then evaluates aggregate SLOs:
+
+   - `dispatcher_noise_policy` (tests/launch_soak.py:211) classifies
+     fleet-wide dispatcher noise using normalized rates:
+     `legacy-count-ok` (≤5 events in 12h), `adaptive-rate-ok`
+     (≤0.01% of completed dispatches), `fleet-rate-high`,
+     `window-rate-high`, or `consecutive-anomalies` (>2 windows of
+     baseline×4 anomaly).
+   - `tolerated_dispatcher_windows` (tests/launch_soak.py:454)
+     reclassifies per-window NO-GOs whose **only** violation is
+     `dispatcher_timed_out delta` (with Phase A still ≥30 and
+     `dropped_full == 0`) as tolerated, so a window that fired the
+     per-window investigation trigger doesn't fail the soak unless
+     the aggregate policy also flags it.
+   - `effective_failed` (tests/launch_soak.py:453) counts only
+     windows that fail for reasons beyond dispatcher noise.
+   - `overall_pass` (tests/launch_soak.py:468) requires zero
+     `effective_failed`, zero missing windows, zero unaccounted
+     telemetry gaps, `dispatcher_noise_policy.passed == true`, and
+     cumulative `dropped_full == 0`.
+
+   This is the implementation of the X0X-0065 SOTA "Pattern 1"
+   multi-burn-rate framework (Google SRE / Datadog / k6). The
+   per-window gate is intentionally strict so that the aggregate
+   policy has high-signal input to classify; do not relax the
+   per-window thresholds to make individual windows pass.
+
 ## Run
 
 ```
@@ -54,16 +95,36 @@ This proof is about topic-overlay shape, not WAN reachability. It must
 show that a hot topic keeps per-node EAGER and LAZY views bounded while
 the global aggregate traffic grows with subscriber count.
 
-## Thresholds (per-scenario window, ~5-10 min)
+## Per-window thresholds (`launch_readiness.py`, ~5-10 min)
+
+These are the strict investigation triggers for one 15-minute window.
+Each is an "any event = NO-GO for this window" gate. They are the
+input to the soak-level aggregate classifier — do not relax them to
+make individual windows pass.
 
 | Metric | Threshold | Rationale |
 |---|---|---|
-| `dispatcher.pubsub.timed_out` delta per node | 0 | At broad-launch scale, a single dispatcher timeout per window is a regression to investigate. |
+| `dispatcher.pubsub.timed_out` delta per node | 0 | At broad-launch scale, a single dispatcher timeout per window is a regression to investigate. The soak-level `dispatcher_noise_policy` decides whether the aggregate pattern is tolerable. |
 | `recv_pump.pubsub.dropped_full` delta per node | 0 | Broad-launch must demonstrate the overload policy never engages on the bootstrap mesh. |
 | `republish_per_peer_timeout / dispatcher.pubsub.completed` delta ratio per node | ≤ 0.25 | Per-peer timeouts are downstream isolated-send events. The broad-launch gate normalizes them by handled PubSub volume so a busier healthy mesh is not failed for natural RTT variance. |
 | `suppressed_peers / known_peer_topic_pairs` at end of run | ≤ 0.12 | Suppression is a bounded cooling set, but the healthy absolute count scales with fleet activity and topic count. The 2026-05-03 12h soak observed 101-134 suppressed entries on the Nuremberg node with roughly 1.3k-1.4k known peer-topic scores, which is healthy but above the old absolute-100 bar. The warmed 2026-05-04 2h soak stayed clean on Phase A, dispatcher timeouts, and drops while the suppression ratio ranged 0.083-0.113, so 0.12 is the calibrated broad-launch ceiling. |
-| Phase A directed-pair receives | = 30 | Always. |
+| Phase A directed-pair receives | = 30 | Always. A miss in one window is a per-window NO-GO; soak certification is decided by `effective_failed` after the dispatcher-only tolerated set is applied. |
 | Restart-storm recovery | ≤ 30s | Indicates the bootstrap cache and ant-quic re-handshake path are healthy. |
+| `data_tx.high_water_count` delta per node | 0 | X0X-0039 + X0X-0063 acceptance — any saturation event signals a real back-pressure regression even at the 50_000 capacity. |
+
+## Soak-level aggregate gate (`launch_soak.py`)
+
+| Metric | Threshold | Source |
+|---|---|---|
+| `effective_failed` windows | 0 (after `tolerated_dispatcher_windows` removed) | tests/launch_soak.py:453 |
+| `missing` windows | 0 | tests/launch_soak.py:413 |
+| `unaccounted_gap_windows` | 0 | tests/launch_soak.py:433 |
+| Cumulative `dropped_full` | ≤ `SOAK_MAX_RECV_PUMP_DROPPED_FULL_DELTA` (0) | tests/launch_soak.py:438 |
+| `dispatcher_noise_policy.passed` | `true` (verdict ∈ {legacy-count-ok, adaptive-rate-ok}) | tests/launch_soak.py:266 |
+| Aggregate `dispatcher_timed_out` total | ≤ `SOAK_MAX_DISPATCHER_TIMED_OUT_DELTA_PER_12H` (5) **or** rate ≤ `SOAK_MAX_DISPATCHER_TIMEOUT_RATIO` (0.0001) | tests/launch_soak.py:254 |
+| Max per-window dispatcher rate | ≤ `SOAK_MAX_DISPATCHER_TIMEOUT_RATIO_PER_WINDOW` (0.0001) | tests/launch_soak.py:261 |
+| Consecutive baseline×4 anomaly windows | ≤ `SOAK_MAX_CONSECUTIVE_DISPATCHER_ANOMALY_WINDOWS` (2) | tests/launch_soak.py:263 |
+| Tolerated dispatcher-only windows | reported, do not fail soak | tests/launch_soak.py:454 |
 
 The harness still reports raw `republish_per_peer_timeout` deltas and
 raw `suppressed_peers` counts in `summary.md` and `summary.csv`. Treat a

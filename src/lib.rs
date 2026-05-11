@@ -3391,16 +3391,28 @@ impl Agent {
         let machine_prefix = network::hex_prefix(&machine_id.0, 4);
         let self_prefix = network::hex_prefix(&self.identity.agent_id().0, 4);
 
-        // First attempt: race send_with_receive_ack against same-peer Replaced,
+        // First attempt: race send_with_receive_ack against same-peer Replaced
         // and (X0X-0066) against a per-peer EWMA-based hedge timer that fires
-        // a duplicate `send_with_receive_ack` when the original is still in
-        // flight at the trigger threshold. Receiver-side dedupe is provided
-        // by X0X-0060 `RecentDeliveryCache`: both sends carry identical
-        // `wire` bytes (same `request_id`), so the receiver collapses the
-        // second arrival and republishes the cached ACK outcome on the
-        // hedge stream. Whichever ACK arrives first wins.
+        // a duplicate send when the original is still in flight at the
+        // trigger threshold.
+        //
+        // Receiver-side dedupe is provided by ant-quic 0.27.21's
+        // `AckRequestDedupeCache`: both sends carry the SAME caller-supplied
+        // ACK-v2 `request_id`, so the receiver replays the cached ACK on the
+        // wire for the second arrival WITHOUT redelivering the payload to
+        // `recv()`. Whichever ACK lands first wins; the loser's future is
+        // dropped (Quinn streams are drop-safe — same contract X0X-0053
+        // already relies on).
+        use rand::RngCore;
         let send_start = std::time::Instant::now();
-        let send_fut = network.send_with_receive_ack(ant_peer_id, wire, timeout);
+        let mut hedge_request_id = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut hedge_request_id);
+        let send_fut = network.send_with_receive_ack_with_request_id(
+            ant_peer_id,
+            hedge_request_id,
+            wire,
+            timeout,
+        );
         tokio::pin!(send_fut);
 
         let hedge_trigger = self.hedge_rtt_tracker.hedge_trigger(&ant_peer_id, timeout);
@@ -3414,6 +3426,12 @@ impl Agent {
             >,
         >;
         let mut hedge_fut: Option<HedgeSendFut<'_>> = None;
+        // Reviewer P1.2: a single bool is sufficient for single-count
+        // accounting. Each counter-recording path (record_hedge_won /
+        // record_hedge_lost) is followed immediately by `return`, so
+        // none can fire twice in one call. The `hedge_fired` flag only
+        // gates the `record_hedge_lost` increment in the original-success
+        // path so we don't count a lost hedge that was never issued.
         let mut hedge_fired = false;
 
         let superseded_to: u64;
@@ -3434,6 +3452,11 @@ impl Agent {
                         Some(Ok(())) => {
                             self.hedge_rtt_tracker
                                 .record_success(ant_peer_id, send_start.elapsed());
+                            // Reviewer P1.2: count hedge_lost only when
+                            // the hedge was actually issued and did not
+                            // already win via the hedge_result arm (both
+                            // win paths `return` immediately, so we can't
+                            // reach here after recording hedge_won).
                             if hedge_fired {
                                 self.direct_messaging.record_hedge_lost();
                             }
@@ -3488,7 +3511,7 @@ impl Agent {
                         None => std::future::pending().await,
                     }
                 }, if hedge_fut.is_some() => {
-                    // X0X-0066: hedged send completed before the original.
+                    // X0X-0066: hedged send resolved before the original.
                     match hedge_result {
                         Some(Ok(())) => {
                             self.hedge_rtt_tracker
@@ -3497,32 +3520,47 @@ impl Agent {
                             return Ok(dm::DmPath::RawQuicAcked);
                         }
                         Some(Err(_)) | None => {
-                            // Hedge failed — drop it and keep waiting for
-                            // the original (or Replaced) to resolve. Do
-                            // not propagate hedge errors: the original is
+                            // Reviewer P1.2: hedge errored. Do NOT record
+                            // hedge_lost here — that would double-count
+                            // when the original later succeeds. The
+                            // hedge is simply dropped; the original is
                             // still authoritative.
                             hedge_fut = None;
-                            self.direct_messaging.record_hedge_lost();
                         }
                     }
                 }
                 () = &mut hedge_timer, if !hedge_fired => {
                     // X0X-0066: trigger threshold reached and original still
-                    // in flight. Spawn a duplicate `send_with_receive_ack`
-                    // with the SAME wire bytes; the receiver dedupes via
-                    // X0X-0060 `RecentDeliveryCache` and replays the cached
-                    // ACK outcome on the hedge stream.
+                    // in flight. Issue a duplicate send with the SAME
+                    // request_id; ant-quic 0.27.21's AckRequestDedupeCache
+                    // replays the cached ACK on the wire without
+                    // redelivering the payload to the receiver's recv().
+                    //
+                    // Reviewer P1.1: use the REMAINING budget for the hedge
+                    // so total caller latency cannot exceed the original
+                    // ACK timeout. Floor at 1 ms so a hedge that fires at
+                    // ~timeout doesn't pass zero through and short-circuit
+                    // to AckTimeout immediately.
                     hedge_fired = true;
                     self.direct_messaging.record_hedge_fired();
+                    let remaining = timeout
+                        .saturating_sub(send_start.elapsed())
+                        .max(std::time::Duration::from_millis(1));
                     tracing::debug!(
                         target: "dm.hedge",
                         from = %self_prefix,
                         to = %agent_prefix,
                         trigger_ms = hedge_trigger.as_millis() as u64,
                         elapsed_ms = send_start.elapsed().as_millis() as u64,
-                        "X0X-0066: hedge timer fired; issuing duplicate send_with_receive_ack",
+                        remaining_budget_ms = remaining.as_millis() as u64,
+                        "X0X-0066: hedge timer fired; issuing duplicate send_with_receive_ack_with_request_id",
                     );
-                    let fut = network.send_with_receive_ack(ant_peer_id, wire, timeout);
+                    let fut = network.send_with_receive_ack_with_request_id(
+                        ant_peer_id,
+                        hedge_request_id,
+                        wire,
+                        remaining,
+                    );
                     hedge_fut = Some(Box::pin(fut));
                 }
                 replaced = replaced_rx.recv() => {

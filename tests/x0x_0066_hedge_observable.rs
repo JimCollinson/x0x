@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tempfile::TempDir;
-use tokio::time::Instant;
+use tokio::time::{timeout, Instant};
 
 use x0x::dm::{DmPath, DmSendConfig};
 use x0x::network::NetworkConfig;
@@ -217,5 +217,104 @@ async fn loopback_send_does_not_fire_hedge_and_records_rtt_sample() {
     assert!(
         (0.0..5_000.0).contains(&ewma),
         "observed loopback RTT should be a small positive ms value, got {ewma}"
+    );
+}
+
+/// X0X-0066 reviewer P0 acceptance — two `send_with_receive_ack_with_request_id`
+/// calls with the same `(peer_id, request_id, wire)` deliver the payload
+/// to `subscribe_direct()` **exactly once**.
+///
+/// This is the dedupe invariant the hedge relies on. ant-quic 0.27.21's
+/// receiver-side `AckRequestDedupeCache` replays the cached ACK on the
+/// second arrival without redelivering the payload to `recv()`, which is
+/// the channel that backs `network::NetworkNode::recv_direct` →
+/// `DirectMessaging::handle_incoming` → user `subscribe_direct`
+/// subscribers. The earlier x0x hedge (commit a9f1007) generated a fresh
+/// ACK-v2 request_id per call inside `network.send_with_receive_ack`, so
+/// the dedupe cache never fired and two distinct receive-pipeline
+/// deliveries reached `subscribe_direct` — double-delivery to file
+/// transfer, exec, and generic DM consumers. This test pins the fixed
+/// behaviour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_calls_with_same_request_id_deliver_to_subscriber_exactly_once() {
+    let dir = TempDir::new().expect("tmpdir");
+    let alice = Arc::new(build_agent(&dir, "alice").await);
+    let bob = Arc::new(build_agent(&dir, "bob").await);
+
+    alice.join_network().await.expect("alice joins");
+    bob.join_network().await.expect("bob joins");
+
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+
+    let bob_addr = normalize_loopback(
+        bob_network
+            .bound_addr()
+            .await
+            .expect("bob bound to a loopback addr"),
+    );
+    let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+
+    let _ = alice_network
+        .connect_addr(bob_addr)
+        .await
+        .expect("alice connects to bob");
+
+    let connected_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < connected_deadline {
+        if alice_network.is_connected(&bob_peer).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(alice_network.is_connected(&bob_peer).await);
+
+    // Subscribe to bob's direct channel BEFORE the sends so we never
+    // miss a delivery.
+    let mut bob_rx = bob.subscribe_direct();
+
+    // Build a raw direct-message wire: [0x10][32-byte sender_agent_id][payload].
+    // Then issue TWO send_with_receive_ack_with_request_id calls with
+    // the SAME request_id and SAME wire bytes. ant-quic's
+    // AckRequestDedupeCache must replay the second ACK without
+    // redelivering to recv().
+    let payload = b"x0x-0066 reviewer deterministic test".to_vec();
+    let mut wire: Vec<u8> = Vec::with_capacity(1 + 32 + payload.len());
+    wire.push(0x10); // DIRECT_MESSAGE_STREAM_TYPE
+    wire.extend_from_slice(&alice.agent_id().0);
+    wire.extend_from_slice(&payload);
+
+    let request_id: [u8; 16] = [
+        0xc0, 0xff, 0xee, 0x66, 0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce, 0x13, 0x37, 0xba,
+        0xbe,
+    ];
+
+    alice_network
+        .send_with_receive_ack_with_request_id(bob_peer, request_id, &wire, Duration::from_secs(5))
+        .await
+        .expect("first send returns Some")
+        .expect("first send Ok");
+
+    alice_network
+        .send_with_receive_ack_with_request_id(bob_peer, request_id, &wire, Duration::from_secs(5))
+        .await
+        .expect("second send returns Some (cached ACK replay)")
+        .expect("second send Ok (cached ACK replay)");
+
+    // First delivery must arrive at subscribe_direct.
+    let first = timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("first delivery timeout")
+        .expect("first delivery channel");
+    assert_eq!(first.sender, alice.agent_id());
+    assert_eq!(first.payload, payload);
+
+    // Second delivery must NOT arrive — the duplicate request_id is
+    // dropped at ant-quic's AckRequestDedupeCache, so the payload is
+    // never put on bob's recv pipeline a second time.
+    let no_second = timeout(Duration::from_millis(750), bob_rx.recv()).await;
+    assert!(
+        no_second.is_err(),
+        "duplicate request_id must not deliver twice to subscribe_direct, got {no_second:?}"
     );
 }

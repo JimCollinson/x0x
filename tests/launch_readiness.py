@@ -306,6 +306,12 @@ def extract_counters(diag: Dict[str, Any]) -> Dict[str, int]:
     kinds = ps.get("message_kinds", {}) or {}
     sp = ps.get("suppressed_peers", []) or []
     scores = ps.get("peer_scores", []) or []
+    topic_caches = ps.get("topic_caches", []) or []
+    cache_stats = [
+        row.get("cache", {}) or {}
+        for row in topic_caches
+        if isinstance(row, dict)
+    ]
     return {
         "dispatcher_completed": int(disp.get("completed", 0)),
         "dispatcher_timed_out": int(disp.get("timed_out", 0)),
@@ -326,6 +332,20 @@ def extract_counters(diag: Dict[str, Any]) -> Dict[str, int]:
         "peer_scores_eager_eligible": sum(1 for r in scores if r.get("eager_eligible")),
         "peer_scores_lazy": sum(1 for r in scores if r.get("role") == "lazy"),
         "peer_scores_excluded": sum(1 for r in scores if r.get("role") == "excluded"),
+        "pubsub_cache_topics": len(cache_stats),
+        "pubsub_cache_msg_count": sum(int(c.get("msg_count", 0)) for c in cache_stats),
+        "pubsub_cache_total_bytes": sum(int(c.get("total_bytes", 0)) for c in cache_stats),
+        "pubsub_cache_oldest_age_secs_max": max(
+            (int(c.get("oldest_age_secs", 0)) for c in cache_stats),
+            default=0,
+        ),
+        "pubsub_cache_evicted_by_age": sum(int(c.get("evicted_by_age", 0)) for c in cache_stats),
+        "pubsub_cache_evicted_by_bytes": sum(
+            int(c.get("evicted_by_bytes", 0)) for c in cache_stats
+        ),
+        "pubsub_cache_evicted_by_count": sum(
+            int(c.get("evicted_by_count", 0)) for c in cache_stats
+        ),
     }
 
 
@@ -338,6 +358,9 @@ MONOTONIC_COUNTER_FIELDS = {
     "data_tx_high_water_count",
     "gso_bundle_send_total",
     "gso_bundle_partial_send",
+    "pubsub_cache_evicted_by_age",
+    "pubsub_cache_evicted_by_bytes",
+    "pubsub_cache_evicted_by_count",
 }
 
 

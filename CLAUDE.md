@@ -1,6 +1,80 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+These rules apply to every task in this project unless explicitly overridden.
+Bias: caution over speed on non-trivial work. Use judgment on trivial tasks.
+
+## Rule 1 — Think Before Coding
+State assumptions explicitly. If uncertain, ask rather than guess.
+Present multiple interpretations when ambiguity exists.
+Push back when a simpler approach exists.
+Stop when confused. Name what's unclear.
+
+## Rule 2 — Simplicity First
+Minimum code that solves the problem. Nothing speculative.
+No features beyond what was asked. No abstractions for single-use code.
+Test: would a senior engineer say this is overcomplicated? If yes, simplify.
+
+## Rule 3 — Surgical Changes
+Touch only what you must. Clean up only your own mess.
+Don't "improve" adjacent code, comments, or formatting.
+Don't refactor what isn't broken. Match existing style.
+
+## Rule 4 — Goal-Driven Execution
+Define success criteria. Loop until verified.
+Don't follow steps. Define success and iterate.
+Strong success criteria let you loop independently.
+
+## Rule 5 — Use the model only for judgment calls
+Use me for: classification, drafting, summarization, extraction.
+Do NOT use me for: routing, retries, deterministic transforms.
+If code can answer, code answers.
+
+## Rule 6 — Token budgets are not advisory
+Per-task: 4,000 tokens. Per-session: 30,000 tokens.
+If approaching budget, summarize and start fresh.
+Surface the breach. Do not silently overrun.
+
+## Rule 7 — Surface conflicts, don't average them
+If two patterns contradict, pick one (more recent / more tested).
+Explain why. Flag the other for cleanup.
+Don't blend conflicting patterns.
+
+## Rule 8 — Read before you write
+Before adding code, read exports, immediate callers, shared utilities.
+"Looks orthogonal" is dangerous. If unsure why code is structured a way, ask.
+
+## Rule 9 — Tests verify intent, not just behavior
+Tests must encode WHY behavior matters, not just WHAT it does.
+A test that can't fail when business logic changes is wrong.
+
+## Rule 10 — Checkpoint after every significant step
+Summarize what was done, what's verified, what's left.
+Don't continue from a state you can't describe back.
+If you lose track, stop and restate.
+
+## Rule 11 — Match the codebase's conventions, even if you disagree
+Conformance > taste inside the codebase.
+If you genuinely think a convention is harmful, surface it. Don't fork silently.
+
+## Rule 12 — Fail loud
+"Completed" is wrong if anything was skipped silently.
+"Tests pass" is wrong if any were skipped.
+Default to surfacing uncertainty, not hiding it.
+
+## On-Demand Reference Docs
+
+These are NOT auto-loaded. Read them when the task touches the relevant area.
+
+- Test suite (integration + e2e tables, running e2e, VPS ports, SSH notes):
+  `tests/CLAUDE.md` (auto-loaded when working in `tests/`)
+- Full REST + WebSocket API: `docs/api-reference.md`
+- Self-update system internals: `docs/upgrade-system.md`
+- Trust model, connectivity, enhanced announcements: `docs/trust-and-connectivity.md`
+- x0x-symphony integration: `docs/symphony-integration.md`
+- CI/CD workflows: `docs/cicd.md`
+- Remote exec design + ACL: `docs/exec.md`, `docs/design/x0x-exec.md`
+- Non-Rust app integration examples: `docs/local-apps.md`
+- Named-groups full model: `docs/design/named-groups-full-model.md`
 
 ## What is x0x
 
@@ -61,26 +135,7 @@ All IDs are SHA-256 hashes of ML-DSA-65 public keys (32 bytes).
 5. **Presence** (`presence.rs`): SOTA presence system via `saorsa-gossip-presence`. Beacons propagate on `GossipStreamType::Bulk`. Phi-Accrual lite adaptive failure detection (180–600s), FOAF random-walk discovery with trust-scoped privacy (`PresenceVisibility::Network` vs `Social`), bootstrap cache enrichment from beacons, quality-weighted FOAF peer selection. Surpasses libp2p presence; matches Tailscale for NAT-aware discovery.
 6. **CRDT** (`crdt/`): Collaborative task lists with OR-Set checkboxes (Empty/Claimed/Done), LWW-Register metadata, RGA ordering. Deltas can be encrypted via MLS groups.
 7. **MLS** (`mls/`): Group encryption using ChaCha20-Poly1305. `MlsGroup` manages membership, `MlsKeySchedule` derives epoch keys, `MlsWelcome` onboards new members.
-8. **Group Discovery** (`groups/`): DHT-free distributed discovery via three tiers: social propagation (agents share cards in conversation), tag shards (BLAKE3-hashed tags → 65,536 PlumTree topics with CRDT OR-Set anti-entropy), and presence-social browsing (groups nearby agents are in). Path caching on relay nodes provides hot-shard mitigation. Fully partition-tolerant — each network fragment maintains complete shard state independently, merges automatically on reconnection. See `docs/design/named-groups-full-model.md`.
-
-### Self-Update System (`upgrade/`)
-
-Manifest-based decentralized self-update with symmetric gossip propagation:
-
-- **`manifest.rs`**: `ReleaseManifest` and `PlatformAsset` types, length-prefixed wire format (`[4-byte BE len][JSON][ML-DSA-65 sig]`), platform target detection (including musl vs glibc)
-- **`signature.rs`**: ML-DSA-65 signing/verification for archives and manifests. Embedded release public key.
-- **`monitor.rs`**: `UpgradeMonitor` polls GitHub releases, `fetch_verified_manifest()` downloads and verifies manifest+signature, returns `VerifiedRelease` with pre-encoded gossip payload
-- **`apply.rs`**: `apply_upgrade_from_manifest()` — downloads archive, verifies SHA-256 hash, extracts binary, performs atomic replacement with rollback
-- **`rollout.rs`**: Staged rollout with deterministic delay based on machine ID hash (configurable window)
-
-**Update flow** (for x0xd):
-1. **Startup**: Check GitHub for new release, broadcast manifest to gossip if found
-2. **Gossip listener**: Receive manifests on `x0x/releases` topic, verify signature, rebroadcast, apply if newer
-3. **GitHub poller**: Periodic fallback poll, broadcast discovered manifests to gossip
-
-All nodes verify and rebroadcast manifests (symmetric propagation — no privileged bootstrap role).
-
-**CI**: `release.yml` generates `release-manifest.json` and `release-manifest.json.sig` via `x0x-keygen manifest` during the release signing job.
+8. **Group Discovery** (`groups/`): DHT-free distributed discovery via three tiers: social propagation (agents share cards in conversation), tag shards (BLAKE3-hashed tags → 65,536 PlumTree topics with CRDT OR-Set anti-entropy), and presence-social browsing (groups nearby agents are in). Path caching on relay nodes provides hot-shard mitigation. Fully partition-tolerant. See `docs/design/named-groups-full-model.md`.
 
 ### Module Dependency Flow
 
@@ -97,7 +152,7 @@ lib.rs (Agent, AgentBuilder, TaskListHandle, KvStoreHandle)
   ├── groups/      ← GroupInfo, GroupPolicy, GroupMember, GroupCard, SignedInvite, AgentCard, discovery index
   ├── mls/         ← MlsGroup, MlsCipher, MlsKeySchedule, MlsWelcome
   ├── presence.rs  ← SOTA presence: beacons, FOAF, adaptive detection, trust privacy
-  ├── upgrade/     ← Self-update: manifest, monitor, apply, rollout, signature
+  ├── upgrade/     ← Self-update — see docs/upgrade-system.md
   └── gui/         ← Embedded HTML GUI (compiled into binary via include_str!)
 ```
 
@@ -116,31 +171,22 @@ let rx = agent.subscribe("topic").await?; // Gossip pub/sub
 agent.publish("topic", payload).await?;
 
 // Identity accessors
-agent.machine_id()       // MachineId
-agent.agent_id()         // AgentId
-agent.user_id()          // Option<UserId>
+agent.machine_id()        // MachineId
+agent.agent_id()          // AgentId
+agent.user_id()           // Option<UserId>
 agent.agent_certificate() // Option<&AgentCertificate>
 
 // KvStore — replicated key-value with access control
 let store = agent.create_kv_store("name", "topic").await?;
 store.put("key".into(), b"value".to_vec(), "text/plain".into()).await?;
-let entry = store.get("key").await?;
-let keys = store.keys().await?;
-store.remove("key").await?;
 
 // Presence — SOTA discovery with FOAF and adaptive detection
-let rx = agent.subscribe_presence().await?;       // AgentOnline/AgentOffline events
-let agents = agent.discover_agents_foaf(2).await?; // FOAF walk, TTL=2
-let found = agent.discover_agent_by_id(id, 3).await?; // Find specific agent
-let cached = agent.cached_agent(&id).await?;       // Local cache lookup (no network)
-let pw = agent.presence_system().unwrap();          // Access PresenceWrapper
-let config = pw.config();                           // PresenceConfig
-
-// Local discovery is handled by ant-quic transport connectivity by default.
-
-// Named groups with invite links
-// (managed via REST API: POST /groups, POST /groups/:id/invite, etc.)
+let rx = agent.subscribe_presence().await?;         // AgentOnline/AgentOffline events
+let agents = agent.discover_agents_foaf(2).await?;  // FOAF walk, TTL=2
+let cached = agent.cached_agent(&id).await?;        // Local cache lookup (no network)
 ```
+
+Named groups, MLS, file transfer, task lists, and diagnostics are managed via the REST API — see `docs/api-reference.md` when working on those surfaces.
 
 ### Error Handling
 
@@ -157,29 +203,25 @@ Keypairs are serialized with **bincode** (compact binary), not JSON. Manual seri
 
 ## Binary: x0x (CLI)
 
-`src/bin/x0x.rs` — unified CLI that controls a running `x0xd` daemon. Every REST endpoint is mapped to a CLI subcommand. Shared endpoint registry in `src/api/mod.rs` ensures routes and CLI commands stay in sync. CLI modules in `src/cli/`.
+`src/bin/x0x.rs` — unified CLI that controls a running `x0xd` daemon. Every REST endpoint is mapped to a CLI subcommand. Shared endpoint registry in `src/api/mod.rs` keeps routes and CLI commands in sync. CLI modules in `src/cli/`.
 
 Key commands: `x0x start`, `x0x health`, `x0x agent`, `x0x contacts`, `x0x publish`, `x0x direct send`, `x0x exec <agent> -- <argv...>`, `x0x groups`, `x0x tasks`, `x0x presence online|foaf|find|status`, `x0x routes` (prints all endpoints).
 
-### Tier-1 Remote Exec
-
-`x0x exec` runs non-interactive, strictly allowlisted commands on a remote daemon over signed/encrypted gossip-DM frames. It is disabled unless an exec ACL is present and has `[exec].enabled = true`. Default ACL path is `/etc/x0x/exec-acl.toml` on Linux and `/usr/local/etc/x0x/exec-acl.toml` on macOS; tests can override with `x0xd --exec-acl <PATH>`. See `docs/exec.md` and `docs/design/x0x-exec.md`.
-
-REST endpoints: `POST /exec/run`, `POST /exec/cancel`, `GET /exec/sessions`, `GET /diagnostics/exec`.
+`x0x exec` is gated behind an exec ACL (default `/etc/x0x/exec-acl.toml` on Linux, `/usr/local/etc/x0x/exec-acl.toml` on macOS) and disabled unless `[exec].enabled = true`. See `docs/exec.md`.
 
 ### x0xd Daemon Flags
 
 ```
 x0xd [OPTIONS]
-  --config <PATH>       Path to config file (TOML)
-  --name <NAME>         Instance name for multi-instance support
+  --config <PATH>                 Path to config file (TOML)
+  --name <NAME>                   Instance name for multi-instance support
   --api-port <PORT>               Override API server port (otherwise ephemeral for named instances)
   --no-hard-coded-bootstrap       Skip configured bootstrap peers
-  --exec-acl <PATH>               Override default exec ACL path (/etc/x0x/exec-acl.toml on Linux)
+  --exec-acl <PATH>               Override default exec ACL path
   --check                         Check configuration and exit
-  --check-updates       Check for updates and exit
-  --skip-update-check   Skip update check on startup
-  --doctor              Run diagnostics
+  --check-updates                 Check for updates and exit
+  --skip-update-check             Skip update check on startup
+  --doctor                        Run diagnostics
 ```
 
 Multi-instance example: `x0xd --name alice --api-port 12701 --no-hard-coded-bootstrap`
@@ -188,212 +230,40 @@ Multi-instance example: `x0xd --name alice --api-port 12701 --no-hard-coded-boot
 
 x0x is daemon-only outside the Rust ecosystem. There are no Node.js or Python FFI bindings — applications start (or connect to) `x0xd` and call the local REST/WebSocket API. See `docs/local-apps.md` for examples in any language.
 
-## CI/CD
-
-Five workflows in `.github/workflows/`:
-- **ci.yml**: fmt, clippy, nextest, doc (all jobs symlink `ant-quic` and `saorsa-gossip` from `.deps/`)
-- **security.yml**: `cargo audit`
-- **release.yml**: Multi-platform builds (7 targets), macOS code signing, publishes to crates.io
-- **build.yml**: PR validation
-- **sign-skill.yml**: GPG-signs `SKILL.md`
-
-## Trust Model (`contacts.rs`, `trust.rs`)
-
-Each agent maintains a `ContactStore` of known peers with:
-
-- `TrustLevel`: Blocked | Unknown | Known | Trusted
-- `IdentityType`: Anonymous | Known | Trusted | Pinned
-- `MachineRecord`: Tracks machine IDs an agent has been observed running on
-
-`TrustEvaluator` evaluates `(AgentId, MachineId)` pairs against the store:
-1. Blocked → `RejectBlocked`
-2. `Pinned` identity type + wrong machine → `RejectMachineMismatch`
-3. `Pinned` identity type + right machine → `Accept`
-4. `TrustLevel::Trusted` → `Accept`
-5. `TrustLevel::Known` → `AcceptWithFlag`
-6. Not in store → `Unknown`
-
-The identity listener applies trust evaluation to every incoming announcement. Blocked and machine-mismatched announcements are silently dropped.
-
-## Connectivity (`connectivity.rs`)
-
-`ReachabilityInfo` summarises how reachable a discovered agent is:
-- `should_attempt_direct()`: true if we have at least one address AND `can_receive_direct` is not explicitly `false`. Unknown reachability still gets a direct probe.
-- `needs_coordination()`: true if `can_receive_direct == Some(false)` (e.g. symmetric NAT)
-- `likely_direct()`: true only when `can_receive_direct == Some(true)` — peer has verified direct inbound connectivity
-
-`Agent::connect_to_agent(agent_id)` strategy:
-1. Look up agent in discovery cache → `NotFound` if absent
-2. No addresses → `Unreachable`
-3. `should_attempt_direct()` → try `network.connect_addr()` for each address → `Direct(addr)` on success
-4. `needs_coordination()` or direct failed → for each reachable coordinator peer: connect to coordinator, then use `network.connect_peer_via(peer_id, coordinator)` for peer-ID hole-punching (QUIC extension frames, PUNCH_ME_NOW) → `Coordinated(addr)` on success
-5. All attempts failed → `Unreachable`
-
-The coordination path uses explicit peer-ID-based NAT traversal via `connect_peer_via` (which calls `connect_to_peer(peer_id, Some(coordinator))`), not raw `connect_addr`. This triggers QUIC extension-frame hole-punching through the coordinator peer (typically a bootstrap node). MASQUE relay fallback is planned but not yet wired in ant-quic.
-
-Successful connections enrich the bootstrap cache via `add_from_connection()`.
-
-## Enhanced Announcements (`lib.rs`, `network.rs`)
-
-`IdentityAnnouncement` and `DiscoveredAgent` carry four optional NAT fields:
-- `nat_type: Option<String>` — e.g. "FullCone", "Symmetric", "None"
-- `can_receive_direct: Option<bool>` — whether inbound connections are accepted
-- `is_relay: Option<bool>` — whether the node is relaying for others
-- `is_coordinator: Option<bool>` — whether the node is coordinating NAT punch timing
-
-The sync `build_announcement()` leaves these as `None` (no network access). The async heartbeat queries `NetworkNode::node_status()` to populate them.
-
-**Protocol note**: These fields use bincode 1.x serialization. Old→new messages will fail to decode because bincode 1.x treats every field as required. This is a deliberate protocol version bump.
-
-## Test Organization
-
-29 integration test files in `tests/` (744 tests total):
-
-| File | Tests |
-|------|-------|
-| `identity_integration.rs` | Three-layer identity, keypair management, certificates |
-| `identity_unification_test.rs` | machine_id == ant-quic PeerId, announcement key derivation |
-| `trust_evaluation_test.rs` | TrustEvaluator decisions, machine pinning, ContactStore mutations |
-| `announcement_test.rs` | Announcement round-trips, NAT fields, discovery cache, reachability |
-| `connectivity_test.rs` | ReachabilityInfo heuristics, ConnectOutcome, connect_to_agent() |
-| `identity_announcement_integration.rs` | Signature verification, TTL expiry, shard topics |
-| `crdt_integration.rs` | TaskList CRUD, state transitions |
-| `crdt_convergence_concurrent.rs` | Concurrent CRDT operations converging |
-| `crdt_partition_tolerance.rs` | Network partition and recovery |
-| `mls_integration.rs` | Group encryption, key rotation |
-| `network_integration.rs` | Bootstrap connection |
-| `network_timeout.rs` | Connection timeouts |
-| `nat_traversal_integration.rs` | NAT hole-punching |
-| `comprehensive_integration.rs` | End-to-end workflows |
-| `scale_testing.rs` | Performance with many agents |
-| `presence_foaf_integration.rs` | Presence beacons, FOAF discovery, trust-scoped visibility |
-| `presence_wiring_test.rs` | PresenceWrapper lifecycle, config defaults, shutdown |
-| `presence_integration.rs` | Presence API surface: subscribe, cached_agent, foaf_peer_candidates |
-| `kv_store_integration.rs` | KV store CRUD, access policies, CRDT sync |
-| `named_group_integration.rs` | Named groups, invites, join/leave, display names |
-| `bootstrap_cache_integration.rs` | Bootstrap cache persistence, quality scoring |
-| `constitution_integration.rs` | Constitution embedding and serving |
-| `daemon_api_integration.rs` | Daemon REST API endpoint coverage |
-| `direct_messaging_integration.rs` | Direct send/receive, connection lifecycle |
-| `file_transfer_integration.rs` | File send, accept, reject, progress |
-| `gossip_cache_adapter_integration.rs` | Gossip cache adapter wrapping bootstrap cache |
-| `rendezvous_integration.rs` | Rendezvous shard discovery |
-| `upgrade_integration.rs` | Self-update manifest signing, verification, rollout |
-| `vps_e2e_integration.rs` | VPS bootstrap node end-to-end |
-
-Test pattern: `TempDir` for key isolation, `#[tokio::test]` for async, `tempfile` crate for temp directories.
-
-## E2E Test Scripts
-
-Bash + Python test harnesses in `tests/` for end-to-end validation:
-
-| Script | Scope | Assertions | What it tests |
-|--------|-------|-----------|---------------|
-| `e2e_comprehensive.sh` | Local (alice+bob+charlie) | ~143 | ALL 75+ endpoints, 18 categories: contacts lifecycle, machine pinning, trust eval (5 paths), MLS full lifecycle (add/remove/re-add), named groups (invite validation, leave/rejoin), KV stores (multi-key, update), presence (all 6 endpoints), seedless bootstrap |
-| `e2e_live_network.sh` | Local → live VPS mesh | ~66 | Local node joins real bootstrap network, bidirectional: direct messaging, pub/sub, MLS groups with VPS members, named group invites across network, presence discovery |
-| `e2e_vps.sh` | 6 VPS bootstrap nodes (legacy SSH-per-call) | ~102 | All 6 nodes: cross-continent direct messaging (NYC→Sydney), multi-continent MLS, named groups, KV stores, contact blocking, presence FOAF, constitution on all nodes. **Dominated by SSH RTT to Singapore/Sydney — use the dogfood-family harnesses for clean cross-region results.** |
-| `e2e_vps_mesh.py` | Phase A — 6 VPS DM matrix (mesh-relay) | 30 directed pairs | All-pairs DM matrix driven through x0x's own DMs via 1 SSH tunnel to an anchor. ~16 s wall-clock, zero harness flakes. See [`TEST_SUITE_GUIDE.md`](TEST_SUITE_GUIDE.md) §7b. |
-| `e2e_vps_groups.py` | Phase B — 6 VPS groups + contacts dogfood | up to 49 | Anchor creates a `public_open` group, DMs invites to all runners, each posts a group message, contacts add/Trust/Block/remove cycle per node. See §7c. |
-| `e2e_local_mesh.sh` | Local 3-node Phase A smoke | 6 directed pairs | Boots alice/bob/charlie + a runner each, runs `e2e_vps_mesh.py --no-tunnel` against alice. Proves the protocol without SSH. |
-| `e2e_dogfood_groups.sh` | Phase B — local 3-instance groups + contacts | 29 | Same dogfood as §7c but local. ~5 s wall-clock. |
-| `e2e_dogfood_local.sh` | Phase D — fast 2-instance pre-commit smoke | 19 | Identity + contacts + DM round-trip + group lifecycle, all via DMs. ~5 s wall-clock; targets every-commit cadence. See §7e. |
-| `e2e_deploy.sh` | Build + deploy to VPS (with optional mesh verification) | ~24 | Cross-compile, upload `x0xd` **and** the mesh test runner (`x0x-test-runner.service`) to 6 nodes, verify health/version/mesh, collect API tokens. **`--mesh-verify` flag** chains Phase A + Phase B verification onto the deploy via 1 SSH tunnel. See §7d. |
-
-### Running E2E Tests
-
-```bash
-# 1. Build release binary
-cargo build --release
-
-# 2. PRE-COMMIT SMOKE (Phase D, ~5 s, no VPS, no SSH)
-bash tests/e2e_dogfood_local.sh
-
-# 3. Local 3-instance dogfood (Phase B, contacts + groups, ~5 s)
-bash tests/e2e_dogfood_groups.sh
-
-# 4. Local Phase-A DM matrix smoke (3 daemons, no VPS, no SSH)
-bash tests/e2e_local_mesh.sh
-
-# 5. Local comprehensive test (legacy curl-driven, ~2 min)
-bash tests/e2e_comprehensive.sh
-
-# 6. Live network test (local node joins real bootstrap, ~3 min)
-#    Requires: VPS nodes running, SSH access
-bash tests/e2e_live_network.sh
-
-# 7. Deploy to VPS — cross-compile + push x0xd + push runner + verify (~5 min)
-#    Add --mesh-verify to chain Phase A + B verification via 1 SSH tunnel
-bash tests/e2e_deploy.sh                          # SSH-only verification
-bash tests/e2e_deploy.sh --mesh-verify            # + Phase A + B mesh checks
-
-# 8a. VPS Phase-A DM matrix (RECOMMENDED for cross-region DM proof, ~16 s)
-python3 tests/e2e_vps_mesh.py --anchor nyc --discover-secs 30 --settle-secs 60
-
-# 8b. VPS Phase-B groups + contacts dogfood (up to 49 assertions, ~60 s)
-python3 tests/e2e_vps_groups.py --anchor nyc --discover-secs 45
-
-# 8c. VPS legacy SSH-per-call test (still useful for surface coverage, ~4 min)
-bash tests/e2e_vps.sh
-
-# 9. Health check (quick VPS status)
-bash .deployment/health-check.sh              # basic
-bash .deployment/health-check.sh --extended   # with peer counts
-```
-
-### VPS Port Configuration
-
-| Port | Protocol | Purpose | Binding |
-|------|----------|---------|---------|
-| **5483** | UDP/QUIC | Transport (gossip network) | `[::]:5483` or `0.0.0.0:5483` |
-| **12600** | TCP/HTTP | REST API on VPS nodes | `127.0.0.1:12600` (configured in `/etc/x0x/config.toml`) |
-| **12700** | TCP/HTTP | REST API default (local dev) | `127.0.0.1:12700` (default when no config) |
-
-VPS API tokens are at `/root/.local/share/x0x/api-token` on Linux nodes.
-
-### SSH Notes for macOS
-
-When running tests that SSH to multiple VPS nodes sequentially, use `-o ControlMaster=no -o ControlPath=none -o BatchMode=yes` to avoid SSH multiplexing hangs. The health check and VPS test scripts already include these flags.
-
-## API Completeness
-
-130 REST endpoints (114 unique paths), all wired to x0xd and CLI:
-- Identity + AgentCard: `GET /agent`, `GET /agent/card`, `POST /agent/card/import`
-- Presence: `GET /presence/online`, `GET /presence/foaf`, `GET /presence/find/:id`, `GET /presence/status/:id`, `GET /presence/events` (SSE)
-- Named groups: `POST/GET /groups`, `POST /groups/:id/invite`, `POST /groups/join`, policy, roles, join requests, ban/unban
-- Group discovery: `GET /groups/discover?q=`, `GET /groups/discover/nearby`, shard subscriptions (Phase C.2, landed)
-- KvStore: `POST/GET /stores`, `PUT/GET/DELETE /stores/:id/:key` (with access control)
-- Direct messaging: `send_direct()`, `recv_direct()`, `connect_to_agent()`
-- MLS groups: `MlsGroup::new()`, `add_member()`, `remove_member()`, `MlsCipher::encrypt/decrypt()`
-- Task lists (CRDTs): `create_task_list()`, `join_task_list()` via `TaskListHandle`
-- File transfer: `POST /files/send`, `POST /files/accept/:id`
-- Diagnostics: `GET /diagnostics/connectivity`, `GET /diagnostics/gossip`, `GET /diagnostics/dm`, `GET /diagnostics/exec` (DM and exec counters + per-peer/session state; CLI: `x0x diagnostics dm`, `x0x diagnostics exec`)
-- Peer lifecycle: `GET /peers/events` SSE (Established / Replaced / Closing / Closed / ReaderExited)
-- GUI: `GET /gui` (embedded HTML), `x0x gui` opens browser
-- Identity, trust, contacts, gossip pub/sub, WebSocket: all complete
-
-## x0x-symphony
-
-A decentralized, harness-agnostic agent work orchestration runner lives in
-the sibling repo [`../x0x-symphony`](../x0x-symphony). It does not link x0x
-as a Rust crate; it consumes x0xd's local REST/WebSocket API. From x0x's
-perspective:
-
-- **What x0x ships for symphony**: the existing TaskList CRDT (`src/crdt/`),
-  the `/task-lists` and `/stores` REST endpoints, the GUI board view
-  (`renderSpaceBoard` in `src/gui/x0x-gui.html`), and MLS group encryption.
-  These are the v1.0 backbone for symphony per
-  `../x0x-symphony/docs/adr/0004-x0x-tasklist-as-backbone.md`.
-- **What symphony adds in M3** (planned, not yet implemented): symphony-aware
-  filters and claim badges on the existing GUI board view; metadata
-  extensions on TaskItems for `shard`, `claim`, `handoff`, `validation`.
-- **No new x0x crates, endpoints, or CRDTs are required** for v1.0 symphony.
-  Symphony rides existing primitives. See
-  `../x0x-symphony/docs/design/symphony.md` for the full architecture.
-
-This repo's `WORKFLOW.md` and `issues/` directory are the bootstrap tracker
-that the M1 symphony runner consumes. M3 retires this JSONL database in
-favour of x0x's CRDT TaskList.
-
 ## Crate-Level Lint Suppressions
 
 `lib.rs` has `#![allow(clippy::unwrap_used, clippy::expect_used, missing_docs)]`. These exist because test code uses unwrap/expect. Production code paths should still avoid panics — use `?` with proper error types.
+
+## Obsidian Vault
+
+The Saorsa Labs Obsidian vault lives at:
+```
+~/Library/Mobile Documents/iCloud~md~obsidian/Documents/Ideas/Saorsa Labs/
+```
+
+x0x docs are mirrored in the vault under:
+```
+Saorsa Labs/Projects/x0x/
+├── x0x MOC.md              ← Map of Content (index page, LLM reads this first)
+├── CHANGELOG.md            ← Mirrored changelog
+├── ADRs/                   ← All ADRs as individual wikilinked pages
+│   ├── x0x - 0001-bootstrap-peers-are-seed-hints-only.md
+│   ├── x0x - 0002-application-level-keepalive-for-direct-connections.md
+│   └── ... (0003–0009)
+└── Docs/                   ← All repo docs + design docs
+    ├── x0x - api-reference.md
+    ├── x0x - identity.md
+    ├── x0x - groups.md
+    ├── x0x - trust.md
+    └── design/
+        ├── x0x-exec.md
+        ├── x0x-terminal.md
+        └── ...
+```
+
+**Vault conventions:**
+- Each page has YAML frontmatter: `title`, `project`, `type` (`adr`/`documentation`/`index`), `source` (repo path), `tags`, `imported` date, `updated` date
+- ADRs use type `adr`; docs use type `documentation`; MOC uses type `index`
+- Pages link to each other via `[[wikilinks]]`
+- The vault is updated manually or via sync scripts — it's a read-only mirror of the repo docs, not a source of truth
+- For cross-project context, see the parent MOCs: `Saorsa Labs/Saorsa Labs MOC.md` and sibling project MOCs (ant-quic, communitas, fae, saorsa-gossip, saorsa-mls, saorsa-pqc)

@@ -41,7 +41,30 @@ quick-check: fmt-check lint test
 
 check: fmt-check lint build test doc
 
-# ── GUI coverage ──────────────────────────────────────────────────────────
+# ── Test coverage (line/region) ───────────────────────────────────────────
+#
+# Uses cargo-llvm-cov + nextest. Install once with:
+#   cargo install cargo-llvm-cov --locked
+# Coverage data lives under target/llvm-cov-target/ — `just coverage-clean`
+# wipes it if results look stale.
+
+# Run the full nextest suite under llvm-cov and open an HTML report.
+coverage:
+    cargo llvm-cov --all-features --workspace --html nextest
+
+# Print a one-shot text summary (fast — useful before pushing).
+coverage-summary:
+    cargo llvm-cov --all-features --workspace --summary-only nextest
+
+# Emit lcov.info for editors (e.g. Coverage Gutters) and future CI uploads.
+coverage-lcov:
+    cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info nextest
+
+# Wipe cached profraw/profdata when results look stale.
+coverage-clean:
+    cargo llvm-cov clean --workspace
+
+# ── GUI coverage (API-surface, not line coverage) ─────────────────────────
 
 # Build the coverage tool and run it against src/gui/x0x-gui.html.
 gui-coverage:

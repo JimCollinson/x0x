@@ -67,17 +67,26 @@ message_cache: LruCache<MessageIdType, CachedMessage>  // line 1405
 replay_cache:  LruCache<[u8; 32], Instant>             // line 1418
 ```
 
-This bounds count but **not bytes or age**. With observed message sizes
-on `x0x.discovery.groups` (11-16 KB per group card), worst-case per-
-topic state is `2048 × 16 KB ≈ 32 MB`. Multiplied across active topics,
-the mesh anti-entropies ~100 MB+ of state per reconciliation cycle.
-Cross-Pacific paths can't sustain that.
+This bounds count and, in the current `saorsa-gossip` snapshot, also
+has a 60 s TTL cleaner (`CACHE_TTL_SECS = 60`). The missing production
+guard is **bytes**: with observed message sizes on
+`x0x.discovery.groups` (11-16 KB per group card), worst-case per-topic
+state is `2048 × 16 KB ≈ 32 MB` before wire-signature overhead.
+Multiplied across active topics, the mesh anti-entropies ~100 MB+ of
+state per reconciliation cycle. Cross-Pacific paths can't sustain that.
+
+**Investigation update (2026-05-12):** implementation should preserve
+the stricter existing 60 s age cap instead of widening it to the
+earlier 10 min design sketch. X0X-0068 makes that age cap explicit in
+`BoundedMessageCache`, adds byte accounting, and exposes per-topic
+cache telemetry.
 
 ### What this ticket ships
 
 Three additional bounds on the per-topic message cache:
 
-1. **Age cap** — drop entries older than `MAX_CACHE_AGE_SECS` (10 min)
+1. **Age cap** — drop entries older than `MAX_CACHE_AGE_SECS` (60 s in
+   the current implementation)
 2. **Bytes cap** — drop entries to keep total per-topic bytes ≤ 16 MB
 3. **Count cap** — existing 2048 limit retained as a final hard upper bound
 
@@ -146,6 +155,14 @@ If x0x's group card store is also unbounded, **this ticket should bound
 it too** — same age + bytes + count pattern. If it's already bounded,
 note the existing bounds in the implementation section.
 
+2026-05-12 investigation result: `src/bin/x0xd.rs` already bounds
+`group_card_cache` with `GROUP_CARD_CACHE_CAP = 8_192` and prunes cards
+by their expiry time before enforcing the cap. No X0X-0068 application-
+layer cache change is required unless later evidence shows byte growth
+inside valid, non-expired cards is material. The directory-side
+`DirectoryShardCache` in `src/groups/discovery.rs` is also bounded by
+`DEFAULT_MAX_ENTRIES_PER_SHARD = 4_096` with per-shard LRU eviction.
+
 ### 1d. Confirm the diagnostics surface
 
 ```bash
@@ -163,6 +180,11 @@ can extend with per-topic cache stats. If it doesn't exist, you'll need
 to either (a) add it as part of this ticket, or (b) extend the existing
 `/diagnostics/gossip` route to include the new fields. Adjust the
 "Files to modify" section accordingly.
+
+2026-05-12 investigation result: `/diagnostics/gossip` exists in
+`src/bin/x0xd.rs` and serializes `state.agent.gossip_pubsub_stage_stats()`
+as `pubsub_stages`. The saorsa-gossip snapshot can add
+`pubsub_stages.topic_caches[]` without changing the route handler.
 
 ### 1e. Note the running soak (if applicable)
 
@@ -186,10 +208,9 @@ In `saorsa-gossip/crates/pubsub/src/lib.rs`, alongside the existing
 
 ```rust
 /// Maximum age of a cached pubsub message before forced eviction.
-/// Calibrated for cross-region p2p mesh where anti-entropy must not
-/// reach back further than this. 10 min covers retransmit + IHAVE
-/// dedupe windows with margin.
-const MAX_CACHE_AGE_SECS: u64 = 600;
+/// Preserves the existing 60 s pubsub recovery TTL while making age
+/// eviction part of the bounded-cache abstraction.
+const MAX_CACHE_AGE_SECS: u64 = 60;
 
 /// Maximum total bytes of cached messages per topic. Cross-Pacific
 /// paths (~280 ms RTT) can sustain ~10 MB/s anti-entropy reconcile;

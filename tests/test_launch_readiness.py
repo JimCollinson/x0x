@@ -193,6 +193,60 @@ class LaunchReadinessGateTests(unittest.TestCase):
         self.assertEqual(0, delta["recv_pump_dropped_full"])
         self.assertEqual(0, delta["per_peer_timeout_count"])
 
+    def test_extract_counters_aggregates_pubsub_cache_stats(self) -> None:
+        diag = {
+            "pubsub_stages": {
+                "topic_caches": [
+                    {
+                        "topic": "x0x.discovery.groups",
+                        "cache": {
+                            "msg_count": 10,
+                            "total_bytes": 12_000,
+                            "oldest_age_secs": 45,
+                            "evicted_by_age": 2,
+                            "evicted_by_bytes": 3,
+                            "evicted_by_count": 4,
+                        },
+                    },
+                    {
+                        "topic": "x0x.presence.global",
+                        "cache": {
+                            "msg_count": 5,
+                            "total_bytes": 500,
+                            "oldest_age_secs": 12,
+                            "evicted_by_age": 1,
+                            "evicted_by_bytes": 0,
+                            "evicted_by_count": 0,
+                        },
+                    },
+                ]
+            }
+        }
+
+        counters = self.lr.extract_counters(diag)
+
+        self.assertEqual(2, counters["pubsub_cache_topics"])
+        self.assertEqual(15, counters["pubsub_cache_msg_count"])
+        self.assertEqual(12_500, counters["pubsub_cache_total_bytes"])
+        self.assertEqual(45, counters["pubsub_cache_oldest_age_secs_max"])
+        self.assertEqual(3, counters["pubsub_cache_evicted_by_age"])
+        self.assertEqual(3, counters["pubsub_cache_evicted_by_bytes"])
+        self.assertEqual(4, counters["pubsub_cache_evicted_by_count"])
+
+    def test_diff_counters_clamps_pubsub_cache_eviction_resets(self) -> None:
+        delta = self.lr.diff_counters(
+            {
+                "pubsub_cache_evicted_by_age": 10,
+                "pubsub_cache_evicted_by_bytes": 20,
+                "pubsub_cache_evicted_by_count": 30,
+            },
+            {},
+        )
+
+        self.assertEqual(0, delta["pubsub_cache_evicted_by_age"])
+        self.assertEqual(0, delta["pubsub_cache_evicted_by_bytes"])
+        self.assertEqual(0, delta["pubsub_cache_evicted_by_count"])
+
     def test_redact_auth_tokens_masks_bearer_values(self) -> None:
         text = "curl -H 'Authorization: Bearer abc123SECRET' http://127.0.0.1"
 

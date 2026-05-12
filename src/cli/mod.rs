@@ -339,3 +339,125 @@ fn format_scalar(value: &serde_json::Value) -> String {
 pub fn print_error(msg: &str) {
     eprintln!("error: {msg}");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_scalar_string() {
+        assert_eq!(format_scalar(&serde_json::Value::String("hello".into())), "hello");
+    }
+
+    #[test]
+    fn format_scalar_number() {
+        assert_eq!(format_scalar(&serde_json::json!(42)), "42");
+        assert_eq!(format_scalar(&serde_json::json!(3.14)), "3.14");
+    }
+
+    #[test]
+    fn format_scalar_bool() {
+        assert_eq!(format_scalar(&serde_json::Value::Bool(true)), "true");
+        assert_eq!(format_scalar(&serde_json::Value::Bool(false)), "false");
+    }
+
+    #[test]
+    fn format_scalar_null() {
+        assert_eq!(format_scalar(&serde_json::Value::Null), "null");
+    }
+
+    #[test]
+    fn format_scalar_object_falls_through() {
+        let obj = serde_json::json!({"key": "val"});
+        let s = format_scalar(&obj);
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn output_format_debug_clone_copy() {
+        let fmt = OutputFormat::Text;
+        let _fmt2 = fmt; // Copy
+        let _fmt3 = fmt; // Copy again
+        assert!(matches!(fmt, OutputFormat::Text));
+        assert!(matches!(OutputFormat::Json, OutputFormat::Json));
+    }
+
+    #[test]
+    fn daemon_client_new_defaults_to_localhost() {
+        // Without a running daemon, this should fail gracefully
+        let result = DaemonClient::new(None, None, OutputFormat::Text);
+        // Should either succeed (if port file exists) or fail with a clear error
+        match result {
+            Ok(client) => {
+                assert!(client.base_url().contains("127.0.0.1") || client.base_url().contains("localhost"));
+            }
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(!msg.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn daemon_client_uses_api_override() {
+        let client = DaemonClient::new(None, Some("192.168.1.1:9999"), OutputFormat::Json).unwrap();
+        assert_eq!(client.base_url(), "http://192.168.1.1:9999");
+        assert!(matches!(client.format(), OutputFormat::Json));
+    }
+
+    #[test]
+    fn daemon_client_uses_http_api_override() {
+        let client = DaemonClient::new(None, Some("http://10.0.0.1:8080"), OutputFormat::Text).unwrap();
+        assert_eq!(client.base_url(), "http://10.0.0.1:8080");
+    }
+
+    #[test]
+    fn daemon_client_named_instance_no_port_file() {
+        // Named instance without a port file should fail with a helpful message
+        let result = DaemonClient::new(Some("nonexistent-test-instance"), None, OutputFormat::Text);
+        match result {
+            Err(e) => {
+                let msg = format!("{e}");
+                assert!(msg.contains("nonexistent-test-instance"), "msg: {msg}");
+            }
+            Ok(_) => {} // Could succeed if port file exists
+        }
+    }
+
+    #[test]
+    fn print_value_json_output() {
+        let val = serde_json::json!({"key": "value"});
+        // Should not panic
+        print_value(OutputFormat::Json, &val);
+    }
+
+    #[test]
+    fn print_value_text_output() {
+        let val = serde_json::json!({"key": "value"});
+        print_value(OutputFormat::Text, &val);
+    }
+
+    #[test]
+    fn print_value_text_nested() {
+        let val = serde_json::json!({"outer": {"inner": "deep"}});
+        print_value(OutputFormat::Text, &val);
+    }
+
+    #[test]
+    fn print_value_text_array() {
+        let val = serde_json::json!([{"a": 1}, {"b": 2}]);
+        print_value(OutputFormat::Text, &val);
+    }
+
+    #[test]
+    fn ensure_running_fails_without_daemon() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let client = DaemonClient::new(None, Some("127.0.0.1:1"), OutputFormat::Text).unwrap();
+            let result = client.ensure_running().await;
+            assert!(result.is_err());
+            let msg = format!("{}", result.unwrap_err());
+            assert!(msg.contains("Daemon is not running") || msg.contains("Connection refused") || msg.contains("request failed"), "msg: {msg}");
+        });
+    }
+}

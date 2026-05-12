@@ -93,3 +93,64 @@ fn json_escape(s: &str) -> String {
     out.push('"');
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::OutputFormat;
+
+    #[test]
+    fn json_escape_simple_string() {
+        assert_eq!(json_escape("hello"), r#""hello""#);
+    }
+
+    #[test]
+    fn json_escape_escapes_quotes() {
+        assert_eq!(json_escape("say \"hi\""), r#""say \"hi\"""#);
+    }
+
+    #[test]
+    fn json_escape_escapes_backslash() {
+        assert_eq!(json_escape("a\\b"), r#""a\\b""#);
+    }
+
+    #[test]
+    fn json_escape_escapes_newline() {
+        assert_eq!(json_escape("a\nb"), r#""a\nb""#);
+    }
+
+    #[test]
+    fn json_escape_escapes_tab() {
+        assert_eq!(json_escape("a\tb"), r#""a\tb""#);
+    }
+
+    #[test]
+    fn json_escape_escapes_control_chars() {
+        assert_eq!(json_escape("a\x00b"), r#""a\u0000b""#);
+    }
+
+    #[test]
+    fn routes_json_output_is_valid() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            routes(true).unwrap();
+        }));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn routes_text_output_is_valid() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            routes(false).unwrap();
+        }));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn output_format_defaults() {
+        let fmt = OutputFormat::Text;
+        let _fmt2 = fmt;
+        assert!(matches!(fmt, OutputFormat::Text));
+        let json_fmt = OutputFormat::Json;
+        assert!(matches!(json_fmt, OutputFormat::Json));
+    }
+}

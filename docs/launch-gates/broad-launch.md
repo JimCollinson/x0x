@@ -57,6 +57,52 @@ python3 tests/launch_readiness.py --gate broad-launch \
     --allow-restart-storm
 ```
 
+## Split-soak methodology
+
+When a combined soak fails, split the next proof into two runs before
+changing transport or overlay policy. This keeps transport/NAT issues
+separate from PubSub pressure and avoids treating one failure class as
+the other.
+
+Variant A is fixed-roster direct DM only after startup:
+
+```
+python3 tests/launch_soak_fixed_roster.py \
+    --duration-hours 4 --interval-mins 15 --anchor nyc
+```
+
+The first discovery round still uses `x0x.test.discover.v1`, because
+runners do not know the orchestrator's agent id before discovery. After
+that, the wrapper sets `X0X_NO_PUBSUB_AFTER_DISCOVER=1`; the Phase A
+harness asks runners to unsubscribe from PubSub control topics, disables
+legacy PubSub result fallback, and sends anchor-local commands through
+direct DM. A pass here says the direct-DM/transport layer is healthy
+under a frozen roster.
+
+Variant B is PubSub pressure only:
+
+```
+python3 tests/launch_soak_pubsub_pressure.py \
+    --duration-hours 4 --interval-mins 15 --anchor nyc \
+    --burst-messages 5000
+```
+
+This loop runs `launch_readiness.py --scenarios fanout_burst` and skips
+the Phase A all-pairs matrix. Use it to measure suppression growth,
+per-peer timeout growth, and recv-pump drops under overlay load without
+mixing in direct-DM delivery failures.
+
+Variant C is the combined soak of record:
+
+```
+python3 tests/launch_soak.py \
+    --duration-hours 4 --interval-mins 15 --anchor nyc
+```
+
+Run this after the isolated variants explain the failure class and any
+overlay fixes have landed. It remains the portfolio gate for broad
+launch.
+
 `restart_storm` is destructive (it issues `systemctl restart x0xd` on
 non-anchor nodes), so it requires the explicit
 `--allow-restart-storm` flag. Run during a quiet window and verify the

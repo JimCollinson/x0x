@@ -96,6 +96,36 @@ class X0xTestRunnerTests(unittest.TestCase):
         queued = [runner._send_q.get_nowait()[0]["request_id"]]
         self.assertEqual(["fresh"], queued)
 
+    def test_no_pubsub_after_discover_unsubscribes_control_topics(self) -> None:
+        client = FakeClient()
+        runner = self.runner_mod.TestRunner(
+            "nyc",
+            client,
+            no_pubsub_after_discover=True,
+        )
+        runner._subscribe_control_topics()
+        first_ids = dict(runner._subscription_ids)
+
+        runner._dispatch_command(
+            {
+                "command_id": "discover-1",
+                "action": "discover",
+                "anchor_aid": "a" * 64,
+                "params": {"request_id": "discover-1"},
+            },
+            source_aid=None,
+        )
+
+        self.assertTrue(runner._pubsub_disabled_after_discover)
+        self.assertEqual([], sorted(runner._subscription_ids))
+        self.assertEqual(sorted(first_ids.values()), sorted(client.unsubscribed))
+
+        runner._subscribe_control_topics()
+        self.assertEqual(
+            [self.runner_mod.DISCOVER_TOPIC, self.runner_mod.LEGACY_CONTROL_TOPIC],
+            client.subscribed,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "dispatcher_timed_out": 0,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 160,
+                "data_tx_high_water_count": 0,
             }
         }
         posts = {"nyc": {"suppressed_peers_size": 0}}
@@ -53,6 +54,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "dispatcher_timed_out": 0,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 40,
+                "data_tx_high_water_count": 0,
             }
         }
         posts = {"sydney": {"suppressed_peers_size": 0}}
@@ -72,6 +74,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "dispatcher_timed_out": 0,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
             }
         }
         posts = {
@@ -96,6 +99,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "dispatcher_timed_out": 0,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
             }
         }
         posts = {
@@ -120,6 +124,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "dispatcher_timed_out": 0,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
             }
         }
         posts = {
@@ -192,6 +197,45 @@ class LaunchReadinessGateTests(unittest.TestCase):
         self.assertEqual(0, delta["dispatcher_timed_out"])
         self.assertEqual(0, delta["recv_pump_dropped_full"])
         self.assertEqual(0, delta["per_peer_timeout_count"])
+
+    def test_connectivity_scalars_preserve_missing_data_tx(self) -> None:
+        counters = self.lr.extract_connectivity_scalars({"gso": {"bundle_send_total": 3}})
+
+        self.assertIsNone(counters["data_tx_high_water_count"])
+        self.assertEqual(3, counters["gso_bundle_send_total"])
+
+    def test_diff_counters_marks_missing_connectivity_delta(self) -> None:
+        delta = self.lr.diff_counters(
+            {"data_tx_high_water_count": 4},
+            {},
+        )
+
+        self.assertIsNone(delta["data_tx_high_water_count"])
+
+    def test_broad_launch_rejects_missing_connectivity_diagnostics(self) -> None:
+        deltas = {
+            "nyc": {
+                "dispatcher_completed": 100,
+                "dispatcher_timed_out": 0,
+                "recv_pump_dropped_full": 0,
+                "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": None,
+                "diagnostics_connectivity_pre_fetched": False,
+                "diagnostics_connectivity_post_fetched": False,
+            }
+        }
+        posts = {"nyc": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100}}
+        scenario = self.lr.ScenarioResult(name="fanout_burst", duration_secs=1.0)
+
+        passed, violations = self.lr.evaluate_slos(
+            "broad-launch", deltas, posts, scenario
+        )
+
+        self.assertFalse(passed)
+        self.assertTrue(
+            any("data_tx_high_water_count_delta unmeasurable" in v for v in violations),
+            violations,
+        )
 
     def test_extract_counters_aggregates_pubsub_cache_stats(self) -> None:
         diag = {
@@ -296,6 +340,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "dispatcher_timed_out": 0,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
             }
         }
         posts = {"nyc": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100}}
@@ -318,6 +363,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "dispatcher_timed_out": 1,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
             }
         }
         posts = {
@@ -342,6 +388,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "dispatcher_timed_out": 0,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
             }
         }
         posts = {"nyc": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100}}
@@ -365,6 +412,7 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "dispatcher_timed_out": 0,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
             }
         }
         posts = {"nyc": {"suppressed_peers_size": 0, "known_peer_topic_pairs": 100}}
@@ -391,12 +439,14 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "dispatcher_timed_out": 1,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
             },
             "nyc": {
                 "dispatcher_completed": 100,
                 "dispatcher_timed_out": 0,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
             },
         }
         posts = {
@@ -423,12 +473,14 @@ class LaunchReadinessGateTests(unittest.TestCase):
                 "dispatcher_timed_out": 0,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
             },
             "nyc": {
                 "dispatcher_completed": 100,
                 "dispatcher_timed_out": 0,
                 "recv_pump_dropped_full": 0,
                 "per_peer_timeout_count": 0,
+                "data_tx_high_water_count": 0,
             },
         }
         posts = {
@@ -563,6 +615,8 @@ class LaunchReadinessGateTests(unittest.TestCase):
                     "recv_pump_latest_depth_post",
                     "suppressed_peers_to_known_ratio",
                     "known_peer_topic_pairs_post",
+                    "diagnostics_connectivity_pre_fetched",
+                    "diagnostics_connectivity_post_fetched",
                     "data_tx_depth_post",
                     "data_tx_capacity_post",
                     "data_tx_high_water_count_delta",
@@ -576,6 +630,9 @@ class LaunchReadinessGateTests(unittest.TestCase):
             self.assertEqual("7", rows[1][12])
             self.assertEqual("0.050000", rows[1][13])
             self.assertEqual("60", rows[1][14])
+            self.assertEqual("false", rows[1][15])
+            self.assertEqual("false", rows[1][16])
+            self.assertEqual("MISSING", rows[1][19])
 
 
 if __name__ == "__main__":

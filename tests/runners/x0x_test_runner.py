@@ -40,6 +40,7 @@ infer an anchor agent_id.
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import logging
@@ -51,7 +52,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 DISCOVER_TOPIC = "x0x.test.discover.v1"
 # Legacy topics retained so an older orchestrator that publishes on the
@@ -273,11 +274,18 @@ class X0xClient:
 class TestRunner:
     """Single-node mesh test runner."""
 
-    def __init__(self, node_name: str, client: X0xClient) -> None:
+    def __init__(
+        self,
+        node_name: str,
+        client: X0xClient,
+        no_pubsub_after_discover: bool = False,
+    ) -> None:
         self.node_name = node_name
         self.client = client
         self.log = logging.getLogger(f"runner[{node_name}]")
         self._stop = threading.Event()
+        self._no_pubsub_after_discover = no_pubsub_after_discover
+        self._pubsub_disabled_after_discover = False
         # Outbound delivery is a (envelope, target_aid) tuple.
         # target_aid=None means publish on the legacy results topic
         # (last-resort fallback for orchestrators that don't include
@@ -337,6 +345,9 @@ class TestRunner:
         )
 
     def _subscribe_control_topics(self) -> None:
+        if self._pubsub_disabled_after_discover:
+            self.log.info("pubsub control disabled after discover; not resubscribing")
+            return
         for topic in (DISCOVER_TOPIC, LEGACY_CONTROL_TOPIC):
             old_id = self._subscription_ids.pop(topic, None)
             if old_id:
@@ -450,6 +461,13 @@ class TestRunner:
     def _publish_result_legacy(
         self, payload: bytes, envelope: Dict[str, Any]
     ) -> None:
+        if self._pubsub_disabled_after_discover:
+            self.log.error(
+                "dropping result after DM failure because pubsub fallback is "
+                "disabled after discover: %s",
+                envelope,
+            )
+            return
         for attempt in range(1, PUBLISH_RETRY_MAX + 1):
             try:
                 self.client.publish(LEGACY_RESULTS_TOPIC, payload)
@@ -534,6 +552,9 @@ class TestRunner:
     # ─── control-topic listener ────────────────────────────────────────
     def _control_listener_loop(self) -> None:
         while not self._stop.is_set():
+            if self._pubsub_disabled_after_discover:
+                self._stop.wait(SSE_RECONNECT_BACKOFF_SECS)
+                continue
             try:
                 # Daemon restarts drop in-process subscriptions while this
                 # long-lived runner process stays up. Re-register before each
@@ -595,6 +616,8 @@ class TestRunner:
 
     # ─── event handlers ────────────────────────────────────────────────
     def _handle_pubsub_event(self, event_type: str, data: str) -> None:
+        if self._pubsub_disabled_after_discover:
+            return
         if event_type != "message":
             return
         try:
@@ -795,6 +818,8 @@ class TestRunner:
                     },
                     target_aid=anchor_aid,
                 )
+                if self._should_disable_pubsub_after_discover(cmd, params):
+                    self._disable_pubsub_after_discover()
             elif action == "noop_ack":
                 self._enqueue_result(
                     {
@@ -845,6 +870,39 @@ class TestRunner:
                 },
                 target_aid=anchor_aid,
             )
+
+    def _should_disable_pubsub_after_discover(
+        self,
+        cmd: Dict[str, Any],
+        params: Dict[str, Any],
+    ) -> bool:
+        return bool(
+            self._no_pubsub_after_discover
+            or cmd.get("no_pubsub_after_discover")
+            or params.get("no_pubsub_after_discover")
+        )
+
+    def _disable_pubsub_after_discover(self) -> None:
+        if self._pubsub_disabled_after_discover:
+            return
+        self._pubsub_disabled_after_discover = True
+        for topic, sub_id in list(self._subscription_ids.items()):
+            try:
+                self.client.unsubscribe(sub_id)
+                self.log.info(
+                    "disabled pubsub control after discover: %s (%s)",
+                    topic,
+                    sub_id,
+                )
+            except Exception as exc:
+                self.log.debug(
+                    "unsubscribe during pubsub-disable failed: %s (%s): %s",
+                    topic,
+                    sub_id,
+                    exc,
+                )
+            finally:
+                self._subscription_ids.pop(topic, None)
 
     def _do_send_dm(
         self,
@@ -1090,7 +1148,24 @@ class TestRunner:
         raise ValueError(f"unhandled action: {action}")
 
 
-def main() -> int:
+def _env_truthy(name: str) -> bool:
+    raw = os.environ.get(name, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--no-pubsub-after-discover",
+        action="store_true",
+        default=_env_truthy("X0X_NO_PUBSUB_AFTER_DISCOVER"),
+        help=(
+            "after the first discover command, unsubscribe from runner PubSub "
+            "control topics and disable legacy PubSub result fallback"
+        ),
+    )
+    args = parser.parse_args(argv)
+
     log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
         level=getattr(logging, log_level, logging.INFO),
@@ -1106,7 +1181,11 @@ def main() -> int:
         return 2
 
     client = X0xClient(base, token)
-    runner = TestRunner(node_name=node_name, client=client)
+    runner = TestRunner(
+        node_name=node_name,
+        client=client,
+        no_pubsub_after_discover=args.no_pubsub_after_discover,
+    )
     return runner.run()
 
 

@@ -67,6 +67,8 @@ PREFIX_RES = b"x0xtest|res|"
 # `COMMAND_DM_ACK_MS` remains the optional post-send liveness probe knob; it is
 # separate from `COMMAND_RAW_QUIC_ACK_MS`, which ACKs the message bytes.
 COMMAND_DM_ACK_MS: Optional[int] = None
+
+
 def _optional_int_env(name: str, default: Optional[int]) -> Optional[int]:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -75,6 +77,11 @@ def _optional_int_env(name: str, default: Optional[int]) -> Optional[int]:
     if lowered in {"none", "off", "false", "0"}:
         return None
     return int(raw)
+
+
+def env_truthy(name: str) -> bool:
+    raw = os.environ.get(name, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # X0X-0060: released-stack 4h soak showed 6s was still too tight for
@@ -503,7 +510,10 @@ def _enqueue_result_envelope(
 
 
 def publish_discover(
-    client: X0xClient, anchor_aid: str, request_id: str
+    client: X0xClient,
+    anchor_aid: str,
+    request_id: str,
+    no_pubsub_after_discover: bool = False,
 ) -> None:
     """Pubsub announcement carrying anchor_aid for runners.
 
@@ -521,7 +531,9 @@ def publish_discover(
             "params": {
                 "request_id": request_id,
                 "anchor_aid": anchor_aid,
+                "no_pubsub_after_discover": no_pubsub_after_discover,
             },
+            "no_pubsub_after_discover": no_pubsub_after_discover,
         }
     ).encode("utf-8")
     client.publish(DISCOVER_TOPIC, payload)
@@ -533,6 +545,7 @@ def send_command_dm(
     cmd: Dict[str, Any],
     log: logging.Logger,
     anchor_aid: Optional[str] = None,
+    allow_anchor_pubsub: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Send a runner command — direct DM if remote, pubsub if collocated.
 
@@ -543,7 +556,7 @@ def send_command_dm(
     pick it up and reply via DM as usual.
     """
     envelope = json.dumps(cmd).encode("utf-8")
-    if anchor_aid and target_aid == anchor_aid:
+    if allow_anchor_pubsub and anchor_aid and target_aid == anchor_aid:
         # Anchor-collocated runner: publish on the legacy control topic.
         try:
             client.publish(LEGACY_CONTROL_TOPIC, envelope)
@@ -587,6 +600,7 @@ def discover_runners(
     timeout_secs: int,
     log: logging.Logger,
     republish_every_secs: int = 12,
+    no_pubsub_after_discover: bool = False,
 ) -> Dict[str, RunnerInfo]:
     """Publish a discover announcement and collect node→runner_info.
 
@@ -604,7 +618,12 @@ def discover_runners(
     while time.time() < deadline and len(found) < len(expected_nodes):
         if time.time() >= next_republish:
             try:
-                publish_discover(client, anchor_aid, str(uuid.uuid4()))
+                publish_discover(
+                    client,
+                    anchor_aid,
+                    str(uuid.uuid4()),
+                    no_pubsub_after_discover=no_pubsub_after_discover,
+                )
             except Exception as exc:
                 log.warning("discover republish failed: %s", exc)
             next_republish = time.time() + republish_every_secs
@@ -647,6 +666,7 @@ def run_all_pairs_matrix(
     anchor_aid: str,
     settle_secs: int,
     log: logging.Logger,
+    no_pubsub_after_discover: bool = False,
 ) -> MatrixOutcome:
     """Fan out a single send command per directed pair via direct DMs."""
     nodes = list(runners.keys())
@@ -702,7 +722,12 @@ def run_all_pairs_matrix(
             },
         }
         resp = send_command_dm(
-            client, runner_aid, cmd, log, anchor_aid=anchor_aid
+            client,
+            runner_aid,
+            cmd,
+            log,
+            anchor_aid=anchor_aid,
+            allow_anchor_pubsub=not no_pubsub_after_discover,
         )
         if resp is None:
             dm_dispatch_failures.append(request_id)
@@ -881,6 +906,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         default=None,
         help="anchor API bearer token when --no-tunnel is set",
     )
+    parser.add_argument(
+        "--no-pubsub-after-discover",
+        action="store_true",
+        default=env_truthy("X0X_NO_PUBSUB_AFTER_DISCOVER"),
+        help=(
+            "after discovery, use only direct-DM control/results and ask "
+            "runners to unsubscribe from PubSub control topics"
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -934,22 +968,25 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 3
         log.info("anchor agent_id=%s…", anchor_aid[:16])
 
-        # Pubsub fallback: subscribe the legacy results topic so an old
-        # runner that publishes its results still reaches us. Phase-A
-        # runners will deliver via direct DMs instead, but the
-        # subscription is cheap and guards against a half-deployed fleet.
-        try:
-            sub = client.subscribe(LEGACY_RESULTS_TOPIC)
-            log.info(
-                "subscribed to %s (id=%s) — legacy fallback",
-                LEGACY_RESULTS_TOPIC,
-                sub.get("subscription_id"),
-            )
-        except Exception as exc:
-            log.warning("legacy results subscription failed: %s", exc)
+        if args.no_pubsub_after_discover:
+            log.info("legacy results PubSub fallback disabled after discover")
+        else:
+            # Pubsub fallback: subscribe the legacy results topic so an old
+            # runner that publishes its results still reaches us. Phase-A
+            # runners will deliver via direct DMs instead, but the
+            # subscription is cheap and guards against a half-deployed fleet.
+            try:
+                sub = client.subscribe(LEGACY_RESULTS_TOPIC)
+                log.info(
+                    "subscribed to %s (id=%s) — legacy fallback",
+                    LEGACY_RESULTS_TOPIC,
+                    sub.get("subscription_id"),
+                )
+            except Exception as exc:
+                log.warning("legacy results subscription failed: %s", exc)
 
-        # Two SSE consumers in parallel: /direct/events is the primary
-        # Phase-A channel; /events is the pubsub fallback.
+        # Two SSE consumers in parallel by default: /direct/events is the
+        # primary Phase-A channel; /events is the PubSub fallback.
         stop = threading.Event()
         bus = ResultsBus()
         sse_threads = [
@@ -957,13 +994,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                 target=consume_sse,
                 args=(client, "/direct/events", bus, stop, log, "direct"),
                 daemon=True,
-            ),
-            threading.Thread(
-                target=consume_sse,
-                args=(client, "/events", bus, stop, log, "pubsub"),
-                daemon=True,
-            ),
+            )
         ]
+        if not args.no_pubsub_after_discover:
+            sse_threads.append(
+                threading.Thread(
+                    target=consume_sse,
+                    args=(client, "/events", bus, stop, log, "pubsub"),
+                    daemon=True,
+                )
+            )
         for t in sse_threads:
             t.start()
         # Give both SSE streams a beat to land.
@@ -976,6 +1016,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             anchor_aid=anchor_aid,
             timeout_secs=args.discover_secs,
             log=log,
+            no_pubsub_after_discover=args.no_pubsub_after_discover,
         )
         if len(runners) < 2:
             log.error("need at least 2 runners; found %s", list(runners.keys()))
@@ -994,6 +1035,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             anchor_aid=anchor_aid,
             settle_secs=args.settle_secs,
             log=log,
+            no_pubsub_after_discover=args.no_pubsub_after_discover,
         )
         total_pairs = len(runners) * (len(runners) - 1)
         print_summary(out, total_pairs, log)

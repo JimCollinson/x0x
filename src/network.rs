@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
@@ -59,13 +60,19 @@ pub const DEFAULT_PORT: u16 = 5483;
 pub const DEFAULT_METRICS_PORT: u16 = 12600;
 
 /// Default maximum connections.
-pub const DEFAULT_MAX_CONNECTIONS: u32 = 100;
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 32;
 
 /// Default connection timeout.
 pub const DEFAULT_CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default stats collection interval.
 pub const DEFAULT_STATS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default age after which an idle pooled QUIC connection is evicted.
+const CONNECTION_POOL_IDLE_EVICT_AFTER: Duration = Duration::from_secs(300);
+
+/// Default interval for background connection-pool eviction.
+const CONNECTION_POOL_EVICTION_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Idle application-data gap after which a peer is probed before reuse.
 ///
@@ -270,6 +277,167 @@ pub struct NetworkStats {
     pub bytes_received: u64,
     /// Number of peers in the local view.
     pub peer_count: usize,
+}
+
+/// Snapshot of the x0x-side QUIC connection pool.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionPoolDiagnosticsSnapshot {
+    /// Peers currently tracked by the pool.
+    pub active_count: usize,
+    /// Maximum tracked active connections before LRU eviction.
+    pub max_connections: usize,
+    /// Idle eviction threshold in seconds.
+    pub idle_evict_after_secs: u64,
+    /// Connections evicted because they were idle beyond the threshold.
+    pub idle_evictions_total: u64,
+    /// Connections evicted because the pool was over the configured cap.
+    pub lru_evictions_total: u64,
+    /// Send-path reconnect/readiness failures observed by the pool facade.
+    pub establish_failures_total: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PooledConnection {
+    last_used: Instant,
+}
+
+#[derive(Debug)]
+struct ConnectionPool {
+    inner: Mutex<HashMap<AntPeerId, PooledConnection>>,
+    max_connections: usize,
+    idle_evict_after: Duration,
+    idle_evictions_total: AtomicU64,
+    lru_evictions_total: AtomicU64,
+    establish_failures_total: AtomicU64,
+}
+
+impl ConnectionPool {
+    fn new(max_connections: usize, idle_evict_after: Duration) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            max_connections: max_connections.max(1),
+            idle_evict_after,
+            idle_evictions_total: AtomicU64::new(0),
+            lru_evictions_total: AtomicU64::new(0),
+            establish_failures_total: AtomicU64::new(0),
+        }
+    }
+
+    fn note_activity(&self, peer_id: AntPeerId) -> Vec<AntPeerId> {
+        let now = Instant::now();
+        let Ok(mut inner) = self.inner.lock() else {
+            error!("connection pool map poisoned while recording activity");
+            return Vec::new();
+        };
+        inner.insert(peer_id, PooledConnection { last_used: now });
+        self.enforce_lru_cap_locked(&mut inner)
+    }
+
+    fn sync_connected_peers(&self, peers: Vec<(AntPeerId, Instant)>) -> Vec<AntPeerId> {
+        let Ok(mut inner) = self.inner.lock() else {
+            error!("connection pool map poisoned while syncing peers");
+            return Vec::new();
+        };
+
+        let mut connected = std::collections::HashSet::with_capacity(peers.len());
+        for (peer_id, last_activity) in peers {
+            connected.insert(peer_id);
+            inner
+                .entry(peer_id)
+                .and_modify(|entry| {
+                    if last_activity > entry.last_used {
+                        entry.last_used = last_activity;
+                    }
+                })
+                .or_insert(PooledConnection {
+                    last_used: last_activity,
+                });
+        }
+        inner.retain(|peer_id, _| connected.contains(peer_id));
+        self.enforce_lru_cap_locked(&mut inner)
+    }
+
+    fn evict_idle(&self, now: Instant) -> Vec<AntPeerId> {
+        let Ok(mut inner) = self.inner.lock() else {
+            error!("connection pool map poisoned while evicting idle peers");
+            return Vec::new();
+        };
+
+        let mut evicted = Vec::new();
+        inner.retain(|peer_id, pooled| {
+            let should_keep =
+                now.saturating_duration_since(pooled.last_used) < self.idle_evict_after;
+            if !should_keep {
+                evicted.push(*peer_id);
+            }
+            should_keep
+        });
+        if !evicted.is_empty() {
+            self.idle_evictions_total
+                .fetch_add(evicted.len() as u64, Ordering::Relaxed);
+        }
+        evicted
+    }
+
+    fn record_disconnected(&self, peer_id: &AntPeerId) {
+        let Ok(mut inner) = self.inner.lock() else {
+            error!("connection pool map poisoned while removing disconnected peer");
+            return;
+        };
+        inner.remove(peer_id);
+    }
+
+    fn record_establish_failure(&self) {
+        self.establish_failures_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ConnectionPoolDiagnosticsSnapshot {
+        let active_count = match self.inner.lock() {
+            Ok(inner) => inner.len(),
+            Err(e) => {
+                error!("connection pool diagnostics poisoned: {e}");
+                0
+            }
+        };
+
+        ConnectionPoolDiagnosticsSnapshot {
+            active_count,
+            max_connections: self.max_connections,
+            idle_evict_after_secs: self.idle_evict_after.as_secs(),
+            idle_evictions_total: self.idle_evictions_total.load(Ordering::Relaxed),
+            lru_evictions_total: self.lru_evictions_total.load(Ordering::Relaxed),
+            establish_failures_total: self.establish_failures_total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn enforce_lru_cap_locked(
+        &self,
+        inner: &mut HashMap<AntPeerId, PooledConnection>,
+    ) -> Vec<AntPeerId> {
+        let excess = inner.len().saturating_sub(self.max_connections);
+        if excess == 0 {
+            return Vec::new();
+        }
+
+        let mut entries: Vec<(AntPeerId, Instant)> = inner
+            .iter()
+            .map(|(peer_id, pooled)| (*peer_id, pooled.last_used))
+            .collect();
+        entries.sort_by_key(|(_, last_used)| *last_used);
+
+        let mut evicted = Vec::with_capacity(excess);
+        for (peer_id, _) in entries.into_iter().take(excess) {
+            if inner.remove(&peer_id).is_some() {
+                evicted.push(peer_id);
+            }
+        }
+        if !evicted.is_empty() {
+            self.lru_evictions_total
+                .fetch_add(evicted.len() as u64, Ordering::Relaxed);
+        }
+        evicted
+    }
 }
 
 /// Snapshot of one stream in the ant-quic → gossip receive pump.
@@ -809,6 +977,39 @@ async fn forward_gossip_payload(
     }
 }
 
+async fn disconnect_pool_candidates(
+    node: &Node,
+    event_sender: &broadcast::Sender<NetworkEvent>,
+    connection_pool: &ConnectionPool,
+    peer_ids: Vec<AntPeerId>,
+    reason: &'static str,
+) {
+    for peer_id in peer_ids {
+        match node.disconnect(&peer_id).await {
+            Ok(()) => {
+                connection_pool.record_disconnected(&peer_id);
+                let _ = event_sender.send(NetworkEvent::PeerDisconnected { peer_id: peer_id.0 });
+                tracing::info!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                    reason,
+                    "connection pool evicted peer"
+                );
+            }
+            Err(e) => {
+                connection_pool.record_disconnected(&peer_id);
+                tracing::debug!(
+                    target: "x0x::connect",
+                    peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                    reason,
+                    error = %e,
+                    "connection pool eviction could not disconnect peer"
+                );
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NetworkNode {
     /// ant-quic P2P node (wrapped in `Arc<RwLock>` for shared async access).
@@ -835,6 +1036,8 @@ pub struct NetworkNode {
     peer_id: AntPeerId,
     /// Bootstrap peer cache for recording connection outcomes.
     bootstrap_cache: Option<Arc<ant_quic::BootstrapCache>>,
+    /// x0x-side connection pool tracking activity, caps, and idle eviction.
+    connection_pool: Arc<ConnectionPool>,
     /// Per-peer liveness repair locks. Prevents concurrent fanout and
     /// maintenance tasks from repeatedly disconnecting/reconnecting the same
     /// stale connection.
@@ -925,6 +1128,15 @@ impl NetworkNode {
         let (recv_bulk_tx, recv_bulk_rx) = mpsc::channel(GOSSIP_CONTROL_RECV_CAPACITY);
         let (direct_tx, direct_rx) = mpsc::channel(10_000);
         let recv_pump_diagnostics = Arc::new(RecvPumpDiagnostics::new());
+        let pool_max_connections = if config.max_connections == 0 {
+            DEFAULT_MAX_CONNECTIONS as usize
+        } else {
+            config.max_connections as usize
+        };
+        let connection_pool = Arc::new(ConnectionPool::new(
+            pool_max_connections,
+            CONNECTION_POOL_IDLE_EVICT_AFTER,
+        ));
 
         let network_node = Self {
             node: Arc::new(RwLock::new(Some(node))),
@@ -941,6 +1153,7 @@ impl NetworkNode {
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             peer_id,
             bootstrap_cache,
+            connection_pool,
             liveness_locks: Arc::new(Mutex::new(HashMap::new())),
             liveness_last_ready: Arc::new(Mutex::new(HashMap::new())),
             liveness_repair_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_LIVENESS_REPAIRS)),
@@ -948,6 +1161,7 @@ impl NetworkNode {
 
         network_node.spawn_receiver();
         network_node.spawn_accept_loop();
+        network_node.spawn_connection_pool_eviction();
 
         Ok(network_node)
     }
@@ -1079,11 +1293,15 @@ impl NetworkNode {
         data: &[u8],
         timeout: std::time::Duration,
     ) -> Option<Result<(), ant_quic::NodeError>> {
-        if let Err(e) = self.ensure_peer_send_ready(&peer_id).await {
+        if let Err(e) = self.get_or_connect_pooled_peer(&peer_id).await {
             return Some(Err(ant_quic::NodeError::Connection(e.to_string())));
         }
         let node = self.node.read().await.as_ref().cloned()?;
-        Some(node.send_with_receive_ack(&peer_id, data, timeout).await)
+        let result = node.send_with_receive_ack(&peer_id, data, timeout).await;
+        if result.is_ok() {
+            self.note_connection_pool_activity(peer_id).await;
+        }
+        Some(result)
     }
 
     /// Subscribe to lifecycle events for all peers (ant-quic 0.27.1 #171).
@@ -1145,6 +1363,44 @@ impl NetworkNode {
     /// * `event` - The event to emit.
     pub fn emit_event(&self, event: NetworkEvent) {
         let _ = self.event_sender.send(event);
+    }
+
+    /// Snapshot x0x-side connection-pool diagnostics.
+    #[must_use]
+    pub fn connection_pool_diagnostics(&self) -> ConnectionPoolDiagnosticsSnapshot {
+        self.connection_pool.snapshot()
+    }
+
+    async fn note_connection_pool_activity(&self, peer_id: AntPeerId) {
+        let evicted = self.connection_pool.note_activity(peer_id);
+        self.disconnect_pool_candidates(evicted, "lru").await;
+    }
+
+    async fn get_or_connect_pooled_peer(&self, peer_id: &AntPeerId) -> NetworkResult<()> {
+        if let Err(e) = self.ensure_peer_send_ready(peer_id).await {
+            self.connection_pool.record_establish_failure();
+            return Err(e);
+        }
+        self.note_connection_pool_activity(*peer_id).await;
+        Ok(())
+    }
+
+    async fn disconnect_pool_candidates(&self, peer_ids: Vec<AntPeerId>, reason: &'static str) {
+        if peer_ids.is_empty() {
+            return;
+        }
+
+        let Some(node) = self.node.read().await.as_ref().cloned() else {
+            return;
+        };
+        disconnect_pool_candidates(
+            &node,
+            &self.event_sender,
+            &self.connection_pool,
+            peer_ids,
+            reason,
+        )
+        .await;
     }
 
     async fn connected_peer_snapshot(
@@ -1543,6 +1799,7 @@ impl NetworkNode {
                     peer_id: peer_conn.peer_id.0,
                     address: addr,
                 });
+                self.note_connection_pool_activity(peer_conn.peer_id).await;
                 tracing::info!(
                     target: "x0x::connect",
                     strategy = "direct_addr",
@@ -1628,6 +1885,7 @@ impl NetworkNode {
             peer_id: peer_conn.peer_id.0,
             address: addr,
         });
+        self.note_connection_pool_activity(peer_conn.peer_id).await;
 
         Ok((addr, peer_conn.peer_id))
     }
@@ -1704,6 +1962,7 @@ impl NetworkNode {
             peer_id: peer_conn.peer_id.0,
             address: addr,
         });
+        self.note_connection_pool_activity(peer_conn.peer_id).await;
 
         tracing::info!(
             target: "x0x::connect",
@@ -1752,6 +2011,7 @@ impl NetworkNode {
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
 
         self.emit_event(NetworkEvent::PeerDisconnected { peer_id: peer_id.0 });
+        self.connection_pool.record_disconnected(peer_id);
 
         Ok(())
     }
@@ -1874,7 +2134,7 @@ impl NetworkNode {
         sender_agent_id: &[u8; 32],
         payload: &[u8],
     ) -> NetworkResult<()> {
-        self.ensure_peer_send_ready(peer_id).await?;
+        self.get_or_connect_pooled_peer(peer_id).await?;
 
         // Build wire format: [0x10][sender_agent_id: 32 bytes][payload]
         let mut buf = Vec::with_capacity(1 + 32 + payload.len());
@@ -1887,6 +2147,7 @@ impl NetworkNode {
         node.send(peer_id, &buf)
             .await
             .map_err(|e| NetworkError::ConnectionFailed(format!("send failed: {}", e)))?;
+        self.note_connection_pool_activity(*peer_id).await;
 
         info!(
             "[1/6 network] send_direct: {} bytes to peer {:?}",
@@ -2119,6 +2380,7 @@ impl NetworkNode {
         let event_sender = self.event_sender.clone();
         let bootstrap_cache = self.bootstrap_cache.clone();
         let inbound_allowlist = self.config.inbound_allowlist.clone();
+        let connection_pool = Arc::clone(&self.connection_pool);
 
         tokio::spawn(async move {
             debug!("NetworkNode accept loop started");
@@ -2167,6 +2429,17 @@ impl NetworkNode {
                             peer_id: peer_conn.peer_id.0,
                             address: addr,
                         });
+                        let evicted = connection_pool.note_activity(peer_conn.peer_id);
+                        if !evicted.is_empty() {
+                            disconnect_pool_candidates(
+                                node_ref,
+                                &event_sender,
+                                connection_pool.as_ref(),
+                                evicted,
+                                "lru",
+                            )
+                            .await;
+                        }
                     }
                     None => {
                         debug!("Accept loop ended (node shutting down)");
@@ -2176,6 +2449,50 @@ impl NetworkNode {
             }
 
             debug!("NetworkNode accept loop stopped");
+        });
+    }
+
+    fn spawn_connection_pool_eviction(&self) {
+        let node = Arc::clone(&self.node);
+        let event_sender = self.event_sender.clone();
+        let connection_pool = Arc::clone(&self.connection_pool);
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(CONNECTION_POOL_EVICTION_INTERVAL);
+            loop {
+                interval.tick().await;
+
+                let Some(node_ref) = node.read().await.as_ref().cloned() else {
+                    debug!("Node not initialized, connection pool eviction stopping");
+                    break;
+                };
+
+                let connected_peers = node_ref
+                    .connected_peers()
+                    .await
+                    .into_iter()
+                    .map(|conn| (conn.peer_id, conn.last_activity))
+                    .collect();
+                let lru_evicted = connection_pool.sync_connected_peers(connected_peers);
+                disconnect_pool_candidates(
+                    &node_ref,
+                    &event_sender,
+                    connection_pool.as_ref(),
+                    lru_evicted,
+                    "lru",
+                )
+                .await;
+
+                let idle_evicted = connection_pool.evict_idle(Instant::now());
+                disconnect_pool_candidates(
+                    &node_ref,
+                    &event_sender,
+                    connection_pool.as_ref(),
+                    idle_evicted,
+                    "idle",
+                )
+                .await;
+            }
         });
     }
 }
@@ -2304,6 +2621,8 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         node.send(&ant_peer, &buf)
             .await
             .map_err(|e| anyhow::anyhow!("send failed: {}", e))?;
+        drop(node_guard);
+        self.note_connection_pool_activity(ant_peer).await;
 
         info!(
             "[1/6 network] send: {} bytes ({:?}) to peer {:?}",
@@ -2399,6 +2718,10 @@ mod tests {
     use super::*;
     use saorsa_gossip_transport::GossipTransport;
 
+    fn test_ant_peer(byte: u8) -> AntPeerId {
+        ant_quic::PeerId([byte; 32])
+    }
+
     #[tokio::test]
     async fn test_gossip_transport_trait() {
         let config = NetworkConfig::default();
@@ -2456,6 +2779,72 @@ mod tests {
 
         assert_eq!(config.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(config.connection_timeout, DEFAULT_CONNECTION_TIMEOUT);
+    }
+
+    #[test]
+    fn pool_evicts_after_idle_threshold() {
+        let pool = ConnectionPool::new(8, Duration::from_secs(5));
+        let now = Instant::now();
+        let old = now.checked_sub(Duration::from_secs(10)).unwrap_or(now);
+        let fresh = now.checked_sub(Duration::from_secs(1)).unwrap_or(now);
+        let stale_peer = test_ant_peer(1);
+        let fresh_peer = test_ant_peer(2);
+
+        assert!(pool
+            .sync_connected_peers(vec![(stale_peer, old), (fresh_peer, fresh)])
+            .is_empty());
+
+        let evicted = pool.evict_idle(now);
+        assert_eq!(evicted, vec![stale_peer]);
+
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.active_count, 1);
+        assert_eq!(snapshot.idle_evictions_total, 1);
+    }
+
+    #[test]
+    fn pool_caps_active_connections_at_max() {
+        let pool = ConnectionPool::new(2, Duration::from_secs(60));
+        let now = Instant::now();
+        let p1 = test_ant_peer(1);
+        let p2 = test_ant_peer(2);
+        let p3 = test_ant_peer(3);
+
+        let evicted = pool.sync_connected_peers(vec![
+            (p1, now.checked_sub(Duration::from_secs(3)).unwrap_or(now)),
+            (p2, now.checked_sub(Duration::from_secs(2)).unwrap_or(now)),
+            (p3, now.checked_sub(Duration::from_secs(1)).unwrap_or(now)),
+        ]);
+
+        assert_eq!(evicted, vec![p1]);
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.active_count, 2);
+        assert_eq!(snapshot.max_connections, 2);
+        assert_eq!(snapshot.lru_evictions_total, 1);
+    }
+
+    #[test]
+    fn pool_lru_eviction_respects_recent_activity() {
+        let pool = ConnectionPool::new(2, Duration::from_secs(60));
+        let now = Instant::now();
+        let p1 = test_ant_peer(1);
+        let p2 = test_ant_peer(2);
+        let p3 = test_ant_peer(3);
+
+        assert!(pool
+            .sync_connected_peers(vec![
+                (p1, now.checked_sub(Duration::from_secs(10)).unwrap_or(now)),
+                (p2, now.checked_sub(Duration::from_secs(9)).unwrap_or(now)),
+            ])
+            .is_empty());
+        assert!(pool.note_activity(p1).is_empty());
+
+        let evicted = pool.note_activity(p3);
+        assert_eq!(evicted, vec![p2]);
+
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.active_count, 2);
+        assert_eq!(snapshot.lru_evictions_total, 1);
     }
 
     #[test]

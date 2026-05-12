@@ -363,23 +363,34 @@ MONOTONIC_COUNTER_FIELDS = {
     "pubsub_cache_evicted_by_count",
 }
 
+CONNECTIVITY_SCALAR_FIELDS = {
+    "data_tx_depth",
+    "data_tx_capacity",
+    "data_tx_high_water_count",
+    "gso_bundle_send_total",
+    "gso_bundle_partial_send",
+}
 
-def extract_connectivity_scalars(diag: Dict[str, Any]) -> Dict[str, int]:
+
+def extract_connectivity_scalars(diag: Dict[str, Any]) -> Dict[str, Optional[int]]:
     """Pull X0X-0039/X0X-0043 scalars out of /diagnostics/connectivity.
 
-    Fields use 0 as the sentinel for missing/null values so the existing
-    diff_counters / gate logic can handle them uniformly.
+    Missing/null values stay distinct from zero so gate evaluation can
+    fail closed when the connectivity endpoint or a required block is
+    unavailable.
     """
-    data_tx = diag.get("data_tx", {}) or {}
-    gso = diag.get("gso", {}) or {}
+    data_tx_raw = diag.get("data_tx")
+    gso_raw = diag.get("gso")
+    data_tx = data_tx_raw if isinstance(data_tx_raw, dict) else {}
+    gso = gso_raw if isinstance(gso_raw, dict) else {}
 
-    def _i(value: Any) -> int:
+    def _i(value: Any) -> Optional[int]:
         if value is None:
-            return 0
+            return None
         try:
             return int(value)
         except (TypeError, ValueError):
-            return 0
+            return None
 
     return {
         "data_tx_depth": _i(data_tx.get("data_tx_depth")),
@@ -390,12 +401,26 @@ def extract_connectivity_scalars(diag: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
-def diff_counters(pre: Dict[str, int], post: Dict[str, int]) -> Dict[str, int]:
+def diff_counters(pre: Dict[str, Any], post: Dict[str, Any]) -> Dict[str, Any]:
     """Per-key delta. Monotonic counters are clamped across resets/gaps."""
     keys = set(pre) | set(post)
-    deltas = {k: int(post.get(k, 0)) - int(pre.get(k, 0)) for k in keys}
+
+    def _delta(key: str) -> Optional[int]:
+        if key in CONNECTIVITY_SCALAR_FIELDS:
+            if key not in pre or key not in post:
+                return None
+            pre_value = pre.get(key)
+            post_value = post.get(key)
+            if pre_value is None or post_value is None:
+                return None
+        else:
+            pre_value = pre.get(key, 0)
+            post_value = post.get(key, 0)
+        return int(post_value) - int(pre_value)
+
+    deltas = {k: _delta(k) for k in keys}
     for key in MONOTONIC_COUNTER_FIELDS:
-        if key in deltas:
+        if key in deltas and deltas[key] is not None:
             deltas[key] = max(0, deltas[key])
     return deltas
 
@@ -435,6 +460,18 @@ def suppressed_peers_ratio(post: Dict[str, int]) -> float:
     if known_pairs == 0:
         return float("inf")
     return suppressed / known_pairs
+
+
+def scalar_for_report(value: Any) -> str:
+    """Render optional diagnostics scalars in proof artifacts."""
+    if value is None:
+        return "MISSING"
+    return str(value)
+
+
+def bool_for_report(value: Any) -> str:
+    """Render proof booleans consistently for CSV/Markdown outputs."""
+    return "true" if bool(value) else "false"
 
 
 def peer_id_matches(observed: Any, target_peer_id: str) -> bool:
@@ -1297,16 +1334,19 @@ def evaluate_slos(
                     f"{d.get('dispatcher_completed', 0)})"
                 )
         # X0X-0039 acceptance: data_tx must not saturate cluster-wide.
-        if (
-            "max_data_tx_high_water_count_delta" in g
-            and d.get("data_tx_high_water_count", 0)
-            > g["max_data_tx_high_water_count_delta"]
-        ):
-            violations.append(
-                f"{node}: data_tx saturation delta "
-                f"{d.get('data_tx_high_water_count', 0)} > "
-                f"gate {g['max_data_tx_high_water_count_delta']}"
-            )
+        if "max_data_tx_high_water_count_delta" in g:
+            high_water_delta = d.get("data_tx_high_water_count")
+            if high_water_delta is None:
+                violations.append(
+                    f"{node}: data_tx_high_water_count_delta unmeasurable: "
+                    "/diagnostics/connectivity unreachable or missing data_tx"
+                )
+            elif high_water_delta > g["max_data_tx_high_water_count_delta"]:
+                violations.append(
+                    f"{node}: data_tx saturation delta "
+                    f"{high_water_delta} > "
+                    f"gate {g['max_data_tx_high_water_count_delta']}"
+                )
 
     for node, post in posts_per_node.items():
         if (
@@ -1426,21 +1466,23 @@ def write_summary_md(
         lines.append("## Diagnostics (X0X-0039 data_tx, X0X-0043 GSO)")
         lines.append("")
         lines.append(
-            "| node | data_tx_depth_post | data_tx_capacity_post | "
+            "| node | conn_pre | conn_post | data_tx_depth_post | data_tx_capacity_post | "
             "data_tx_high_water Δ | gso_bundle_send_total Δ | "
             "gso_bundle_partial_send Δ |"
         )
-        lines.append("|---|---:|---:|---:|---:|---:|")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|")
         for node in sorted(deltas):
             d = deltas[node]
             posts = d.get("_post", {})
             lines.append(
                 f"| {node} | "
-                f"{posts.get('data_tx_depth', 0)} | "
-                f"{posts.get('data_tx_capacity', 0)} | "
-                f"{d.get('data_tx_high_water_count', 0)} | "
-                f"{d.get('gso_bundle_send_total', 0)} | "
-                f"{d.get('gso_bundle_partial_send', 0)} |"
+                f"{bool_for_report(d.get('diagnostics_connectivity_pre_fetched', False))} | "
+                f"{bool_for_report(d.get('diagnostics_connectivity_post_fetched', False))} | "
+                f"{scalar_for_report(posts.get('data_tx_depth'))} | "
+                f"{scalar_for_report(posts.get('data_tx_capacity'))} | "
+                f"{scalar_for_report(d.get('data_tx_high_water_count'))} | "
+                f"{scalar_for_report(d.get('gso_bundle_send_total'))} | "
+                f"{scalar_for_report(d.get('gso_bundle_partial_send'))} |"
             )
         lines.append("")
     (proof_dir / "summary.md").write_text("\n".join(lines))
@@ -1461,6 +1503,8 @@ def write_summary_csv(
             "recv_pump_latest_depth_post", "suppressed_peers_to_known_ratio",
             "known_peer_topic_pairs_post",
             # X0X-0039 / X0X-0043 connectivity diagnostics scalars.
+            "diagnostics_connectivity_pre_fetched",
+            "diagnostics_connectivity_post_fetched",
             "data_tx_depth_post", "data_tx_capacity_post",
             "data_tx_high_water_count_delta",
             "gso_bundle_send_total_delta", "gso_bundle_partial_send_delta",
@@ -1486,11 +1530,13 @@ def write_summary_csv(
                     posts.get("recv_pump_latest_depth", 0),
                     "inf" if suppressed_ratio == float("inf") else f"{suppressed_ratio:.6f}",
                     posts.get("known_peer_topic_pairs", posts.get("peer_scores_total", 0)),
-                    posts.get("data_tx_depth", 0),
-                    posts.get("data_tx_capacity", 0),
-                    d.get("data_tx_high_water_count", 0),
-                    d.get("gso_bundle_send_total", 0),
-                    d.get("gso_bundle_partial_send", 0),
+                    bool_for_report(d.get("diagnostics_connectivity_pre_fetched", False)),
+                    bool_for_report(d.get("diagnostics_connectivity_post_fetched", False)),
+                    scalar_for_report(posts.get("data_tx_depth")),
+                    scalar_for_report(posts.get("data_tx_capacity")),
+                    scalar_for_report(d.get("data_tx_high_water_count")),
+                    scalar_for_report(d.get("gso_bundle_send_total")),
+                    scalar_for_report(d.get("gso_bundle_partial_send")),
                 ])
 
 
@@ -1610,8 +1656,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     json.dumps(conn_diag, indent=2)
                 )
                 pre_counters[node].update(extract_connectivity_scalars(conn_diag))
+                pre_counters[node]["diagnostics_connectivity_pre_fetched"] = True
             except Exception as e:
                 LOG.warning("pre connectivity snapshot %s failed: %s", node, e)
+                pre_counters[node]["diagnostics_connectivity_pre_fetched"] = False
 
         sr = SCENARIOS[sname](ctx)
 
@@ -1638,8 +1686,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     json.dumps(conn_diag, indent=2)
                 )
                 post_counters[node].update(extract_connectivity_scalars(conn_diag))
+                post_counters[node]["diagnostics_connectivity_post_fetched"] = True
             except Exception as e:
                 LOG.warning("post connectivity snapshot %s failed: %s", node, e)
+                post_counters[node]["diagnostics_connectivity_post_fetched"] = False
 
         deltas: Dict[str, Dict[str, int]] = {}
         for node in nodes:
@@ -1652,6 +1702,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             pre["known_peer_topic_pairs"] = known_pairs
             post["known_peer_topic_pairs"] = known_pairs
             d = diff_counters(pre_counters.get(node, {}), post_counters.get(node, {}))
+            d["diagnostics_connectivity_pre_fetched"] = pre.get(
+                "diagnostics_connectivity_pre_fetched", False
+            )
+            d["diagnostics_connectivity_post_fetched"] = post.get(
+                "diagnostics_connectivity_post_fetched", False
+            )
             d["_post"] = post  # smuggle for reports
             deltas[node] = d
 

@@ -12548,6 +12548,7 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
             let data_tx = network.data_channel_diagnostics().await;
             // X0X-0043: real GSO bundle send snapshot from ant-quic 0.27.13.
             let gso = network.gso_diagnostics().await;
+            let connection_pool = network.connection_pool_diagnostics();
             let snapshot = serde_json::json!({
                 "ok": true,
                 "peer_id": hex::encode(ns.peer_id.0),
@@ -12578,6 +12579,7 @@ async fn connectivity_diagnostics(State(state): State<Arc<AppState>>) -> impl In
                     "relayed": ns.relayed_connections,
                     "hole_punch_success_rate": ns.hole_punch_success_rate,
                 },
+                "connection_pool": connection_pool,
                 "relay": {
                     "is_relaying": ns.is_relaying,
                     "sessions": ns.relay_sessions,

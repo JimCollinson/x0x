@@ -8402,3 +8402,121 @@ mod tests {
         assert!(topic_a.starts_with("x0x.user.shard.v2."));
     }
 }
+    #[test]
+    fn agent_shard_topic_is_deterministic() {
+        let agent_id = identity::AgentId([6u8; 32]);
+        let topic_a = shard_topic_for_agent(&agent_id);
+        let topic_b = shard_topic_for_agent(&agent_id);
+        assert_eq!(topic_a, topic_b);
+        assert!(topic_a.starts_with("x0x.identity.shard.v2."));
+    }
+
+    #[test]
+    fn machine_shard_topic_is_deterministic() {
+        let machine_id = identity::MachineId([7u8; 32]);
+        let topic_a = shard_topic_for_machine(&machine_id);
+        let topic_b = shard_topic_for_machine(&machine_id);
+        assert_eq!(topic_a, topic_b);
+        assert!(topic_a.starts_with("x0x.machine.shard.v2."));
+    }
+
+    #[test]
+    fn rendezvous_shard_topic_is_deterministic() {
+        let agent_id = identity::AgentId([8u8; 32]);
+        let topic_a = rendezvous_shard_topic_for_agent(&agent_id);
+        let topic_b = rendezvous_shard_topic_for_agent(&agent_id);
+        assert_eq!(topic_a, topic_b);
+        assert!(topic_a.starts_with("x0x.rendezvous.shard."));
+    }
+
+    #[test]
+    fn different_ids_produce_different_shard_topics() {
+        let agent_a = identity::AgentId([1u8; 32]);
+        let agent_b = identity::AgentId([2u8; 32]);
+        let topic_a = shard_topic_for_agent(&agent_a);
+        let topic_b = shard_topic_for_agent(&agent_b);
+        assert_ne!(topic_a, topic_b, "different agent IDs should produce different shard topics");
+    }
+
+    #[test]
+    fn collect_local_interface_addrs_returns_non_empty() {
+        let addrs = collect_local_interface_addrs(5483);
+        assert!(!addrs.is_empty(), "should find at least one interface");
+        for addr in &addrs {
+            assert_eq!(addr.port(), 5483, "all addrs should use port 5483");
+        }
+    }
+
+    #[test]
+    fn collect_local_interface_addrs_returns_reasonable_results() {
+        let addrs = collect_local_interface_addrs(9000);
+        assert!(!addrs.is_empty(), "should find at least one interface");
+        for addr in &addrs {
+            assert_eq!(addr.port(), 9000, "all addrs should use port 9000");
+        }
+    }
+
+    #[test]
+    fn is_globally_routable_v4_private() {
+        assert!(!is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(!is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1))));
+    }
+
+    #[test]
+    fn is_globally_routable_v4_global() {
+        assert!(is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))));
+    }
+
+    #[test]
+    fn is_globally_routable_v6_private() {
+        assert!(!is_globally_routable(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1))));
+        assert!(!is_globally_routable(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1))));
+        assert!(!is_globally_routable(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1))));
+    }
+
+    #[test]
+    fn is_globally_routable_v6_global() {
+        assert!(is_globally_routable(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))));
+        assert!(is_globally_routable(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888))));
+    }
+
+    #[test]
+    fn is_globally_routable_v4_cgnat() {
+        assert!(!is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(!is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(100, 127, 255, 255))));
+    }
+
+    #[test]
+    fn is_globally_routable_v4_documentation() {
+        assert!(!is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))));
+        assert!(!is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1))));
+        assert!(!is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 1))));
+    }
+
+    #[test]
+    fn is_globally_routable_v4_broadcast() {
+        assert!(!is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(255, 255, 255, 255))));
+    }
+
+    #[test]
+    fn is_globally_routable_v4_unspecified() {
+        assert!(!is_globally_routable(std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0))));
+    }
+
+    #[test]
+    fn is_globally_routable_v6_unspecified() {
+        assert!(!is_globally_routable(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0))));
+    }
+
+    #[test]
+    fn is_globally_routable_v6_unique_local() {
+        assert!(!is_globally_routable(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1))));
+    }
+
+    #[test]
+    fn is_globally_routable_v6_site_local() {
+        assert!(!is_globally_routable(std::net::IpAddr::V6(std::net::Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 1))));
+    }
+

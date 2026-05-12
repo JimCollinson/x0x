@@ -84,20 +84,54 @@ reviewer):
        X0X-0072  QUIC connection pool (state-refresh / idle eviction)
 ```
 
-**Recommended cadence:**
+**Recommended cadence (v2 — 2026-05-12, locked sequence):**
 
-1. Ship X0X-0075 diagnostics first (no acceptance soak required —
-   just instrumentation). Unblocks everything else.
-2. Ship X0X-0076 split-soak methodology in parallel. Run Variant A
-   and Variant B once X0X-0075 is in. These produce the prerequisite
-   evidence for X0X-0074 design decisions.
-3. Ship X0X-0068 cache bounding in parallel (smaller diff, bandwidth
-   reduction is independently valuable, reuses X0X-0075 telemetry
-   infrastructure).
-4. Ship X0X-0074 admission control as the centrepiece. **This is the
-   ticket that should pass the plateau 4h soak.**
-5. Then ship the supporting layers (X0X-0073, 0069, 0071, 0070, 0072)
-   in priority order, each with its own 4h soak gate.
+The user-architected sequence puts cooldown primitives + visibility
+*before* the cooling-decision integration. Each ticket needs the
+prior one's primitives or visibility to be designed correctly; doing
+them out of order means refactoring or flying blind on validation.
+
+1. **X0X-0068 — bounded cache** (saorsa-gossip 0.5.41). ✓ shipped.
+   Ships first — small diff, bandwidth-reduction is independently
+   valuable, provides per-topic `CacheStats` infrastructure that
+   X0X-0075 builds on.
+2. **X0X-0069 (MVP) — SWIM bridge** (saorsa-gossip 0.5.42). ✓ shipped.
+   Trait + plumbing only. Doesn't change cooling behaviour; gives
+   every downstream ticket the oracle surface to consume.
+3. **X0X-0073 — adaptive cooling primitives**. Ships next. Provides
+   per-peer p95 EWMA timeout + decaying cooldown to replace the fixed
+   2500ms / 120000ms values. Independent of X0X-0069b — the
+   primitives are the foundation for it.
+4. **X0X-0075 — per-topic + per-peer diagnostics**. Ships after
+   X0X-0073 (so the adaptive cooldown values are visible in the new
+   per-topic per-peer suppression breakdown). Quinn PathStats per
+   peer also lands here. Unblocks design + validation of everything
+   that follows.
+5. **X0X-0076 — split-soak methodology**. Ships in parallel with
+   X0X-0073 / X0X-0075. Variant A (fixed-roster DM-only) + Variant B
+   (PubSub-pressure-only) produce the prerequisite evidence for
+   X0X-0074 priority tuning.
+6. **X0X-0069b — cooling-decision integration**. Ships after X0X-0073
+   *and* X0X-0075. By now we have adaptive cooldown primitives to
+   integrate against and per-topic visibility to validate the
+   integration is firing on the right peers / topics. Wires the
+   oracle into `record_send_timeout_at` threshold-crossing:
+   `Suspect` holds cooling, `Dead` escalates.
+7. **X0X-0074 — admission control + topic priority** (centrepiece).
+   Ships in parallel with X0X-0069b once X0X-0075 lands. Admission
+   control prevents low-priority work from entering the per-peer
+   pipeline at all; X0X-0069b changes how the pipeline handles things
+   that do enter. They compose; neither blocks the other.
+8. **X0X-0071 — P1-P7 peer scoring**. Ships after X0X-0069b (and
+   X0X-0073). Consumes the bridge surface + adaptive cooldown
+   primitives in its decay function.
+9. **X0X-0070 — peer relay** + **X0X-0072 — connection pool**.
+   Independent of Track A; can interleave at any point.
+
+**Plateau acceptance** (window-16 `max_pp_to` ≤ 2× window-1) belongs
+to X0X-0074. Earlier tickets each have their own acceptance soaks
+that don't require plateau — they're necessary infrastructure that
+sets up admission control to do the heavy lifting.
 
 The remaining sections of this document describe the supporting
 layers in the form they had under v1 of the plan. Read them with the

@@ -346,4 +346,42 @@ mod tests {
         // archive_sha256 for first asset should be hex-encoded 0xAA repeated 32 times
         assert!(json.contains(&"aa".repeat(32)));
     }
+
+
+    #[test]
+    fn test_asset_for_current_platform_matches() {
+        let manifest = make_manifest();
+        let asset = manifest.asset_for_current_platform();
+        // On supported platforms, should return Some
+        #[cfg(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "aarch64"),
+            all(target_os = "macos", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "windows", target_arch = "x86_64"),
+        ))]
+        assert!(asset.is_some(), "should find asset for current platform");
+    }
+
+    #[test]
+    fn test_asset_for_current_platform_returns_none_for_unsupported() {
+        let manifest = ReleaseManifest {
+            schema_version: 1,
+            version: "1.0.0".to_string(),
+            timestamp: 1000,
+            assets: vec![
+                PlatformAsset {
+                    target: "nonexistent-cpu-none".to_string(),
+                    archive_url: "https://example.com/asset.tar.gz".to_string(),
+                    archive_sha256: [0xBB; 32],
+                    signature_url: "https://example.com/asset.tar.gz.sig".to_string(),
+                },
+            ],
+            skill_url: "https://example.com/skill.wasm".to_string(),
+            skill_sha256: [0xCC; 32],
+        };
+        // Should return None since no asset matches the current platform
+        let asset = manifest.asset_for_current_platform();
+        assert!(asset.is_none(), "no asset should match nonexistent platform");
+    }
 }

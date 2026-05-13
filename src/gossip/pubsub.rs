@@ -1359,4 +1359,75 @@ mod tests {
             MESSAGES
         );
     }
+
+
+    // ── PubSubStats ────────────────────────────────────────────────────
+
+    #[test]
+    fn pubsub_stats_default_is_zero() {
+        let stats = PubSubStats::default();
+        let snap = stats.snapshot();
+        assert_eq!(snap.publish_total, 0);
+        assert_eq!(snap.publish_failed, 0);
+        assert_eq!(snap.incoming_total, 0);
+        assert_eq!(snap.incoming_decoded, 0);
+        assert_eq!(snap.incoming_decode_failed, 0);
+        assert_eq!(snap.delivered_to_subscriber, 0);
+        assert_eq!(snap.slow_subscriber_dropped, 0);
+        assert_eq!(snap.subscriber_channel_closed, 0);
+    }
+
+    #[test]
+    fn pubsub_stats_tracks_publish_via_fetch_add() {
+        let stats = PubSubStats::default();
+        stats.publish_total.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        stats.publish_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let snap = stats.snapshot();
+        assert_eq!(snap.publish_total, 2);
+        assert_eq!(snap.publish_failed, 1);
+    }
+
+    #[test]
+    fn pubsub_stats_tracks_incoming_via_fetch_add() {
+        let stats = PubSubStats::default();
+        stats.incoming_total.fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        stats.incoming_decoded.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+        stats.incoming_decode_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let snap = stats.snapshot();
+        assert_eq!(snap.incoming_total, 5);
+        assert_eq!(snap.incoming_decoded, 4);
+        assert_eq!(snap.incoming_decode_failed, 1);
+    }
+
+    #[test]
+    fn pubsub_stats_tracks_delivery_via_fetch_add() {
+        let stats = PubSubStats::default();
+        stats.delivered_to_subscriber.fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        stats.slow_subscriber_dropped.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        stats.subscriber_channel_closed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let snap = stats.snapshot();
+        assert_eq!(snap.delivered_to_subscriber, 10);
+        assert_eq!(snap.slow_subscriber_dropped, 2);
+        assert_eq!(snap.subscriber_channel_closed, 1);
+    }
+
+    #[test]
+    fn pubsub_stats_computes_in_flight_decode() {
+        let stats = PubSubStats::default();
+        stats.incoming_total.fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        stats.incoming_decoded.fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+        stats.incoming_decode_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let snap = stats.snapshot();
+        assert_eq!(snap.in_flight_decode, 2);
+    }
+
+    #[test]
+    fn pubsub_stats_computes_decode_to_delivery_drops() {
+        let stats = PubSubStats::default();
+        stats.incoming_decoded.fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        stats.delivered_to_subscriber.fetch_add(6, std::sync::atomic::Ordering::Relaxed);
+        stats.subscriber_channel_closed.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        let snap = stats.snapshot();
+        assert_eq!(snap.decode_to_delivery_drops, 2);
+    }
 }

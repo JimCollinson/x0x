@@ -336,4 +336,115 @@ mod tests {
         assert_eq!(version_from_tag("0.4.0"), "0.4.0");
         assert_eq!(version_from_tag("v1.2.3-rc1"), "1.2.3-rc1");
     }
+
+
+    #[test]
+    fn validate_manifest_timestamp_accepts_recent() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let manifest = ReleaseManifest {
+            schema_version: 1,
+            version: "0.19.42".to_string(),
+            timestamp: now - 3600, // 1 hour ago
+            assets: vec![],
+            skill_url: String::new(),
+            skill_sha256: [0u8; 32],
+        };
+        assert!(validate_manifest_timestamp(&manifest).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_timestamp_rejects_old() {
+        let manifest = ReleaseManifest {
+            schema_version: 1,
+            version: "0.19.42".to_string(),
+            timestamp: 1000000, // way in the past
+            assets: vec![],
+            skill_url: String::new(),
+            skill_sha256: [0u8; 32],
+        };
+        assert!(validate_manifest_timestamp(&manifest).is_err());
+    }
+
+    #[test]
+    fn validate_manifest_timestamp_accepts_zero() {
+        let manifest = ReleaseManifest {
+            schema_version: 1,
+            version: "0.19.42".to_string(),
+            timestamp: 0, // backward compat
+            assets: vec![],
+            skill_url: String::new(),
+            skill_sha256: [0u8; 32],
+        };
+        assert!(validate_manifest_timestamp(&manifest).is_ok());
+    }
+
+    #[test]
+    fn validate_manifest_timestamp_accepts_future() {
+        let far_future = 9999999999;
+        let manifest = ReleaseManifest {
+            schema_version: 1,
+            version: "0.19.42".to_string(),
+            timestamp: far_future,
+            assets: vec![],
+            skill_url: String::new(),
+            skill_sha256: [0u8; 32],
+        };
+        assert!(validate_manifest_timestamp(&manifest).is_ok());
+    }
+
+    #[test]
+    fn upgrade_monitor_new_parses_version() {
+        let monitor = UpgradeMonitor::new("saorsa-labs/x0x", "x0xd", "0.19.42").unwrap();
+        assert_eq!(monitor.repo, "saorsa-labs/x0x");
+        assert_eq!(monitor.current_version.to_string(), "0.19.42");
+        assert!(!monitor.include_prereleases);
+    }
+
+    #[test]
+    fn upgrade_monitor_new_rejects_invalid_version() {
+        let result = UpgradeMonitor::new("saorsa-labs/x0x", "x0xd", "not-a-version");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn upgrade_monitor_with_prereleases() {
+        let monitor = UpgradeMonitor::new("saorsa-labs/x0x", "x0xd", "0.19.42")
+            .unwrap()
+            .with_include_prereleases(true);
+        assert!(monitor.include_prereleases);
+    }
+
+    #[test]
+    fn github_release_deserializes() {
+        let json = r#"{
+            "tag_name": "v0.19.42",
+            "body": "Release notes",
+            "assets": [
+                {"name": "x0d-x86_64-linux-gnu.tar.gz", "browser_download_url": "https://example.com/asset.tar.gz"},
+                {"name": "release-manifest.json", "browser_download_url": "https://example.com/manifest.json"},
+                {"name": "release-manifest.json.sig", "browser_download_url": "https://example.com/manifest.json.sig"}
+            ]
+        }"#;
+        let release: GitHubRelease = serde_json::from_str(json).unwrap();
+        assert_eq!(release.tag_name, "v0.19.42");
+        assert_eq!(release.assets.len(), 3);
+        assert_eq!(release.assets[0].name, "x0d-x86_64-linux-gnu.tar.gz");
+        assert_eq!(release.assets[1].name, "release-manifest.json");
+        assert_eq!(release.assets[2].name, "release-manifest.json.sig");
+    }
+
+    #[test]
+    fn github_release_deserializes_without_body() {
+        let json = r#"{
+            "tag_name": "v0.18.0",
+            "assets": []
+        }"#;
+        let release: GitHubRelease = serde_json::from_str(json).unwrap();
+        assert_eq!(release.tag_name, "v0.18.0");
+        assert!(release.body.is_none());
+        assert!(release.assets.is_empty());
+    }
 }

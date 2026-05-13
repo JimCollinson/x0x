@@ -14,7 +14,7 @@ use crate::identity::AgentId;
 use crate::network::NetworkNode;
 use bytes::Bytes;
 use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
-use saorsa_gossip_types::{PeerId, TopicId};
+use saorsa_gossip_types::{PeerId, TopicId, TopicPriority};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -295,6 +295,7 @@ impl PubSubManager {
             Arc::clone(&network),
             plumtree_signing_key,
         ));
+        register_x0x_topic_priorities(plumtree.admission().registry());
 
         Ok(Self {
             network,
@@ -341,6 +342,7 @@ impl PubSubManager {
     /// `Subscription` is dropped.
     pub async fn subscribe(&self, topic: String) -> Subscription {
         let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.register_dynamic_topic_priority(&topic, topic_id);
         self.initialize_topic_peers(topic_id).await;
 
         let mut plumtree_rx = self.plumtree.subscribe(topic_id);
@@ -451,6 +453,7 @@ impl PubSubManager {
         };
 
         let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.register_dynamic_topic_priority(&topic, topic_id);
         self.initialize_topic_peers(topic_id).await;
 
         match self.plumtree.publish(topic_id, encoded).await {
@@ -535,6 +538,24 @@ impl PubSubManager {
         }
     }
 
+    /// X0X-0074: classify a dynamic topic name and register it with the
+    /// admission control registry. Idempotent — re-registering with the
+    /// same priority is a no-op; re-registering with a different priority
+    /// overwrites (the runtime should never do that for production
+    /// topics, but the registry handles it gracefully).
+    ///
+    /// Called on subscribe + publish entry points. The static x0x topic
+    /// set is seeded at construction; this path covers sharded topics
+    /// (`x0x.identity.shard.v2.<u16>`), DM-inbox topics (per-recipient
+    /// hashes), release manifests, and any custom application topic.
+    fn register_dynamic_topic_priority(&self, topic_name: &str, topic_id: TopicId) {
+        let priority = classify_x0x_topic(topic_name);
+        self.plumtree
+            .admission()
+            .registry()
+            .register(topic_id, priority);
+    }
+
     /// Initialize PlumTree peers for a topic from currently connected peers.
     async fn initialize_topic_peers(&self, topic: TopicId) {
         let peers: Vec<PeerId> = self
@@ -587,6 +608,139 @@ async fn decode_for_delivery(
     }
 
     Some(message)
+}
+
+// ---------------------------------------------------------------------------
+// X0X-0074 — topic priority classification
+// ---------------------------------------------------------------------------
+
+/// Topic-name fragments that classify production x0x topics into admission
+/// priority bands. Topics not matching any prefix here default to
+/// `TopicPriority::Normal` via the registry.
+///
+/// Matching is `starts_with` against the topic name string (the value
+/// applications pass to `PubSubManager::publish` / `subscribe`, before
+/// `TopicId::from_entity` hashes it). x0x's production topic set mixes
+/// two naming conventions:
+///   - **Slash-separated** (path style): `x0x/dm/v1/bus`, `x0x/release`,
+///     `x0x/caps/v1`. Used for DM bus, release manifests, capability
+///     adverts.
+///   - **Dot-separated**: `x0x.identity.shard.v2.<u16>`, `x0x.discovery.groups`,
+///     etc. Used for identity/machine/user anti-entropy + discovery
+///     shards.
+///
+/// Both shapes are listed below so the classifier matches what x0x
+/// actually publishes. A previous version of this classifier had only
+/// the dot-style prefixes, which caused DM bus and release manifests to
+/// silently fall through to Normal in production (reviewer P1.2,
+/// 2026-05-12).
+const CRITICAL_TOPIC_PREFIXES: &[&str] = &[
+    "x0x/dm/v1/", // DM bus + DM inbox (slash style — x0x/dm/v1/bus, x0x/dm/v1/inbox/...)
+    "x0x.dm.",    // Reserved for any future dot-style DM topics
+    "x0x.identity.announce.v2", // Identity announce — control-plane
+    "x0x.test.discover.v1", // Test orchestrator discover (X0X-0076 harness)
+    "x0x.test.control.v1", // Test orchestrator control commands
+];
+
+const BULK_TOPIC_PREFIXES: &[&str] = &[
+    "x0x.identity.shard.v2.",  // Identity anti-entropy shards
+    "x0x.machine.shard.v2.",   // Machine anti-entropy shards
+    "x0x.user.shard.v2.",      // User anti-entropy shards
+    "x0x.machine.announce.v2", // Machine announce — bulk
+    "x0x.user.announce.v2",    // User announce — bulk
+    "x0x.discovery.groups",    // Global group discovery anti-entropy
+    "x0x.rendezvous.shard",    // Rendezvous shard discovery
+    "x0x/release",             // Release manifests (slash style — x0x/release)
+    "x0x.release.",            // Reserved for any future dot-style release topics
+    "x0x/caps/v1",             // Mesh-wide DM capability advert (5-min republish)
+    "x0x.group.cards",         // Group card anti-entropy
+    "x0x.group.share.v2",      // Group share anti-entropy
+];
+
+/// Returns the X0X-0074 admission priority for an x0x topic name.
+///
+/// Matching is prefix-based against the priority lists above. Critical is
+/// checked before Bulk so e.g. `x0x.test.discover.v1` lands on Critical
+/// even though `x0x.test.` is a substring of other bulk topics. Anything
+/// unmatched (presence, named-group fanout, public messages, custom app
+/// topics) falls through to `TopicPriority::Normal`.
+#[must_use]
+pub fn classify_x0x_topic(topic_name: &str) -> TopicPriority {
+    if CRITICAL_TOPIC_PREFIXES
+        .iter()
+        .any(|prefix| topic_name.starts_with(prefix))
+    {
+        return TopicPriority::Critical;
+    }
+    if BULK_TOPIC_PREFIXES
+        .iter()
+        .any(|prefix| topic_name.starts_with(prefix))
+    {
+        return TopicPriority::Bulk;
+    }
+    TopicPriority::Normal
+}
+
+/// Seed the topic-priority registry with x0x's production topic set.
+///
+/// Called once during `PubSubManager::new` so the admission gate has
+/// correct priorities before any traffic flows. Application-side topics
+/// (custom user topics, named-group fanout) are not pre-registered and
+/// default to Normal admission — which is the safe default for traffic
+/// the substrate doesn't have context on.
+fn register_x0x_topic_priorities(
+    registry: &saorsa_gossip_pubsub::admission::TopicPriorityRegistry,
+) {
+    use saorsa_gossip_types::TopicId;
+
+    // Critical — DM bus + control plane + test orchestrator
+    registry.register(
+        TopicId::from_entity("x0x/dm/v1/bus".as_bytes()),
+        TopicPriority::Critical,
+    );
+    registry.register(
+        TopicId::from_entity("x0x.identity.announce.v2".as_bytes()),
+        TopicPriority::Critical,
+    );
+    registry.register(
+        TopicId::from_entity("x0x.test.discover.v1".as_bytes()),
+        TopicPriority::Critical,
+    );
+    registry.register(
+        TopicId::from_entity("x0x.test.control.v1".as_bytes()),
+        TopicPriority::Critical,
+    );
+    // Per-recipient DM inbox topics (`x0x/dm/v1/inbox/<hash>`) are
+    // dynamic — they're registered through `register_dynamic_topic_priority`
+    // when the runtime subscribes to its own inbox. The prefix
+    // `x0x/dm/v1/` in CRITICAL_TOPIC_PREFIXES catches them.
+
+    // Bulk — fleet-wide anti-entropy + manifests + capability adverts
+    registry.register(
+        TopicId::from_entity("x0x.machine.announce.v2".as_bytes()),
+        TopicPriority::Bulk,
+    );
+    registry.register(
+        TopicId::from_entity("x0x.user.announce.v2".as_bytes()),
+        TopicPriority::Bulk,
+    );
+    registry.register(
+        TopicId::from_entity("x0x.discovery.groups".as_bytes()),
+        TopicPriority::Bulk,
+    );
+    registry.register(
+        TopicId::from_entity("x0x/release".as_bytes()),
+        TopicPriority::Bulk,
+    );
+    registry.register(
+        TopicId::from_entity("x0x/caps/v1".as_bytes()),
+        TopicPriority::Bulk,
+    );
+    // Identity/Machine/User shards (`x0x.identity.shard.v2.<u16>`,
+    // `x0x.machine.shard.v2.<u16>`, `x0x.user.shard.v2.<u16>`) + rendezvous
+    // shards are dynamic per-shard topic names — they fall through
+    // `register_dynamic_topic_priority` on first publish/subscribe.
+    // Normal is the default for anything unregistered.
 }
 
 // ---------------------------------------------------------------------------
@@ -853,6 +1007,118 @@ mod tests {
     use super::*;
     use crate::identity::AgentKeypair;
     use crate::network::NetworkConfig;
+
+    #[test]
+    fn classify_x0x_topic_routes_dm_bus_to_critical() {
+        // Why: x0x's DM bus is the canonical Critical class — never drop
+        // on admission load. The production topic uses slash-style
+        // naming (`x0x/dm/v1/bus`), and a previous classifier with only
+        // `x0x.dm.` dot-style prefix silently routed DM to Normal in
+        // production (reviewer P1.2, 2026-05-12).
+        assert_eq!(
+            classify_x0x_topic("x0x/dm/v1/bus"),
+            TopicPriority::Critical,
+            "DM_BUS_TOPIC string from src/dm_inbox.rs must classify as Critical"
+        );
+    }
+
+    #[test]
+    fn classify_x0x_topic_routes_dm_inbox_hash_to_critical() {
+        // Why: per-recipient DM inbox topics use the slash-prefix
+        // `x0x/dm/v1/inbox/<hash>`. The classifier prefix `x0x/dm/v1/`
+        // catches both the bus and per-recipient inbox topics.
+        assert_eq!(
+            classify_x0x_topic("x0x/dm/v1/inbox/abc123"),
+            TopicPriority::Critical
+        );
+    }
+
+    #[test]
+    fn classify_x0x_topic_routes_identity_announce_to_critical() {
+        assert_eq!(
+            classify_x0x_topic("x0x.identity.announce.v2"),
+            TopicPriority::Critical
+        );
+    }
+
+    #[test]
+    fn classify_x0x_topic_routes_test_orchestrator_to_critical() {
+        // Why: split-soak (X0X-0076) needs reliable test-orchestrator
+        // control delivery even under PubSub-pressure variant B.
+        assert_eq!(
+            classify_x0x_topic("x0x.test.discover.v1"),
+            TopicPriority::Critical
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.test.control.v1"),
+            TopicPriority::Critical
+        );
+    }
+
+    #[test]
+    fn classify_x0x_topic_routes_anti_entropy_to_bulk() {
+        // Why: identity / machine / user shards + discovery anti-entropy
+        // + release manifests + capability adverts + group cards are the
+        // pressure-generating topics the Hunt 12f forecast identified.
+        // Production uses both dot- and slash-separated topic names —
+        // both must classify correctly.
+        assert_eq!(
+            classify_x0x_topic("x0x.identity.shard.v2.0042"),
+            TopicPriority::Bulk
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.machine.shard.v2.0123"),
+            TopicPriority::Bulk
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.user.shard.v2.0099"),
+            TopicPriority::Bulk
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.discovery.groups"),
+            TopicPriority::Bulk
+        );
+        // Production RELEASE_TOPIC from src/upgrade/manifest.rs is
+        // `x0x/release` (slash-style). A previous classifier with only
+        // the dot-style `x0x.release.` prefix silently routed release
+        // manifests to Normal (reviewer P1.2, 2026-05-12).
+        assert_eq!(
+            classify_x0x_topic("x0x/release"),
+            TopicPriority::Bulk,
+            "RELEASE_TOPIC string from src/upgrade/manifest.rs must classify as Bulk"
+        );
+        // DM capability advert — mesh-wide republish every 5 min.
+        // Production constant `DM_CAPABILITY_TOPIC = x0x/caps/v1`
+        // (src/dm_capability.rs).
+        assert_eq!(
+            classify_x0x_topic("x0x/caps/v1"),
+            TopicPriority::Bulk,
+            "DM_CAPABILITY_TOPIC string from src/dm_capability.rs must classify as Bulk"
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.group.cards.v1"),
+            TopicPriority::Bulk
+        );
+    }
+
+    #[test]
+    fn classify_x0x_topic_defaults_unknown_topics_to_normal() {
+        // Why: presence, named-group fanout, public messages, and any
+        // custom application topic land here. Normal admission only
+        // drops Dead peers — safe default.
+        assert_eq!(
+            classify_x0x_topic("x0x.presence.global"),
+            TopicPriority::Normal
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.groups.public.v1"),
+            TopicPriority::Normal
+        );
+        assert_eq!(
+            classify_x0x_topic("my.custom.app.topic"),
+            TopicPriority::Normal
+        );
+    }
 
     /// Helper to create a test network node.
     async fn test_node() -> Arc<NetworkNode> {
@@ -1360,7 +1626,6 @@ mod tests {
         );
     }
 
-
     // ── PubSubStats ────────────────────────────────────────────────────
 
     #[test]
@@ -1380,8 +1645,12 @@ mod tests {
     #[test]
     fn pubsub_stats_tracks_publish_via_fetch_add() {
         let stats = PubSubStats::default();
-        stats.publish_total.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
-        stats.publish_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .publish_total
+            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .publish_failed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snap = stats.snapshot();
         assert_eq!(snap.publish_total, 2);
         assert_eq!(snap.publish_failed, 1);
@@ -1390,9 +1659,15 @@ mod tests {
     #[test]
     fn pubsub_stats_tracks_incoming_via_fetch_add() {
         let stats = PubSubStats::default();
-        stats.incoming_total.fetch_add(5, std::sync::atomic::Ordering::Relaxed);
-        stats.incoming_decoded.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
-        stats.incoming_decode_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .incoming_total
+            .fetch_add(5, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .incoming_decoded
+            .fetch_add(4, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .incoming_decode_failed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snap = stats.snapshot();
         assert_eq!(snap.incoming_total, 5);
         assert_eq!(snap.incoming_decoded, 4);
@@ -1402,9 +1677,15 @@ mod tests {
     #[test]
     fn pubsub_stats_tracks_delivery_via_fetch_add() {
         let stats = PubSubStats::default();
-        stats.delivered_to_subscriber.fetch_add(10, std::sync::atomic::Ordering::Relaxed);
-        stats.slow_subscriber_dropped.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
-        stats.subscriber_channel_closed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .delivered_to_subscriber
+            .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .slow_subscriber_dropped
+            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .subscriber_channel_closed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snap = stats.snapshot();
         assert_eq!(snap.delivered_to_subscriber, 10);
         assert_eq!(snap.slow_subscriber_dropped, 2);
@@ -1414,9 +1695,15 @@ mod tests {
     #[test]
     fn pubsub_stats_computes_in_flight_decode() {
         let stats = PubSubStats::default();
-        stats.incoming_total.fetch_add(10, std::sync::atomic::Ordering::Relaxed);
-        stats.incoming_decoded.fetch_add(7, std::sync::atomic::Ordering::Relaxed);
-        stats.incoming_decode_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .incoming_total
+            .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .incoming_decoded
+            .fetch_add(7, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .incoming_decode_failed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snap = stats.snapshot();
         assert_eq!(snap.in_flight_decode, 2);
     }
@@ -1424,9 +1711,15 @@ mod tests {
     #[test]
     fn pubsub_stats_computes_decode_to_delivery_drops() {
         let stats = PubSubStats::default();
-        stats.incoming_decoded.fetch_add(10, std::sync::atomic::Ordering::Relaxed);
-        stats.delivered_to_subscriber.fetch_add(6, std::sync::atomic::Ordering::Relaxed);
-        stats.subscriber_channel_closed.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .incoming_decoded
+            .fetch_add(10, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .delivered_to_subscriber
+            .fetch_add(6, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .subscriber_channel_closed
+            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
         let snap = stats.snapshot();
         assert_eq!(snap.decode_to_delivery_drops, 2);
     }

@@ -4,6 +4,88 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.43] - 2026-05-13
+
+X0X-0074 admission control bundle. Consumes saorsa-gossip 0.5.48 which
+bundles X0X-0073b (cooling-decision integration on top of X0X-0073
+primitives + X0X-0069 oracle bridge) and X0X-0074 (substrate-level
+admission control with topic priority). 0.5.46 (yanked from crates.io)
+and 0.5.47 (behaviour-correct but stale source docs) precede 0.5.48.
+
+### Tickets
+
+- **X0X-0073b** (review): cooling-decision integration shipped in
+  saorsa-gossip 0.5.48. 1s background snapshot refresher reads
+  `oracle.health_of(peer).await`; `record_send_timeout_inner_at` reads
+  the snapshot synchronously and branches on Dead/Suspect/Alive
+  (`escalate_on_dead` / hold+probe / `next_cooldown`). Success path
+  decays `cooling.cooldown` while preserving `last_suppressed_at` so
+  the next escalation builds from the decayed value.
+- **X0X-0074** (review): admission control + topic priority shipped
+  in saorsa-gossip 0.5.48. Three priority bands (Bulk / Normal /
+  Critical); `parallel_send_to_peers` and `send_to_peer_bounded`
+  filter peers through admission before claiming attempts; Bulk
+  admissions release via RAII-style guard or explicit
+  `release_bulk_admissions` exactly once per admit; Critical
+  failures to claim downstream record `dropped_critical_hard_error`
+  (soak-blocking violation if non-zero in production).
+- **X0X-0074b** (todo, filed): future work for the full
+  "Bulk-evict-before-Critical-drop + Critical bypass cooling"
+  contract from the original X0X-0074 ticket text. The current MVP
+  records a hard-error counter; X0X-0074b will implement either an
+  explicit per-peer priority queue replacing the permit/slack model,
+  or transport-layer cancellation of in-flight Bulk sends.
+
+### Added
+
+- `register_x0x_topic_priorities()` — seeds the X0X-0074 admission
+  registry at `PubSubManager::new` with the production topic set:
+  - **Critical**: `x0x/dm/v1/bus`, `x0x.identity.announce.v2`,
+    `x0x.test.discover.v1`, `x0x.test.control.v1`
+  - **Bulk**: `x0x.machine.announce.v2`, `x0x.user.announce.v2`,
+    `x0x.discovery.groups`, `x0x/release`, `x0x/caps/v1`
+- `classify_x0x_topic(topic_name) -> TopicPriority` — prefix-based
+  classifier covering both slash-style (`x0x/dm/v1/...`,
+  `x0x/release`, `x0x/caps/v1`) and dot-style (`x0x.identity.shard.v2.*`,
+  `x0x.machine.shard.v2.*`, `x0x.user.shard.v2.*`, `x0x.rendezvous.shard`,
+  etc.) production topic names. Reviewer round 1 P1.2 caught the
+  earlier classifier missing the slash-style production topics —
+  this is the fixed shape.
+- `register_dynamic_topic_priority()` — applies the classifier on
+  every `PubSubManager::subscribe` and `publish` call so sharded
+  topic names (per-shard identity/machine/user, DM per-recipient
+  inbox hashes) get registered on first use.
+
+### Changed
+
+- `saorsa-gossip-*` workspace deps bumped 0.5.45 → 0.5.48 across all
+  11 crates. Brings X0X-0073b cooling-decision integration,
+  X0X-0074 admission control engine, reviewer round 1 fixes
+  (Critical hard-error counter, Bulk depth leak resolved, topic
+  classifier mismatch fixed, Normal drops on Suspect), and round 2
+  documentation corrections.
+
+### Validation
+
+- cargo build --release --bin x0xd: clean
+- cargo nextest run --all-features --workspace -E
+  '!test(x0x_0041_synthetic_kill_restart)': 1173/1173 pass (known
+  X0X-0054 flake filtered)
+- cargo clippy --all-targets --all-features -- -D warnings: clean
+  (after fixing overnight-autoresearch test-code lints —
+  TaskListId.clone in crdt/persistence tests, π approximation in
+  cli/mod test, single-pattern match in cli/mod, loop index in
+  exec/audit, constant assertions in dm_send)
+- cargo fmt --all -- --check: clean
+- python3 -m unittest: 37/37 pass
+
+### Notes
+
+- 4h Phase A soak gates closure of X0X-0073 / X0X-0073b / X0X-0074
+  (cooling event reduction ≥ 5×, no peer continuously cooled > 30s,
+  Phase A ≥ 98%, `dropped_critical_hard_error` stays zero).
+- X0X-0071 (P1-P7 peer scoring) now functionally unblocked.
+
 ## [v0.19.42] - 2026-05-12
 
 Phase 2 portfolio release: SOTA-Borrow Phase 2 work shipped via the

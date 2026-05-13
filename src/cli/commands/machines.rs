@@ -150,5 +150,31 @@ mod tests {
         let result = discovered(&client, false).await;
         assert!(result.is_ok(), "discovered should succeed: {:?}", result);
     }
+
+
+    #[tokio::test]
+    async fn get_discovered_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = get_discovered(&client, "machine-1", false).await;
+        assert!(result.is_ok(), "get_discovered should succeed: {:?}", result);
+    }
+    #[tokio::test]
+    async fn by_user_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = by_user(&client, "user-1").await;
+        assert!(result.is_ok(), "by_user should succeed: {:?}", result);
+    }
+    #[tokio::test]
+    async fn list_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = list(&client, "agent-1").await;
+        assert!(result.is_ok(), "list should succeed: {:?}", result);
+    }
 }
 

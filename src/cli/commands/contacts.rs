@@ -169,5 +169,15 @@ mod tests {
         let result = revocations(&client, "abc123").await;
         assert!(result.is_ok(), "revocations should succeed: {:?}", result);
     }
+
+
+    #[tokio::test]
+    async fn trust_evaluate_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = trust_evaluate(&client, "agent-123", "machine-456").await;
+        assert!(result.is_ok(), "trust_evaluate should succeed: {:?}", result);
+    }
 }
 

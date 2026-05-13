@@ -185,5 +185,23 @@ mod tests {
         let result = transfer_status(&client, "transfer-123").await;
         assert!(result.is_ok(), "transfer_status should succeed: {:?}", result);
     }
+
+
+    #[tokio::test]
+    async fn accept_file_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = accept_file(&client, "transfer-123").await;
+        assert!(result.is_ok(), "accept_file should succeed: {:?}", result);
+    }
+    #[tokio::test]
+    async fn reject_file_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = reject_file(&client, "transfer-123", Some("too-large")).await;
+        assert!(result.is_ok(), "reject_file should succeed: {:?}", result);
+    }
 }
 

@@ -117,5 +117,47 @@ mod tests {
         let result = list(&client, false).await;
         assert!(result.is_ok(), "list should succeed: {:?}", result);
     }
+
+
+    #[tokio::test]
+    async fn get_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = get(&client, "agent-123", None::<u64>).await;
+        assert!(result.is_ok(), "get should succeed: {:?}", result);
+    }
+    #[tokio::test]
+    async fn find_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = find(&client, "agent-123").await;
+        assert!(result.is_ok(), "find should succeed: {:?}", result);
+    }
+    #[tokio::test]
+    async fn reachability_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = reachability(&client, "agent-123").await;
+        assert!(result.is_ok(), "reachability should succeed: {:?}", result);
+    }
+    #[tokio::test]
+    async fn machine_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = machine(&client, "agent-123").await;
+        assert!(result.is_ok(), "machine should succeed: {:?}", result);
+    }
+    #[tokio::test]
+    async fn by_user_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = by_user(&client, "user-123").await;
+        assert!(result.is_ok(), "by_user should succeed: {:?}", result);
+    }
 }
 

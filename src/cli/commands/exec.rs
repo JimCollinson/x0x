@@ -163,5 +163,15 @@ mod tests {
         let result = diagnostics(&client).await;
         assert!(result.is_ok(), "diagnostics should succeed: {:?}", result);
     }
+
+
+    #[tokio::test]
+    async fn cancel_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = cancel(&client, "req-123", None::<&str>).await;
+        assert!(result.is_ok(), "cancel should succeed: {:?}", result);
+    }
 }
 

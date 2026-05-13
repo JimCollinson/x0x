@@ -115,5 +115,15 @@ mod tests {
         let result = list(&client).await;
         assert!(result.is_ok(), "list should succeed: {:?}", result);
     }
+
+
+    #[tokio::test]
+    async fn show_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = show(&client, "list-1").await;
+        assert!(result.is_ok(), "show should succeed: {:?}", result);
+    }
 }
 

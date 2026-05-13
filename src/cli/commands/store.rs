@@ -124,5 +124,23 @@ mod tests {
         let result = list(&client).await;
         assert!(result.is_ok(), "list should succeed: {:?}", result);
     }
+
+
+    #[tokio::test]
+    async fn keys_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = keys(&client, "store-1").await;
+        assert!(result.is_ok(), "keys should succeed: {:?}", result);
+    }
+    #[tokio::test]
+    async fn get_returns_mock_response() {
+        let mock_resp = serde_json::json!({"status": "ok"});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = get(&client, "store-1", "my-key").await;
+        assert!(result.is_ok(), "get should succeed: {:?}", result);
+    }
 }
 

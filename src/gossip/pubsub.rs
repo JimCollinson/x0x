@@ -14,7 +14,7 @@ use crate::identity::AgentId;
 use crate::network::NetworkNode;
 use bytes::Bytes;
 use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
-use saorsa_gossip_types::{PeerId, TopicId, TopicPriority};
+use saorsa_gossip_types::{PeerHealthOracle, PeerId, TopicId, TopicPriority};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -284,17 +284,37 @@ impl PubSubManager {
         network: Arc<NetworkNode>,
         signing: Option<Arc<SigningContext>>,
     ) -> NetworkResult<Self> {
+        Self::new_with_oracle(network, signing, None)
+    }
+
+    /// Construct a [`PubSubManager`] with an explicit SWIM peer-health
+    /// oracle. X0X-0073b cooling-decision branches (Suspect grace, Dead
+    /// escalation) and X0X-0074 admission Suspect/Dead drops require the
+    /// oracle to be wired — without it, the snapshot stays empty and
+    /// those branches never engage in production.
+    ///
+    /// Use `new_with_oracle(network, signing, Some(membership.swim_arc()))`
+    /// from the runtime to thread the existing HyParView SWIM detector
+    /// into pub-sub. Use [`Self::new`] only when running pub-sub in
+    /// isolation (tests, single-binary tools).
+    pub fn new_with_oracle(
+        network: Arc<NetworkNode>,
+        signing: Option<Arc<SigningContext>>,
+        oracle: Option<Arc<dyn PeerHealthOracle>>,
+    ) -> NetworkResult<Self> {
         let peer_id = saorsa_gossip_transport::GossipTransport::local_peer_id(network.as_ref());
         let plumtree_signing_key =
             saorsa_gossip_identity::MlDsaKeyPair::generate().map_err(|e| {
                 NetworkError::NodeCreation(format!("failed to create PlumTree signing key: {e}"))
             })?;
 
-        let plumtree = Arc::new(PlumtreePubSub::new(
-            peer_id,
-            Arc::clone(&network),
-            plumtree_signing_key,
-        ));
+        let plumtree_inner =
+            PlumtreePubSub::new(peer_id, Arc::clone(&network), plumtree_signing_key);
+        let plumtree_inner = match oracle {
+            Some(oracle) => plumtree_inner.with_health_oracle(oracle),
+            None => plumtree_inner,
+        };
+        let plumtree = Arc::new(plumtree_inner);
         register_x0x_topic_priorities(plumtree.admission().registry());
 
         Ok(Self {
@@ -649,6 +669,7 @@ const BULK_TOPIC_PREFIXES: &[&str] = &[
     "x0x.machine.announce.v2", // Machine announce — bulk
     "x0x.user.announce.v2",    // User announce — bulk
     "x0x.discovery.groups",    // Global group discovery anti-entropy
+    "x0x.directory.",          // Group directory tag/name/id shards (src/groups/discovery.rs)
     "x0x.rendezvous.shard",    // Rendezvous shard discovery
     "x0x/release",             // Release manifests (slash style — x0x/release)
     "x0x.release.",            // Reserved for any future dot-style release topics
@@ -1052,6 +1073,28 @@ mod tests {
         assert_eq!(
             classify_x0x_topic("x0x.test.control.v1"),
             TopicPriority::Critical
+        );
+    }
+
+    #[test]
+    fn classify_x0x_topic_routes_directory_shards_to_bulk() {
+        // Why: group directory shard topics (tag/name/id) are
+        // anti-entropy discovery traffic published from x0xd. They use
+        // `x0x.directory.{kind}.{shard}` naming (see
+        // src/groups/discovery.rs `DIRECTORY_TOPIC_PREFIX`). A previous
+        // classifier omitted them so they defaulted to Normal admission
+        // (reviewer P2.1, 2026-05-13).
+        assert_eq!(
+            classify_x0x_topic("x0x.directory.tag.42"),
+            TopicPriority::Bulk
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.directory.name.0"),
+            TopicPriority::Bulk
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x.directory.id.65535"),
+            TopicPriority::Bulk
         );
     }
 

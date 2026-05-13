@@ -863,7 +863,18 @@ impl GossipRuntime {
             membership_config,
             Arc::clone(&network),
         ));
-        let pubsub = Arc::new(PubSubManager::new(Arc::clone(&network), signing)?);
+        // X0X-0073b + X0X-0074 (reviewer P1.1, 2026-05-13): wire the
+        // HyParView-owned SWIM detector into PlumtreePubSub so the
+        // peer-health snapshot is populated. Without this wire,
+        // pub-sub's Suspect/Dead cooling branches and admission drops
+        // never engage in production — they silently fall through to
+        // the legacy/Alive path.
+        let oracle: Arc<dyn saorsa_gossip_types::PeerHealthOracle> = membership.swim_arc();
+        let pubsub = Arc::new(PubSubManager::new_with_oracle(
+            Arc::clone(&network),
+            signing,
+            Some(oracle),
+        )?);
         let dispatch_workers = config.dispatch_workers;
 
         Ok(Self {

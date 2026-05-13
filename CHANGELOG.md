@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.19.44] - 2026-05-13
+
+Reviewer round 3 corrections to the X0X-0074 admission control bundle.
+Consumes saorsa-gossip 0.5.49 which fixes two reviewer findings on the
+saorsa-gossip side (IHAVE/anti-entropy bypassed admission, Bulk depth
+leak on future cancellation); the remaining two findings (oracle not
+wired into PubSub, missing `x0x.directory.*` Bulk prefix) live in x0x
+and are addressed here.
+
+### Fixed (reviewer round 3 findings 2026-05-13)
+
+- **P1.1 — SWIM PeerHealthOracle was not wired into PlumtreePubSub.**
+  `PubSubManager::new` never called `PlumtreePubSub::with_health_oracle`.
+  The peer-health snapshot stayed empty, so X0X-0073b's Suspect/Dead
+  cooling branches and X0X-0074's Suspect/Dead admission drops never
+  engaged in x0x production — only p95 timeout sizing and local
+  cooling/backpressure ran. Now `src/gossip/runtime.rs` calls the new
+  `PubSubManager::new_with_oracle(network, signing,
+  Some(membership.swim_arc()))`, threading the existing HyParView SWIM
+  detector into pub-sub. `Self::new` keeps the old signature for
+  tests / single-binary callers and delegates to
+  `new_with_oracle(_, _, None)`.
+- **P2.1 — Topic classifier omitted `x0x.directory.*` shard topics.**
+  Group directory tag/name/id shards (`x0x.directory.tag.{N}`,
+  `x0x.directory.name.{N}`, `x0x.directory.id.{N}`; see
+  `src/groups/discovery.rs`, published from `src/bin/x0xd.rs`) are
+  anti-entropy traffic that should classify as Bulk. The previous
+  classifier defaulted them to Normal so admission did not throttle
+  them under pressure. Added `"x0x.directory."` to
+  `BULK_TOPIC_PREFIXES` with a regression test covering all three
+  shard kinds.
+
+### Notes
+
+- Saorsa-gossip-side fixes (P1.2 IHAVE/anti-entropy gating, P2.2 RAII
+  guard for fanout Bulk depth) consumed via the 0.5.49 dep bump; no
+  x0x-side action required for those.
+- 4h Phase A soak (gate for X0X-0073 / X0X-0073b / X0X-0074 closure)
+  is the next milestone now that all four reviewer findings have
+  landed.
+
+### Changed
+
+- saorsa-gossip-* deps bumped 0.5.48 → 0.5.49 across all 11 crates.
+
 ## [v0.19.43] - 2026-05-13
 
 X0X-0074 admission control bundle. Consumes saorsa-gossip 0.5.48 which

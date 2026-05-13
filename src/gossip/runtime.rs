@@ -1589,4 +1589,57 @@ mod tests {
         );
         assert_eq!(active_count.load(Ordering::Relaxed), 2);
     }
+
+
+    // ── Helper functions ───────────────────────────────────────────────
+
+    #[test]
+    fn duration_ms_converts_correctly() {
+        assert_eq!(duration_ms(Duration::from_secs(1)), 1000);
+        assert_eq!(duration_ms(Duration::from_millis(500)), 500);
+        assert_eq!(duration_ms(Duration::from_nanos(1_000_000)), 1);
+        assert_eq!(duration_ms(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn duration_ns_converts_correctly() {
+        assert_eq!(duration_ns(Duration::from_secs(1)), 1_000_000_000);
+        assert_eq!(duration_ns(Duration::from_millis(1)), 1_000_000);
+        assert_eq!(duration_ns(Duration::from_nanos(500)), 500);
+        assert_eq!(duration_ns(Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn usize_to_u64_converts_correctly() {
+        assert_eq!(usize_to_u64(0), 0);
+        assert_eq!(usize_to_u64(42), 42);
+        assert_eq!(usize_to_u64(usize::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn ceil_worker_count_rounds_up() {
+        assert_eq!(ceil_worker_count(0.0), 1, "clamped to PUBSUB_WORKER_MIN");
+        assert_eq!(ceil_worker_count(0.5), 1);
+        assert_eq!(ceil_worker_count(1.0), 1);
+        assert_eq!(ceil_worker_count(1.5), 2);
+        assert_eq!(ceil_worker_count(10.1), 11);
+    }
+
+    #[test]
+    fn window_rate_computes_correctly() {
+        assert!((window_rate(100u64, 0u64, 10.0) - 10.0).abs() < 0.001);
+        assert_eq!(window_rate(0u64, 0u64, 10.0), 0.0);
+        assert!((window_rate(50u64, 0u64, 5.0) - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn window_rate_handles_zero_interval() {
+        let rate = window_rate(100u64, 0u64, 0.0);
+        assert!(rate.is_finite());
+    }
+
+    #[test]
+    fn window_rate_handles_no_previous() {
+        assert_eq!(window_rate(50u64, 50u64, 10.0), 0.0);
+    }
 }

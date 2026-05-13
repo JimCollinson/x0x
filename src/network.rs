@@ -3755,4 +3755,40 @@ mod message_tests {
         assert!(ts > 1600000000);
         assert!(ts < 2000000000);
     }
+
+
+    #[test]
+    fn default_max_connections_value() {
+        assert_eq!(default_max_connections(), 32);
+    }
+
+    #[test]
+    fn default_port_mapping_enabled_value() {
+        assert!(default_port_mapping_enabled());
+    }
+
+    #[test]
+    fn default_connection_timeout_value() {
+        assert_eq!(default_connection_timeout(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn default_stats_interval_value() {
+        assert_eq!(default_stats_interval(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn default_max_peers_per_ip_value() {
+        assert_eq!(default_max_peers_per_ip(), 3);
+    }
+
+    #[test]
+    fn network_config_defaults_are_consistent() {
+        let config = NetworkConfig::default();
+        assert_eq!(config.max_connections, default_max_connections());
+        assert_eq!(config.port_mapping_enabled, default_port_mapping_enabled());
+        assert_eq!(config.connection_timeout, default_connection_timeout());
+        assert_eq!(config.stats_interval, default_stats_interval());
+        assert_eq!(config.max_peers_per_ip, default_max_peers_per_ip());
+    }
 }

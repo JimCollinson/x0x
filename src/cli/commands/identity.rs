@@ -121,3 +121,81 @@ pub async fn import_card(
     print_value(client.format(), &resp);
     Ok(())
 }
+
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn identity_words_encodes_known_hex() {
+        let encoder = IdentityEncoder::new();
+        let hex_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let result = identity_words(&encoder, hex_id);
+        assert!(result.is_some(), "should encode valid hex");
+        let words = result.unwrap();
+        assert!(!words.is_empty(), "should produce non-empty words");
+        // Should be 4 words separated by hyphens
+        assert!(!words.is_empty(), "should produce non-empty words: {words}");
+    }
+
+    #[test]
+    fn identity_words_rejects_invalid_hex() {
+        let encoder = IdentityEncoder::new();
+        let result = identity_words(&encoder, "not-hex");
+        assert!(result.is_none(), "should reject invalid hex");
+    }
+
+    #[test]
+    fn identity_words_rejects_short_hex() {
+        let encoder = IdentityEncoder::new();
+        let result = identity_words(&encoder, "aabb");
+        assert!(result.is_none(), "should reject short hex");
+    }
+
+    #[test]
+    fn inject_identity_words_adds_words_to_object() {
+        let encoder = IdentityEncoder::new();
+        let agent_hex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut value = serde_json::json!({
+            "agent_id": agent_hex,
+            "name": "test-agent"
+        });
+        inject_identity_words(&encoder, &mut value);
+        assert!(value.get("identity_words").is_some(), "should add identity_words");
+        let words = value["identity_words"].as_str().unwrap().to_string();
+        assert!(!words.is_empty(), "should produce non-empty words: {words}");
+    }
+
+    #[test]
+    fn inject_identity_words_skips_missing_agent_id() {
+        let encoder = IdentityEncoder::new();
+        let mut value = serde_json::json!({"name": "no-id"});
+        inject_identity_words(&encoder, &mut value);
+        assert!(value.get("identity_words").is_none(), "should not add words without agent_id");
+    }
+
+    #[test]
+    fn inject_identity_words_adds_user_words() {
+        let encoder = IdentityEncoder::new();
+        let user_hex = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let mut value = serde_json::json!({
+            "agent_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "user_id": user_hex,
+        });
+        inject_identity_words(&encoder, &mut value);
+        assert!(value.get("identity_words").is_some(), "should add identity_words");
+        assert!(value.get("user_words").is_some(), "should add user_words");
+    }
+
+    #[test]
+    fn inject_identity_words_handles_non_object() {
+        let encoder = IdentityEncoder::new();
+        let mut value = serde_json::json!([1, 2, 3]);
+        inject_identity_words(&encoder, &mut value);
+        // Should not panic, should not modify array
+        assert!(value.is_array());
+    }
+}
+

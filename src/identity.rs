@@ -1070,4 +1070,98 @@ mod tests {
         card.signature = forged_donor.signature;
         assert!(card.verify().is_err());
     }
+
+
+    // ── MachineId ──────────────────────────────────────────────────────
+
+    #[test]
+    fn machine_id_as_bytes_returns_inner() {
+        let id = MachineId([0xAA; 32]);
+        assert_eq!(id.as_bytes(), &[0xAA; 32]);
+    }
+
+    #[test]
+    fn machine_id_to_vec_returns_copy() {
+        let id = MachineId([0xBB; 32]);
+        let vec = id.to_vec();
+        assert_eq!(vec.len(), 32);
+        assert_eq!(vec, vec![0xBBu8; 32]);
+    }
+
+    #[test]
+    fn machine_id_debug_contains_bytes() {
+        let id = MachineId([0xCC; 32]);
+        let debug = format!("{:?}", id);
+        // Debug is derived, so it shows the array
+        assert!(debug.contains("204"), "should contain decimal 204 (0xCC): {debug}");
+    }
+
+    #[test]
+    fn machine_id_verify_mismatch_returns_error() {
+        let id = MachineId([0xDD; 32]);
+        let kp = MachineKeypair::generate().unwrap();
+        let result = id.verify(kp.public_key());
+        assert!(result.is_err());
+    }
+
+    // ── AgentId ────────────────────────────────────────────────────────
+
+    #[test]
+    fn agent_id_to_vec_returns_copy() {
+        let id = AgentId([0xEE; 32]);
+        let vec = id.to_vec();
+        assert_eq!(vec.len(), 32);
+        assert_eq!(vec, vec![0xEEu8; 32]);
+    }
+
+    #[test]
+    fn agent_id_verify_mismatch_returns_error() {
+        let id = AgentId([0xFF; 32]);
+        let kp = AgentKeypair::generate().unwrap();
+        let result = id.verify(kp.public_key());
+        assert!(result.is_err());
+    }
+
+    // ── UserId ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn user_id_to_vec_returns_copy() {
+        let id = UserId([0x11; 32]);
+        let vec = id.to_vec();
+        assert_eq!(vec.len(), 32);
+        assert_eq!(vec, vec![0x11u8; 32]);
+    }
+
+    // ── Keypair Debug ──────────────────────────────────────────────────
+
+    #[test]
+    fn machine_keypair_debug_redacts_secret() {
+        let kp = MachineKeypair::generate().unwrap();
+        let debug = format!("{:?}", kp);
+        assert!(debug.contains("<REDACTED>"), "debug should redact secret key");
+        assert!(debug.contains("public_key"), "debug should show public_key");
+    }
+
+    #[test]
+    fn agent_keypair_debug_redacts_secret() {
+        let kp = AgentKeypair::generate().unwrap();
+        let debug = format!("{:?}", kp);
+        assert!(debug.contains("<REDACTED>"), "debug should redact secret key");
+    }
+
+    // ── Display ────────────────────────────────────────────────────────
+
+    #[test]
+    fn machine_id_display_hex_format() {
+        let id = MachineId([0x22; 32]);
+        let display = format!("{}", id);
+        assert!(display.contains("2222"));
+    }
+
+    #[test]
+    fn agent_id_display_hex_format() {
+        let id = AgentId([0x33; 32]);
+        let display = format!("{}", id);
+        assert!(display.contains("3333"));
+    }
 }

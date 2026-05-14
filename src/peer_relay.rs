@@ -76,6 +76,13 @@ pub const DEFAULT_FAIL_WINDOW: Duration = Duration::from_secs(60);
 /// stops a captured relay envelope being replayed long after the fact.
 pub const DEFAULT_RELAY_FRESHNESS: Duration = Duration::from_secs(30);
 
+/// Clock-skew tolerance for a relayed envelope's `originated_at_unix_ms`.
+/// A header whose timestamp is more than this far *ahead* of local
+/// wall-clock is refused as stale — without this bound a far-future
+/// timestamp would read as age 0 forever (replayable until the local
+/// clock catches up). Mirrors `dm::CLOCK_SKEW_TOLERANCE_MS`.
+pub const RELAY_CLOCK_SKEW_TOLERANCE_MS: u64 = 30_000;
+
 /// Routing header for a relayed DM — the **only** part a relay node
 /// sees in cleartext. Independently signed by the sender so the relay
 /// can prove the request's origin and reject tampered routing fields.
@@ -516,8 +523,9 @@ impl PeerRelay {
     ///   (`BadSignature`), `relay_refused_bad_signature` += 1.
     /// - Policy disabled → `Refuse(PolicyDisabled)`,
     ///   `relay_refused_policy_disabled` += 1.
-    /// - `originated_at` older than `freshness` → `Refuse(Stale)`,
-    ///   `relay_refused_stale` += 1.
+    /// - `originated_at` older than `freshness`, or more than
+    ///   [`RELAY_CLOCK_SKEW_TOLERANCE_MS`] ahead of `now_unix_ms` →
+    ///   `Refuse(Stale)`, `relay_refused_stale` += 1.
     /// - `dst == local` → [`RelayDisposition::DeliverLocally`],
     ///   `relay_received` += 1.
     /// - otherwise → [`RelayDisposition::Forward`],
@@ -542,8 +550,13 @@ impl PeerRelay {
             return RelayDisposition::Refuse(RelayRefusal::PolicyDisabled);
         }
         let freshness_ms = self.policy.freshness.as_millis() as u64;
-        let age = now_unix_ms.saturating_sub(relayed.header.originated_at_unix_ms);
-        if age > freshness_ms {
+        let originated = relayed.header.originated_at_unix_ms;
+        // Refuse far-future timestamps: without this bound `saturating_sub`
+        // reports age 0 for any future `originated_at`, so a captured header
+        // stays replayable until the local clock catches up.
+        let from_future = originated > now_unix_ms.saturating_add(RELAY_CLOCK_SKEW_TOLERANCE_MS);
+        let too_old = now_unix_ms.saturating_sub(originated) > freshness_ms;
+        if from_future || too_old {
             self.stats
                 .relay_refused_stale
                 .fetch_add(1, Ordering::Relaxed);
@@ -931,6 +944,64 @@ mod tests {
             RelayDisposition::Refuse(RelayRefusal::Stale)
         );
         assert_eq!(relay.stats().snapshot().relay_refused_stale, 1);
+    }
+
+    #[test]
+    fn disposition_refuses_far_future_relayed_dm() {
+        // Why: a header timestamped far in the future would otherwise read
+        // as age 0 under `saturating_sub` and stay replayable until the
+        // local clock caught up. It must be refused as stale, mirroring
+        // the DM path's clock-skew bound.
+        let kp = AgentKeypair::generate().expect("keypair");
+        let sender = kp.agent_id();
+        let (pub_bytes, sec_bytes) = kp.to_bytes();
+        let secret = ant_quic::MlDsaSecretKey::from_bytes(&sec_bytes).expect("secret");
+        let local = aid(91);
+
+        let relay = PeerRelay::with_policy(RelayPolicy::enabled());
+        let now_ms = 1_700_000_000_000u64;
+        // Origination is 31 s *ahead* of now — past the 30 s skew bound.
+        let originated_ms = now_ms + RELAY_CLOCK_SKEW_TOLERANCE_MS + 1_000;
+        let relayed = relay
+            .build_relayed_dm(
+                &local,
+                &sender,
+                pub_bytes,
+                originated_ms,
+                dummy_inner(),
+                |bytes| {
+                    ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, bytes)
+                        .map(|s| s.as_bytes().to_vec())
+                        .map_err(|e| format!("{e:?}"))
+                },
+            )
+            .expect("build");
+
+        assert_eq!(
+            relay.disposition_for(&relayed, &local, now_ms),
+            RelayDisposition::Refuse(RelayRefusal::Stale)
+        );
+        assert_eq!(relay.stats().snapshot().relay_refused_stale, 1);
+
+        // A header just inside the skew bound is still accepted.
+        let fresh = relay
+            .build_relayed_dm(
+                &local,
+                &sender,
+                kp.to_bytes().0,
+                now_ms + 1_000,
+                dummy_inner(),
+                |bytes| {
+                    ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, bytes)
+                        .map(|s| s.as_bytes().to_vec())
+                        .map_err(|e| format!("{e:?}"))
+                },
+            )
+            .expect("build");
+        assert_eq!(
+            relay.disposition_for(&fresh, &local, now_ms),
+            RelayDisposition::DeliverLocally
+        );
     }
 
     #[test]

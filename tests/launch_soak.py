@@ -25,6 +25,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 import re
 import shlex
 import signal
@@ -422,13 +423,19 @@ def run_window(
     cmd = [
         sys.executable,
         str(repo_root / "tests" / "launch_readiness.py"),
+        "--network", args.network,
         "--gate", args.gate,
         "--scenarios", "baseline",
         "--anchor", args.anchor,
         "--proof-dir", str(window_dir),
     ]
+    # Per-window invocations of launch_readiness.py would each print the
+    # banner + (for prod) wait 5s. Suppress the wait inside the loop —
+    # the soak-level banner at startup already established the network.
+    env = os.environ.copy()
+    env["X0X_NETWORK_NO_HOLD"] = "1"
     LOG.info("window run: %s", " ".join(shlex.quote(c) for c in cmd))
-    proc = subprocess.run(cmd, cwd=repo_root, capture_output=True, timeout=900)
+    proc = subprocess.run(cmd, cwd=repo_root, capture_output=True, timeout=900, env=env)
     (window_dir / "stdout.log").write_bytes(proc.stdout)
     (window_dir / "stderr.log").write_bytes(proc.stderr)
     return proc.returncode
@@ -620,6 +627,11 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--network", choices=["test", "prod"], default="test",
+                        help="Which fleet to soak. Default 'test' (isolated testnet). "
+                             "Pass 'prod' to soak the production fleet (REAL USERS, "
+                             "5s Ctrl-C window before action). Pass-through to "
+                             "launch_readiness.py per window.")
     parser.add_argument("--duration-hours", type=float, default=12.0)
     parser.add_argument("--interval-mins", type=float, default=30.0)
     parser.add_argument("--anchor", default="nyc")
@@ -632,6 +644,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+
+    # Network selection banner — fires once at soak start, before any
+    # window. Per-window launch_readiness invocations get
+    # X0X_NETWORK_NO_HOLD=1 so they don't re-pause for 5s every 15min.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from x0x_network import select_network as _x0x_select, banner as _x0x_banner
+    _net = _x0x_select(args)
+    _x0x_banner(_net)
 
     repo_root = Path(__file__).resolve().parents[1]
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())

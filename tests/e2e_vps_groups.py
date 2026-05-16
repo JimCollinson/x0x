@@ -71,12 +71,16 @@ def now_ms() -> int:
 # ─── token-file parsing ────────────────────────────────────────────────
 
 
-def load_tokens(path: str) -> Dict[str, Tuple[str, str]]:
+def load_tokens(path: str, var_prefix: str = "") -> Dict[str, Tuple[str, str]]:
+    """`var_prefix` ("PROD" or "TEST") narrows to one network's vars."""
     if not os.path.isfile(path):
         raise FileNotFoundError(f"token file not found: {path}")
     ips: Dict[str, str] = {}
     toks: Dict[str, str] = {}
-    pat = re.compile(r'^([A-Z]+)_(IP|TK)="?([^"]+)"?\s*$')
+    if var_prefix:
+        pat = re.compile(r'^' + re.escape(var_prefix) + r'_([A-Z]+)_(IP|TK)="?([^"]+)"?\s*$')
+    else:
+        pat = re.compile(r'^([A-Z]+)_(IP|TK)="?([^"]+)"?\s*$')
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
@@ -225,12 +229,13 @@ class TunnelHandle:
     pid: int
 
 
-def start_ssh_tunnel(ip: str, local_port: int) -> TunnelHandle:
+def start_ssh_tunnel(ip: str, local_port: int, remote_port: int = 13600) -> TunnelHandle:
+    """Forward local_port → remote_port (defaults to testnet API 13600)."""
     if shutil.which("ssh") is None:
         raise RuntimeError("ssh not on PATH")
     cmd = [
         "ssh", "-N",
-        "-L", f"127.0.0.1:{local_port}:127.0.0.1:12600",
+        "-L", f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
         "-o", "ConnectTimeout=10",
         "-o", "ControlMaster=no",
         "-o", "ControlPath=none",
@@ -908,13 +913,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Phase-B VPS dogfood (groups + contacts via x0x DMs)"
     )
+    parser.add_argument(
+        "--network", choices=["test", "prod"], default="test",
+        help="Which fleet to dogfood. Default 'test' (testnet 6483/13600). "
+             "'prod' targets production (REAL USERS, 5s Ctrl-C window).",
+    )
     parser.add_argument("--anchor", default="nyc")
     parser.add_argument("--local-port", type=int, default=22600)
     parser.add_argument("--discover-secs", type=int, default=45)
     parser.add_argument(
         "--nodes", nargs="+", default=NODES_DEFAULT,
     )
-    parser.add_argument("--tokens-file", default=None)
+    parser.add_argument("--tokens-file", default=None,
+                        help="override tokens file (default: derived from --network)")
     parser.add_argument("--cmd-timeout", type=int, default=30)
     parser.add_argument("--report", default=None)
     parser.add_argument(
@@ -931,19 +942,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     log = logging.getLogger("e2e_vps_groups")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Network selection via central contract — banner + 5s hold on prod.
+    import sys as _sys
+    _sys.path.insert(0, script_dir)
+    from x0x_network import select_network as _x0x_select, banner as _x0x_banner
+    _net = _x0x_select(args)
+    _x0x_banner(_net)
     tokens_path = (
         args.tokens_file
         or os.environ.get("X0X_TOKENS_FILE")
-        or os.path.join(script_dir, ".vps-tokens.env")
+        or str(_net.token_file)
     )
-    tokens = load_tokens(tokens_path)
+    tokens = load_tokens(tokens_path, var_prefix=_net.var_prefix)
     if args.anchor not in tokens:
-        log.error("anchor %s missing from %s", args.anchor, tokens_path)
+        log.error("anchor %s missing from %s (network=%s, prefix=%s)",
+                  args.anchor, tokens_path, _net.name, _net.var_prefix)
         return 2
     anchor_ip, anchor_token = tokens[args.anchor]
-    log.info("anchor=%s ip=%s", args.anchor, anchor_ip)
-    log.info("opening SSH tunnel %d → %s:12600", args.local_port, anchor_ip)
-    tunnel = start_ssh_tunnel(anchor_ip, args.local_port)
+    log.info("anchor=%s ip=%s network=%s", args.anchor, anchor_ip, _net.name)
+    log.info("opening SSH tunnel %d → %s:%d", args.local_port, anchor_ip, _net.api_port)
+    tunnel = start_ssh_tunnel(anchor_ip, args.local_port, remote_port=_net.api_port)
     try:
         client = X0xClient(
             f"http://127.0.0.1:{args.local_port}", anchor_token,

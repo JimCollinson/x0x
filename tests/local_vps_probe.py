@@ -82,10 +82,14 @@ def ssh_get_token(ip: str) -> str:
     return out.strip()
 
 
+# Default API port — testnet. main() overrides from --network.
+API_PORT: int = 13600
+
+
 def vps_api_get(ip: str, token: str, path: str) -> tuple[int, dict]:
     """GET a VPS API path via ssh-curl."""
     cmd = (f"curl -s -m 8 -H 'Authorization: Bearer {token}' "
-           f"-w '\\n%{{http_code}}' http://127.0.0.1:12600{path}")
+           f"-w '\\n%{{http_code}}' http://127.0.0.1:{API_PORT}{path}")
     rc, out = ssh_run(ip, cmd, timeout=14.0)
     if rc != 0:
         return 0, {"error": "ssh_failed"}
@@ -106,7 +110,7 @@ def vps_api_post(ip: str, token: str, path: str, body: dict) -> tuple[int, dict]
            f"-H 'Authorization: Bearer {token}' "
            f"-H 'Content-Type: application/json' "
            f"-d '{body_json}' "
-           f"-w '\\n%{{http_code}}' http://127.0.0.1:12600{path}")
+           f"-w '\\n%{{http_code}}' http://127.0.0.1:{API_PORT}{path}")
     rc, out = ssh_run(ip, cmd, timeout=16.0)
     if rc != 0:
         return 0, {"error": "ssh_failed"}
@@ -276,11 +280,24 @@ class DirectEventWatcher:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--network", choices=["test", "prod"], default="test",
+                    help="Which VPS fleet to probe. Default 'test' (testnet 6483/13600). "
+                         "'prod' probes the production fleet (REAL USERS, 5s Ctrl-C window).")
     ap.add_argument("--duration-mins", type=float, default=30.0)
     ap.add_argument("--probe-interval-secs", type=int, default=60)
     ap.add_argument("--out-dir", default="proofs/local-probe")
     ap.add_argument("--x0xd", default="target/release/x0xd")
     args = ap.parse_args()
+
+    # Network selection — banner + 5s hold on prod. Sets API_PORT for the
+    # vps_api_get/post curl calls below (which substitute it via .format()).
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from x0x_network import select_network as _x0x_select, banner as _x0x_banner
+    _net = _x0x_select(args)
+    _x0x_banner(_net)
+    global API_PORT
+    API_PORT = _net.api_port
 
     out_dir = Path(args.out_dir)
     if out_dir.exists():

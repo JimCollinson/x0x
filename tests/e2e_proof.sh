@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+
+# ── Network selector (added 2026-05-16) — default TESTNET ─────────────
+# Source the contract module; consume --network from "$@"; banner;
+# re-export legacy NYC_TK/NYC_IP-style vars so the rest of the script
+# does not need rewriting. Pass --network prod for the production fleet
+# (REAL USERS, 5s Ctrl-C window).
+SCRIPT_DIR_X0X="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR_X0X/x0x-network.sh"
+x0x_network_select "$@"
+set -- "${X0X_FILTERED_ARGS[@]+"${X0X_FILTERED_ARGS[@]}"}"
+x0x_export_legacy_token_vars
+
 # =============================================================================
 # x0x Master E2E Proof Runner
 #
@@ -48,8 +61,8 @@ REPORT_DIR="${PROOF_REPORT_DIR:-$(pwd)/tests/proof-reports}"
 RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
 REPORT_FILE="$REPORT_DIR/PROOF_REPORT_${RUN_ID}.md"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+RED='[0;31m'; GREEN='[0;32m'; YELLOW='[0;33m'
+CYAN='[0;36m'; BOLD='[1m'; NC='[0m'
 
 mkdir -p "$REPORT_DIR"
 
@@ -175,7 +188,8 @@ run_script_suite() {
 
     # Try to parse the last summary line containing numbers
     local last_line
-    last_line=$(grep -E "PASS|pass|passed|FAIL|fail|failed|SKIP|skip|skipped" "$log" | tail -5 | tr '\n' ' ')
+    last_line=$(grep -E "PASS|pass|passed|FAIL|fail|failed|SKIP|skip|skipped" "$log" | tail -5 | tr '
+' ' ')
 
     # Extract from "X PASSED, Y FAILED, Z SKIPPED" style
     local p f s
@@ -735,14 +749,14 @@ run_vps_probe() {
 
         local R VER AID PEERS
         R=$($SSH_CMD "root@$ip" \
-            "curl -sf -m 10 -H 'Authorization: Bearer $tok' http://127.0.0.1:12600/health" \
+            "curl -sf -m 10 -H 'Authorization: Bearer $tok' http://127.0.0.1:${X0X_API_PORT}/health" \
             2>/dev/null || echo '{"error":"timeout"}')
         VER=$(jq_get "$R" "version")
         AID=$($SSH_CMD "root@$ip" \
-            "curl -sf -m 10 -H 'Authorization: Bearer $tok' http://127.0.0.1:12600/agent" \
+            "curl -sf -m 10 -H 'Authorization: Bearer $tok' http://127.0.0.1:${X0X_API_PORT}/agent" \
             2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('agent_id','?'))" 2>/dev/null || echo "?")
         PEERS=$($SSH_CMD "root@$ip" \
-            "curl -sf -m 10 -H 'Authorization: Bearer $tok' http://127.0.0.1:12600/peers" \
+            "curl -sf -m 10 -H 'Authorization: Bearer $tok' http://127.0.0.1:${X0X_API_PORT}/peers" \
             2>/dev/null | python3 -c "import sys,json;print(len(json.load(sys.stdin).get('peers',[])))" 2>/dev/null || echo "0")
 
         if echo "$R" | python3 -c "import sys,json;d=json.load(sys.stdin);assert d.get('ok')==True" 2>/dev/null; then
@@ -927,7 +941,8 @@ if $RUN_LAN; then
         STUDIO1_SSH_TARGET="$S1_TARGET" STUDIO2_SSH_TARGET="$S2_TARGET" \
         run_script_suite "lan" "$(pwd)/tests/e2e_lan.sh"
     else
-        echo -e "\n  ${YELLOW}SKIP LAN${NC} — $S1_TARGET not reachable"
+        echo -e "
+  ${YELLOW}SKIP LAN${NC} — $S1_TARGET not reachable"
         add_suite_result "SKIP" "lan" 0 0 0
     fi
 fi
@@ -939,7 +954,8 @@ if $RUN_VPS; then
         run_vps_probe
         run_script_suite "vps-full" "$(pwd)/tests/e2e_vps.sh"
     else
-        echo -e "\n  ${YELLOW}SKIP VPS${NC} — bootstrap nodes not reachable"
+        echo -e "
+  ${YELLOW}SKIP VPS${NC} — bootstrap nodes not reachable"
         add_suite_result "SKIP" "vps-probe" 0 0 0
         add_suite_result "SKIP" "vps-full"  0 0 0
     fi
@@ -951,7 +967,8 @@ if $RUN_LIVE; then
            root@142.93.199.50 echo ok &>/dev/null 2>&1; then
         run_script_suite "live-network" "$(pwd)/tests/e2e_live_network.sh"
     else
-        echo -e "\n  ${YELLOW}SKIP live-network${NC} — VPS not reachable"
+        echo -e "
+  ${YELLOW}SKIP live-network${NC} — VPS not reachable"
         add_suite_result "SKIP" "live-network" 0 0 0
     fi
 fi
@@ -968,8 +985,10 @@ echo -e "${BOLD}${YELLOW}╠═════════════════�
 while IFS='|' read -r status name pass fail skip || [ -n "$status" ]; do
     [ -z "$status" ] && continue
     case "$status" in
-        PASS) printf "${BOLD}${YELLOW}║  ${GREEN}✅ PASS${NC}${BOLD}${YELLOW}  %-20s  pass=%-4s fail=%-4s${NC}\n" "$name" "$pass" "$fail" ;;
-        FAIL) printf "${BOLD}${YELLOW}║  ${RED}❌ FAIL${NC}${BOLD}${YELLOW}  %-20s  pass=%-4s fail=%-4s${NC}\n" "$name" "$pass" "$fail" ;;
+        PASS) printf "${BOLD}${YELLOW}║  ${GREEN}✅ PASS${NC}${BOLD}${YELLOW}  %-20s  pass=%-4s fail=%-4s${NC}
+" "$name" "$pass" "$fail" ;;
+        FAIL) printf "${BOLD}${YELLOW}║  ${RED}❌ FAIL${NC}${BOLD}${YELLOW}  %-20s  pass=%-4s fail=%-4s${NC}
+" "$name" "$pass" "$fail" ;;
         SKIP) echo -e "${BOLD}${YELLOW}║  ${YELLOW}⏭ SKIP${NC}${BOLD}${YELLOW}  $name${NC}" ;;
     esac
 done <<< "$SUITE_SUMMARY"

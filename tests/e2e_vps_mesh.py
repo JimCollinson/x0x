@@ -112,13 +112,20 @@ def now_ms() -> int:
 # ─── token file parsing ────────────────────────────────────────────────
 
 
-def load_tokens(path: str) -> Dict[str, Tuple[str, str]]:
-    """Parse tests/.vps-tokens.env and return {node: (ip, token)}."""
+def load_tokens(path: str, var_prefix: str = "") -> Dict[str, Tuple[str, str]]:
+    """Parse a tokens file → {node: (ip, token)}.
+
+    `var_prefix` ("PROD" or "TEST") narrows to one network's variables so
+    a wrong-prefix sourcing is loud rather than silent. Empty = legacy.
+    """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"token file not found: {path}")
     ips: Dict[str, str] = {}
     toks: Dict[str, str] = {}
-    pattern = re.compile(r'^([A-Z]+)_(IP|TK)="?([^"]+)"?\s*$')
+    if var_prefix:
+        pattern = re.compile(r'^' + re.escape(var_prefix) + r'_([A-Z]+)_(IP|TK)="?([^"]+)"?\s*$')
+    else:
+        pattern = re.compile(r'^([A-Z]+)_(IP|TK)="?([^"]+)"?\s*$')
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
@@ -235,11 +242,12 @@ class TunnelHandle:
     pid: int
 
 
-def start_ssh_tunnel(ip: str, local_port: int) -> TunnelHandle:
-    """Open a backgrounded SSH tunnel forwarding ``local_port`` → 12600.
+def start_ssh_tunnel(ip: str, local_port: int, remote_port: int = 13600) -> TunnelHandle:
+    """Open a backgrounded SSH tunnel forwarding ``local_port`` → remote_port.
 
-    The tunnel is a single SSH connection that survives the whole test
-    run; every API call to the anchor reuses it.
+    `remote_port` defaults to the testnet API port (13600). Pass 12600 to
+    target prod. The tunnel is a single SSH connection that survives the
+    whole test run; every API call to the anchor reuses it.
     """
     if shutil.which("ssh") is None:
         raise RuntimeError("ssh not on PATH")
@@ -247,7 +255,7 @@ def start_ssh_tunnel(ip: str, local_port: int) -> TunnelHandle:
         "ssh",
         "-N",
         "-L",
-        f"127.0.0.1:{local_port}:127.0.0.1:12600",
+        f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
         "-o",
         "ConnectTimeout=10",
         "-o",
@@ -293,7 +301,7 @@ def start_ssh_tunnel(ip: str, local_port: int) -> TunnelHandle:
             raise RuntimeError(f"ssh tunnel exited early: {err}")
         time.sleep(0.5)
     proc.terminate()
-    raise RuntimeError(f"ssh tunnel to {ip}:12600 not ready in 15s")
+    raise RuntimeError(f"ssh tunnel to {ip}:{remote_port} not ready in 15s")
 
 
 def stop_ssh_tunnel(t: TunnelHandle) -> None:
@@ -886,9 +894,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="expected node labels (default: %(default)s)",
     )
     parser.add_argument(
+        "--network",
+        choices=["test", "prod"],
+        default="test",
+        help="Which fleet to mesh-test. Default 'test' (testnet, UDP 6483/TCP 13600). "
+             "'prod' targets production (REAL USERS, 5s Ctrl-C window).",
+    )
+    parser.add_argument(
         "--tokens-file",
         default=None,
-        help="path to tests/.vps-tokens.env (default: relative to script)",
+        help="override tokens file (default: derived from --network)",
     )
     parser.add_argument(
         "--no-tunnel",
@@ -933,19 +948,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.info("anchor=%s base=%s (no SSH tunnel)", args.anchor, anchor_base)
     else:
         script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Network selection via central contract — banner + 5s hold on prod.
+        import sys as _sys
+        _sys.path.insert(0, script_dir)
+        from x0x_network import select_network as _x0x_select, banner as _x0x_banner
+        _net = _x0x_select(args)
+        _x0x_banner(_net)
         tokens_path = (
             args.tokens_file
             or os.environ.get("X0X_TOKENS_FILE")
-            or os.path.join(script_dir, ".vps-tokens.env")
+            or str(_net.token_file)
         )
-        tokens = load_tokens(tokens_path)
+        tokens = load_tokens(tokens_path, var_prefix=_net.var_prefix)
         if args.anchor not in tokens:
-            log.error("anchor %s missing from %s", args.anchor, tokens_path)
+            log.error("anchor %s missing from %s (network=%s, prefix=%s)",
+                      args.anchor, tokens_path, _net.name, _net.var_prefix)
             return 2
         anchor_ip, anchor_token = tokens[args.anchor]
-        log.info("anchor=%s ip=%s", args.anchor, anchor_ip)
-        log.info("opening SSH tunnel %d → %s:12600", args.local_port, anchor_ip)
-        tunnel = start_ssh_tunnel(anchor_ip, args.local_port)
+        log.info("anchor=%s ip=%s network=%s", args.anchor, anchor_ip, _net.name)
+        log.info("opening SSH tunnel %d → %s:%d", args.local_port, anchor_ip, _net.api_port)
+        tunnel = start_ssh_tunnel(anchor_ip, args.local_port, remote_port=_net.api_port)
         anchor_base = f"http://127.0.0.1:{args.local_port}"
 
     try:

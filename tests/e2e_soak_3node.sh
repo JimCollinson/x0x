@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+
+# ── Network selector (added 2026-05-16) — default TESTNET ─────────────
+# Source the contract module; consume --network from "$@"; banner;
+# re-export legacy NYC_TK/NYC_IP-style vars so the rest of the script
+# does not need rewriting. Pass --network prod for the production fleet
+# (REAL USERS, 5s Ctrl-C window).
+SCRIPT_DIR_X0X="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR_X0X/x0x-network.sh"
+x0x_network_select "$@"
+set -- "${X0X_FILTERED_ARGS[@]+"${X0X_FILTERED_ARGS[@]}"}"
+x0x_export_legacy_token_vars
+
 # 3-node VPS soak — 8-hour validation that the saorsa-gossip-pubsub
 # cache fix (MAX_CACHE_SIZE 10000 → 2048, CACHE_TTL_SECS 300 → 60) holds
 # under sustained publisher load on the live mesh.
@@ -93,13 +106,13 @@ ssh_run() {
 api_get() {
     local node="$1" path="$2"
     ssh_run root@"${IP[$node]}" \
-        "curl -sS -m 10 -H 'authorization: Bearer ${TK[$node]}' http://127.0.0.1:12600${path}" 2>/dev/null
+        "curl -sS -m 10 -H 'authorization: Bearer ${TK[$node]}' http://127.0.0.1:${X0X_API_PORT}${path}" 2>/dev/null
 }
 
 api_post() {
     local node="$1" path="$2" body="$3"
     ssh_run root@"${IP[$node]}" \
-        "curl -sS -m 10 -X POST -H 'authorization: Bearer ${TK[$node]}' -H 'content-type: application/json' -d '${body}' http://127.0.0.1:12600${path}" 2>/dev/null
+        "curl -sS -m 10 -X POST -H 'authorization: Bearer ${TK[$node]}' -H 'content-type: application/json' -d '${body}' http://127.0.0.1:${X0X_API_PORT}${path}" 2>/dev/null
 }
 
 remote_rss_kb() {
@@ -110,7 +123,8 @@ remote_rss_kb() {
 }
 
 remote_cpu_pct() {
-    ssh_run root@"${IP[$1]}" 'ps -o %cpu= -p $(pidof x0xd)' 2>/dev/null | tr -d ' \n'
+    ssh_run root@"${IP[$1]}" 'ps -o %cpu= -p $(pidof x0xd)' 2>/dev/null | tr -d ' 
+'
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -162,7 +176,8 @@ rm -f "$ABORT_FLAG"
         done
         # Strip non-digits from R values (handle empty/error returns gracefully).
         for n in "${ALL_NODES[@]}"; do
-            R[$n]=$(echo "${R[$n]:-0}" | tr -d '\n ' | grep -oE '^[0-9]+' || echo 0)
+            R[$n]=$(echo "${R[$n]:-0}" | tr -d '
+ ' | grep -oE '^[0-9]+' || echo 0)
             R[$n]=${R[$n]:-0}
         done
         echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),$UP,${R[nyc]},${C[nyc]:-0},${R[sfo]},${C[sfo]:-0},${R[helsinki]},${C[helsinki]:-0}" >> "$RSS_CSV"
@@ -198,7 +213,8 @@ SAMPLER_PID=$!
 # ─────────────────────────────────────────────────────────────────────────
 SLEEP_SEC=$(awk -v r="$MSG_RATE" 'BEGIN { printf "%.4f", 1.0 / r }')
 PAYLOAD_RAW=$(printf '%*s' "$MSG_SIZE" | tr ' ' 'x')
-PAYLOAD_B64=$(printf '%s' "$PAYLOAD_RAW" | base64 | tr -d '\n')
+PAYLOAD_B64=$(printf '%s' "$PAYLOAD_RAW" | base64 | tr -d '
+')
 BODY="{\"topic\":\"$TOPIC\",\"payload\":\"$PAYLOAD_B64\"}"
 REMOTE_STOP_FILE="/tmp/.soak-stop-${TOPIC}"
 REMOTE_COUNT_FILE="/tmp/soak-pub-${TOPIC}.count"
@@ -216,11 +232,12 @@ for pn in "${PUBLISHERS[@]}"; do
     # locally; nohup keeps the loop running after the SSH session exits.
     REMOTE_INNER=$(cat <<EOF
 rm -f '${REMOTE_STOP_FILE}' '${REMOTE_COUNT_FILE}' '${REMOTE_LOG_FILE}'
-nohup bash -c 'count=0; while [ ! -f '"'"'${REMOTE_STOP_FILE}'"'"' ]; do curl -sS -m 5 -X POST -H "authorization: Bearer ${TK[$pn]}" -H "content-type: application/json" -d '"'"'${BODY}'"'"' http://127.0.0.1:12600/publish >/dev/null 2>&1 || true; count=\$((count+1)); echo \$count > '"'"'${REMOTE_COUNT_FILE}'"'"'; sleep ${SLEEP_SEC}; done' > '${REMOTE_LOG_FILE}' 2>&1 &
+nohup bash -c 'count=0; while [ ! -f '"'"'${REMOTE_STOP_FILE}'"'"' ]; do curl -sS -m 5 -X POST -H "authorization: Bearer ${TK[$pn]}" -H "content-type: application/json" -d '"'"'${BODY}'"'"' http://127.0.0.1:${X0X_API_PORT}/publish >/dev/null 2>&1 || true; count=\$((count+1)); echo \$count > '"'"'${REMOTE_COUNT_FILE}'"'"'; sleep ${SLEEP_SEC}; done' > '${REMOTE_LOG_FILE}' 2>&1 &
 echo \$!
 EOF
 )
-    REMOTE_PUB_PIDS[$pn]=$(ssh_run root@"${IP[$pn]}" "$REMOTE_INNER" 2>/dev/null | tail -1 | tr -d '\n ')
+    REMOTE_PUB_PIDS[$pn]=$(ssh_run root@"${IP[$pn]}" "$REMOTE_INNER" 2>/dev/null | tail -1 | tr -d '
+ ')
     log "  $pn remote publisher PID: ${REMOTE_PUB_PIDS[$pn]}"
 done
 

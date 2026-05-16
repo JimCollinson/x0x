@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+
+# ── Network selector (added 2026-05-16) — default TESTNET ─────────────
+# Source the contract module; consume --network from "$@"; banner;
+# re-export legacy NYC_TK/NYC_IP-style vars so the rest of the script
+# does not need rewriting. Pass --network prod for the production fleet
+# (REAL USERS, 5s Ctrl-C window).
+SCRIPT_DIR_X0X="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR_X0X/x0x-network.sh"
+x0x_network_select "$@"
+set -- "${X0X_FILTERED_ARGS[@]+"${X0X_FILTERED_ARGS[@]}"}"
+x0x_export_legacy_token_vars
+
 # Large-file transfer matrix.
 #
 # Drives `POST /files/send` + `POST /files/accept/:id` across multiple
@@ -253,7 +266,8 @@ local_pair_rss() {
     local side="$1"
     local pid_idx; [ "$side" = sender ] && pid_idx=0 || pid_idx=1
     local pid="${LOCAL_DAEMON_PIDS[$pid_idx]}"
-    ps -o rss= -p "$pid" 2>/dev/null | tr -d ' \n' || echo 0
+    ps -o rss= -p "$pid" 2>/dev/null | tr -d ' 
+' || echo 0
 }
 
 local_pair_make_file() {
@@ -315,11 +329,11 @@ local_nyc_pair_setup() {
         log "FAIL: tests/.vps-tokens.env missing"; return 1
     fi
     # shellcheck disable=SC1090
-    source "$SCRIPT_DIR/.vps-tokens.env"
+    # [migrated 2026-05-16] tokens loaded by x0x-network.sh preamble
     NYC_IP="$NYC_IP"; NYC_TK="$NYC_TK"
     log "NYC: $NYC_IP"
 
-    NYC_AGENT_ID=$($SSH root@"$NYC_IP" "curl -sS -m 5 -H 'authorization: Bearer $NYC_TK' http://127.0.0.1:12600/agent" 2>/dev/null \
+    NYC_AGENT_ID=$($SSH root@"$NYC_IP" "curl -sS -m 5 -H 'authorization: Bearer $NYC_TK' http://127.0.0.1:${X0X_API_PORT}/agent" 2>/dev/null \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["agent_id"])' 2>/dev/null)
     log "NYC agent_id: ${NYC_AGENT_ID:0:16}.."
     log "Local agent_id: ${LOCAL_AGENT_IDS[0]:0:16}.."
@@ -327,9 +341,9 @@ local_nyc_pair_setup() {
     # Cross-import contact cards so trust eval permits the offer.
     local local_card nyc_card
     local_card=$(curl -sS -m 5 -H "authorization: Bearer ${LOCAL_TOKENS[0]}" http://127.0.0.1:$port/agent/card)
-    nyc_card=$($SSH root@"$NYC_IP" "curl -sS -m 5 -H 'authorization: Bearer $NYC_TK' http://127.0.0.1:12600/agent/card")
+    nyc_card=$($SSH root@"$NYC_IP" "curl -sS -m 5 -H 'authorization: Bearer $NYC_TK' http://127.0.0.1:${X0X_API_PORT}/agent/card")
     curl -sS -m 5 -X POST -H "authorization: Bearer ${LOCAL_TOKENS[0]}" -H "content-type: application/json" -d "$nyc_card" "http://127.0.0.1:$port/contacts/import" >/dev/null 2>&1 || true
-    $SSH root@"$NYC_IP" "curl -sS -m 5 -X POST -H 'authorization: Bearer $NYC_TK' -H 'content-type: application/json' -d '$local_card' http://127.0.0.1:12600/contacts/import" >/dev/null 2>&1 || true
+    $SSH root@"$NYC_IP" "curl -sS -m 5 -X POST -H 'authorization: Bearer $NYC_TK' -H 'content-type: application/json' -d '$local_card' http://127.0.0.1:${X0X_API_PORT}/contacts/import" >/dev/null 2>&1 || true
 }
 
 # ── Driver ────────────────────────────────────────────────────────────────
@@ -360,7 +374,8 @@ run_one_transfer() {
             transfer_id=$(echo "$resp" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("transfer_id","") if d.get("ok") else "")' 2>/dev/null)
             if [ -z "$transfer_id" ]; then
                 log "FAIL: send rejected: $resp"
-                printf '%s,%s,%s,%s,,,,fail-send,,,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "${resp//,/;}" >> "$CSV"
+                printf '%s,%s,%s,%s,,,,fail-send,,,%s
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "${resp//,/;}" >> "$CSV"
                 return 1
             fi
             log "transfer_id=$transfer_id; waiting for receiver to see Pending offer"
@@ -376,7 +391,8 @@ run_one_transfer() {
             done
             if [ $ok -ne 1 ]; then
                 log "FAIL: receiver never saw the offer"
-                printf '%s,%s,%s,%s,,,,fail-no-offer,,,\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" >> "$CSV"
+                printf '%s,%s,%s,%s,,,,fail-no-offer,,,
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" >> "$CSV"
                 return 1
             fi
             log "Accepting on receiver"
@@ -384,7 +400,8 @@ run_one_transfer() {
             accept_resp=$(local_pair_accept "$transfer_id")
             if ! echo "$accept_resp" | grep -q '"ok":true'; then
                 log "FAIL: accept rejected: $accept_resp"
-                printf '%s,%s,%s,%s,,,,fail-accept,,,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "${accept_resp//,/;}" >> "$CSV"
+                printf '%s,%s,%s,%s,,,,fail-accept,,,%s
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "${accept_resp//,/;}" >> "$CSV"
                 return 1
             fi
 
@@ -427,7 +444,8 @@ run_one_transfer() {
 
             if [ "$final_status" != "Complete" ]; then
                 log "FAIL: status=$final_status (elapsed ${elapsed}s)"
-                printf '%s,%s,%s,%s,%s,%s,fail,%s,%s,%s,\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "$elapsed" "$mbps" "$final_status" "$sender_peak_rss" "$receiver_peak_rss" >> "$CSV"
+                printf '%s,%s,%s,%s,%s,%s,fail,%s,%s,%s,
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "$elapsed" "$mbps" "$final_status" "$sender_peak_rss" "$receiver_peak_rss" >> "$CSV"
                 return 1
             fi
 
@@ -442,7 +460,8 @@ run_one_transfer() {
             fi
 
             log "PASS: $size_label transferred in ${elapsed}s @ ${mbps} MB/s, sha_match=$sha_match"
-            printf '%s,%s,%s,%s,%s,%s,%s,Complete,%s,%s,\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "$elapsed" "$mbps" "$sha_match" "$sender_peak_rss" "$receiver_peak_rss" >> "$CSV"
+            printf '%s,%s,%s,%s,%s,%s,%s,Complete,%s,%s,
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "$elapsed" "$mbps" "$sha_match" "$sender_peak_rss" "$receiver_peak_rss" >> "$CSV"
 
             # Cleanup
             rm -f "$src_file"
@@ -467,28 +486,31 @@ run_one_transfer() {
             transfer_id=$(echo "$resp" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("transfer_id","") if d.get("ok") else "")' 2>/dev/null)
             if [ -z "$transfer_id" ]; then
                 log "FAIL: send rejected: $resp"
-                printf '%s,%s,%s,%s,,,,fail-send,,,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "${resp//,/;}" >> "$CSV"
+                printf '%s,%s,%s,%s,,,,fail-send,,,%s
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "${resp//,/;}" >> "$CSV"
                 return 1
             fi
             log "transfer_id=$transfer_id; waiting for nyc to see Pending"
             local ok=0
             for _ in $(seq 1 30); do
                 local list
-                list=$($SSH root@"$NYC_IP" "curl -sS -m 5 -H 'authorization: Bearer $NYC_TK' http://127.0.0.1:12600/files/transfers" 2>/dev/null)
+                list=$($SSH root@"$NYC_IP" "curl -sS -m 5 -H 'authorization: Bearer $NYC_TK' http://127.0.0.1:${X0X_API_PORT}/files/transfers" 2>/dev/null)
                 if echo "$list" | grep -q "$transfer_id"; then ok=1; break; fi
                 sleep 2
             done
             if [ $ok -ne 1 ]; then
                 log "FAIL: nyc never saw the offer"
-                printf '%s,%s,%s,%s,,,,fail-no-offer,,,\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" >> "$CSV"
+                printf '%s,%s,%s,%s,,,,fail-no-offer,,,
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" >> "$CSV"
                 return 1
             fi
             log "Accepting on nyc"
             local accept_resp
-            accept_resp=$($SSH root@"$NYC_IP" "curl -sS -m 30 -X POST -H 'authorization: Bearer $NYC_TK' http://127.0.0.1:12600/files/accept/$transfer_id" 2>/dev/null)
+            accept_resp=$($SSH root@"$NYC_IP" "curl -sS -m 30 -X POST -H 'authorization: Bearer $NYC_TK' http://127.0.0.1:${X0X_API_PORT}/files/accept/$transfer_id" 2>/dev/null)
             if ! echo "$accept_resp" | grep -q '"ok":true'; then
                 log "FAIL: nyc accept rejected: $accept_resp"
-                printf '%s,%s,%s,%s,,,,fail-accept,,,%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "${accept_resp//,/;}" >> "$CSV"
+                printf '%s,%s,%s,%s,,,,fail-accept,,,%s
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "${accept_resp//,/;}" >> "$CSV"
                 return 1
             fi
 
@@ -500,14 +522,15 @@ run_one_transfer() {
             (( deadline_nyc > start_ns + 12 * 3600 )) && deadline_nyc=$((start_ns + 12 * 3600))
             while [ "$(date +%s)" -lt "$deadline_nyc" ]; do
                 local s
-                s=$($SSH root@"$NYC_IP" "curl -sS -m 5 -H 'authorization: Bearer $NYC_TK' http://127.0.0.1:12600/files/transfers/$transfer_id" 2>/dev/null)
+                s=$($SSH root@"$NYC_IP" "curl -sS -m 5 -H 'authorization: Bearer $NYC_TK' http://127.0.0.1:${X0X_API_PORT}/files/transfers/$transfer_id" 2>/dev/null)
                 local status bytes_xferred
                 status=$(echo "$s" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("transfer",{}).get("status",""))' 2>/dev/null)
                 bytes_xferred=$(echo "$s" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("transfer",{}).get("bytes_transferred",0))' 2>/dev/null)
                 recv_path=$(echo "$s" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("transfer",{}).get("output_path","") or "")' 2>/dev/null)
                 local rss_s rss_r
                 rss_s=$(local_pair_rss sender)
-                rss_r=$($SSH root@"$NYC_IP" 'awk "/VmRSS/{print \$2}" /proc/$(pidof x0xd)/status' 2>/dev/null | tr -d ' \n')
+                rss_r=$($SSH root@"$NYC_IP" 'awk "/VmRSS/{print \$2}" /proc/$(pidof x0xd)/status' 2>/dev/null | tr -d ' 
+')
                 rss_r=${rss_r:-0}
                 [ "$rss_s" -gt "$sender_peak_rss" ] 2>/dev/null && sender_peak_rss=$rss_s
                 [ "$rss_r" -gt "$receiver_peak_rss" ] 2>/dev/null && receiver_peak_rss=$rss_r
@@ -527,7 +550,8 @@ run_one_transfer() {
             local mbps; mbps=$(awk -v b=$size_bytes -v t=$elapsed 'BEGIN{printf "%.2f", (b/1048576.0)/t}')
             if [ "$final_status" != "Complete" ]; then
                 log "FAIL: status=$final_status (elapsed ${elapsed}s)"
-                printf '%s,%s,%s,%s,%s,%s,fail,%s,%s,%s,\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "$elapsed" "$mbps" "$final_status" "$sender_peak_rss" "$receiver_peak_rss" >> "$CSV"
+                printf '%s,%s,%s,%s,%s,%s,fail,%s,%s,%s,
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "$elapsed" "$mbps" "$final_status" "$sender_peak_rss" "$receiver_peak_rss" >> "$CSV"
                 return 1
             fi
             local sha_match=no
@@ -538,7 +562,8 @@ run_one_transfer() {
                 log "Receiver SHA-256: $sha_recv (match=$sha_match)"
             fi
             log "PASS: $size_label transferred in ${elapsed}s @ ${mbps} MB/s, sha_match=$sha_match"
-            printf '%s,%s,%s,%s,%s,%s,%s,Complete,%s,%s,\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "$elapsed" "$mbps" "$sha_match" "$sender_peak_rss" "$receiver_peak_rss" >> "$CSV"
+            printf '%s,%s,%s,%s,%s,%s,%s,Complete,%s,%s,
+' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pair" "$size_label" "$size_bytes" "$elapsed" "$mbps" "$sha_match" "$sender_peak_rss" "$receiver_peak_rss" >> "$CSV"
             rm -f "$src_file"
             [ -n "$recv_path" ] && $SSH root@"$NYC_IP" "rm -f '$recv_path'" 2>/dev/null || true
             return 0

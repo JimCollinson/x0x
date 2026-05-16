@@ -13,6 +13,8 @@ __pycache__
 .claude/scheduled_tasks.lock
 .gstack/
 tests/.vps-tokens.env
+tests/.vps-tokens-prod.env
+tests/.vps-tokens-test.env
 .config/*
 !.config/nextest.toml
 test-results/

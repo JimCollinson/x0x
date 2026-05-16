@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
 # x0x Build, Deploy & Verify Bootstrap Nodes
-# Cross-compiles for Linux, deploys to all 6 VPS nodes, verifies health + mesh
-# Writes API tokens to tests/.vps-tokens.env for e2e_vps.sh
+#
+# Cross-compiles for Linux, deploys to all 6 VPS nodes, verifies health + mesh.
+# Writes API tokens to tests/.vps-tokens-<network>.env.
+#
+# DEFAULT NETWORK = TESTNET. Pass --network prod to target the production
+# fleet (REAL USERS) — that path prints a loud red banner and waits 5 s for
+# Ctrl-C before any action.
 # =============================================================================
 set -euo pipefail
 
@@ -11,7 +16,27 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BINARY="$PROJECT_DIR/target/x86_64-unknown-linux-gnu/release/x0xd"
 RUNNER_SCRIPT="$SCRIPT_DIR/runners/x0x_test_runner.py"
 RUNNER_UNIT="$SCRIPT_DIR/runners/x0x-test-runner.service"
-TOKEN_FILE="$SCRIPT_DIR/.vps-tokens.env"
+
+# Network selector — sets X0X_NETWORK, X0X_API_PORT, X0X_SERVICE,
+# X0X_TOKEN_FILE, X0X_TOKEN_VAR_PREFIX. Banner + 5 s hold for prod.
+# Consumes the --network flag from "$@" and leaves the rest in
+# X0X_FILTERED_ARGS.
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/x0x-network.sh"
+x0x_network_select "$@"
+set -- "${X0X_FILTERED_ARGS[@]+"${X0X_FILTERED_ARGS[@]}"}"
+
+TOKEN_FILE="$X0X_TOKEN_FILE"
+# Per-network runner identity: testnet runs alongside prod, must not collide.
+if [ "$X0X_NETWORK" = "prod" ]; then
+    RUNNER_UNIT_NAME="x0x-test-runner.service"
+    RUNNER_ENV_FILE="/etc/x0x-test-runner.env"
+    RUNNER_AGENT_DATA_DIR="/root/.local/share/x0x"
+else
+    RUNNER_UNIT_NAME="x0x-test-runner-testnet.service"
+    RUNNER_ENV_FILE="/etc/x0x-test-runner-testnet.env"
+    RUNNER_AGENT_DATA_DIR="/root/.local/share/x0x-testnet"
+fi
 DEPLOY_RUNNER="${DEPLOY_RUNNER:-1}"
 MESH_VERIFY="${MESH_VERIFY:-0}"
 MESH_ANCHOR="${MESH_ANCHOR:-nyc}"
@@ -99,9 +124,12 @@ for node in "${NODE_NAMES[@]}"; do
         continue
     fi
 
-    # Install atomically and restart
-    echo -n "    Restarting service... "
-    if $SSH root@"$ip" 'install -m 755 /tmp/x0xd.codex /opt/x0x/x0xd && rm -f /tmp/x0xd.codex && systemctl restart x0xd' 2>/dev/null; then
+    # Install atomically and restart. Binary path /opt/x0x/x0xd is shared
+    # by both x0xd.service (prod) and x0xd-testnet.service (test); only the
+    # service that matches $X0X_SERVICE is restarted so the other network
+    # stays on whatever binary it had loaded in memory.
+    echo -n "    Restarting $X0X_SERVICE... "
+    if $SSH root@"$ip" "install -m 755 /tmp/x0xd.codex /opt/x0x/x0xd && rm -f /tmp/x0xd.codex && systemctl restart $X0X_SERVICE" 2>/dev/null; then
         echo -e "${GREEN}done${NC}"
     else
         echo -e "${RED}failed${NC}"
@@ -115,24 +143,29 @@ for node in "${NODE_NAMES[@]}"; do
     # one SSH per assertion.
     if [ "$DEPLOY_RUNNER" = "1" ] && [ -f "$RUNNER_SCRIPT" ] && [ -f "$RUNNER_UNIT" ]; then
         echo -n "    Installing mesh test runner... "
+        # Per-network unit + env file so prod and testnet runners coexist.
+        # The Python script at /usr/local/bin/x0x-test-runner.py is shared;
+        # the systemd unit uses EnvironmentFile= for the network-specific
+        # endpoint + api-token path.
+        REMOTE_UNIT_PATH="/etc/systemd/system/$RUNNER_UNIT_NAME"
         if cat "$RUNNER_SCRIPT" \
             | $SSH root@"$ip" 'cat > /tmp/x0x-test-runner.py.codex && chmod 755 /tmp/x0x-test-runner.py.codex' 2>/dev/null \
-           && cat "$RUNNER_UNIT" \
-            | $SSH root@"$ip" 'cat > /tmp/x0x-test-runner.service.codex' 2>/dev/null \
+           && sed "s|EnvironmentFile=.*|EnvironmentFile=$RUNNER_ENV_FILE|" "$RUNNER_UNIT" \
+            | $SSH root@"$ip" "cat > /tmp/$RUNNER_UNIT_NAME.codex" 2>/dev/null \
            && $SSH root@"$ip" "
                 set -e
                 install -m 755 /tmp/x0x-test-runner.py.codex /usr/local/bin/x0x-test-runner.py
-                install -m 644 /tmp/x0x-test-runner.service.codex /etc/systemd/system/x0x-test-runner.service
-                rm -f /tmp/x0x-test-runner.py.codex /tmp/x0x-test-runner.service.codex
-                cat > /etc/x0x-test-runner.env <<EOF
+                install -m 644 /tmp/$RUNNER_UNIT_NAME.codex $REMOTE_UNIT_PATH
+                rm -f /tmp/x0x-test-runner.py.codex /tmp/$RUNNER_UNIT_NAME.codex
+                cat > $RUNNER_ENV_FILE <<EOF
 NODE_NAME=$node
-X0X_API_BASE=http://127.0.0.1:12600
-X0X_API_TOKEN=/root/.local/share/x0x/api-token
+X0X_API_BASE=http://127.0.0.1:$X0X_API_PORT
+X0X_API_TOKEN=$RUNNER_AGENT_DATA_DIR/api-token
 LOG_LEVEL=INFO
 EOF
                 systemctl daemon-reload
-                systemctl enable --quiet x0x-test-runner.service
-                systemctl restart x0x-test-runner.service
+                systemctl enable --quiet $RUNNER_UNIT_NAME
+                systemctl restart $RUNNER_UNIT_NAME
             " 2>/dev/null; then
             echo -e "${GREEN}done${NC}"
         else
@@ -164,36 +197,38 @@ sleep 30
 echo -e "\n${CYAN}[4/4] Verify health, version, mesh & collect tokens${NC}"
 
 # Clear token file
-echo "# x0x VPS API tokens — auto-generated by e2e_deploy.sh" > "$TOKEN_FILE"
-echo "# Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$TOKEN_FILE"
+echo "# x0x ${X0X_NETWORK^^} API tokens (UDP $X0X_GOSSIP_PORT / TCP $X0X_API_PORT)" > "$TOKEN_FILE"
+echo "# Auto-generated by e2e_deploy.sh on $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> "$TOKEN_FILE"
+echo "# Variable prefix: ${X0X_TOKEN_VAR_PREFIX}_<NODE>_<IP|TK>. Do NOT mix with the other network's tokens." >> "$TOKEN_FILE"
+echo "" >> "$TOKEN_FILE"
 
 for node in "${NODE_NAMES[@]}"; do
     ip="${NODE_IPS[$node]}"
     echo -e "\n  ${CYAN}$node${NC} ($ip):"
 
     # Check service status
-    STATUS=$($SSH root@"$ip" 'systemctl is-active x0xd' 2>/dev/null || echo "failed")
+    STATUS=$($SSH root@"$ip" "systemctl is-active $X0X_SERVICE" 2>/dev/null || echo "failed")
     check "$node service active" "$([ "$STATUS" = "active" ] && echo true || echo false)"
 
     if [ "$STATUS" != "active" ]; then
         echo "    Service not active, showing logs:"
-        $SSH root@"$ip" 'journalctl -u x0xd -n 10 --no-pager' 2>/dev/null || true
+        $SSH root@"$ip" "journalctl -u $X0X_SERVICE -n 10 --no-pager" 2>/dev/null || true
         continue
     fi
 
-    # Read API token
-    TOKEN=$($SSH root@"$ip" 'cat /root/.local/share/x0x/api-token 2>/dev/null || cat /var/lib/x0x/data/api-token 2>/dev/null' || echo "")
+    # Read API token from the network-specific data dir
+    TOKEN=$($SSH root@"$ip" "cat $RUNNER_AGENT_DATA_DIR/api-token 2>/dev/null" || echo "")
     if [ -n "$TOKEN" ]; then
         NODE_UPPER=$(echo "$node" | tr '[:lower:]' '[:upper:]')
-        echo "${NODE_UPPER}_IP=\"$ip\"" >> "$TOKEN_FILE"
-        echo "${NODE_UPPER}_TK=\"$TOKEN\"" >> "$TOKEN_FILE"
+        echo "${X0X_TOKEN_VAR_PREFIX}_${NODE_UPPER}_IP=\"$ip\"" >> "$TOKEN_FILE"
+        echo "${X0X_TOKEN_VAR_PREFIX}_${NODE_UPPER}_TK=\"$TOKEN\"" >> "$TOKEN_FILE"
         echo "    Token: ${TOKEN:0:16}..."
     else
         echo -e "    ${RED}Could not read API token${NC}"
     fi
 
     # Health check
-    HEALTH=$($SSH root@"$ip" 'curl -sf -m 5 http://127.0.0.1:12600/health' 2>/dev/null || echo '{"error":"failed"}')
+    HEALTH=$($SSH root@"$ip" "curl -sf -m 5 -H 'Authorization: Bearer $TOKEN' http://127.0.0.1:$X0X_API_PORT/health" 2>/dev/null || echo '{"error":"failed"}')
     check "$node health ok" "$(echo "$HEALTH" | grep -q '"ok":true\|"ok": true' && echo true || echo false)"
 
     # Version check
@@ -201,7 +236,7 @@ for node in "${NODE_NAMES[@]}"; do
     check "$node version $VERSION" "$([ "$HAS_VERSION" = "True" ] && echo true || echo false)"
 
     # Peer count
-    NET=$($SSH root@"$ip" "curl -sf -m 5 -H 'Authorization: Bearer $TOKEN' http://127.0.0.1:12600/network/status" 2>/dev/null || echo '{}')
+    NET=$($SSH root@"$ip" "curl -sf -m 5 -H 'Authorization: Bearer $TOKEN' http://127.0.0.1:$X0X_API_PORT/network/status" 2>/dev/null || echo '{}')
     PEERS=$(echo "$NET" | python3 -c "import sys,json;print(json.load(sys.stdin).get('connected_peers',0))" 2>/dev/null || echo "0")
     check "$node has peers (got $PEERS)" "$([ "$PEERS" -ge 1 ] 2>/dev/null && echo true || echo false)"
     echo "    Connected peers: $PEERS"

@@ -97,14 +97,31 @@ GATES: Dict[str, Dict[str, float]] = {
 }
 
 
+# ── Network endpoints (rebound at runtime by --network flag) ────────────
+# Defaults to testnet to keep accidental runs off prod. main() overrides
+# these by reading tests/x0x_network.py.
+X0X_API_PORT: int = 13600
+X0X_GOSSIP_PORT: int = 6483
+
+
 # ── Token loading ──────────────────────────────────────────────────────
-def load_tokens(path: Path) -> Dict[str, Tuple[str, str]]:
-    """Parse tests/.vps-tokens.env → {node: (ip, token)}."""
+def load_tokens(path: Path, var_prefix: str = "") -> Dict[str, Tuple[str, str]]:
+    """Parse a tokens file → {node: (ip, token)}.
+
+    `var_prefix` (e.g. "PROD" or "TEST") narrows parsing to that network's
+    variables so a single combined file can never be misread. Empty string
+    accepts the legacy unprefixed format.
+    """
     if not path.is_file():
         raise FileNotFoundError(f"token file not found: {path}")
     ips: Dict[str, str] = {}
     toks: Dict[str, str] = {}
-    pattern = re.compile(r'^([A-Z]+)_(IP|TK)="?([^"]+)"?\s*$')
+    if var_prefix:
+        pattern = re.compile(
+            r'^' + re.escape(var_prefix) + r'_([A-Z]+)_(IP|TK)="?([^"]+)"?\s*$'
+        )
+    else:
+        pattern = re.compile(r'^([A-Z]+)_(IP|TK)="?([^"]+)"?\s*$')
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -211,7 +228,7 @@ def fetch_remote_json(
 ) -> Dict[str, Any]:
     """Fetch an authenticated local x0xd JSON endpoint through SSH."""
     header = shlex.quote(f"Authorization: Bearer {token}")
-    url = shlex.quote(f"http://127.0.0.1:12600/{path.lstrip('/')}")
+    url = shlex.quote(f"http://127.0.0.1:{X0X_API_PORT}/{path.lstrip('/')}")
     cmd = f"curl -s --max-time {timeout} -H {header} {url}"
     body = ssh_checked(ip, cmd, timeout=timeout + 10)
     if not body:
@@ -884,7 +901,7 @@ def scenario_fanout_burst(ctx: ScenarioContext) -> ScenarioResult:
         "curl -s -X POST -H 'Authorization: Bearer {token}' "
         "-H 'Content-Type: application/json' "
         "-d '{{\"topic\":\"{topic}\",\"payload\":\"{payload}\"}}' "
-        "http://127.0.0.1:12600/publish >/dev/null; "
+        "http://127.0.0.1:{api_port}/publish >/dev/null; "
         "{sleep}"
         "done"
     ).format(
@@ -893,6 +910,7 @@ def scenario_fanout_burst(ctx: ScenarioContext) -> ScenarioResult:
         topic=topic,
         payload=payload_b64,
         sleep=(f"sleep {delay_ms / 1000.0}; " if delay_ms > 0 else ""),
+        api_port=X0X_API_PORT,
     )
 
     t0 = time.time()
@@ -983,7 +1001,7 @@ def scenario_restart_storm(ctx: ScenarioContext) -> ScenarioResult:
                         "-o", "ConnectTimeout=5",
                         f"root@{ip}",
                         f"curl -sf -H 'Authorization: Bearer {token}' "
-                        f"http://127.0.0.1:12600/health",
+                        f"http://127.0.0.1:{X0X_API_PORT}/health",
                     ],
                     capture_output=True,
                     timeout=10,
@@ -1715,7 +1733,23 @@ def main(argv: Optional[List[str]] = None) -> int:
                         choices=sorted(GATES.keys()))
     parser.add_argument("--scenarios", default="baseline,fanout_burst",
                         help="comma-separated scenario list (default: %(default)s)")
-    parser.add_argument("--tokens-file", default="tests/.vps-tokens.env")
+    # Network selection — defaults to testnet. Pass --network prod for the
+    # production fleet (REAL USERS); that path prints a loud banner and
+    # holds 5s before any action. See tests/x0x_network.py.
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from x0x_network import (
+        NETWORKS as _X0X_NETWORKS,
+        select_network as _x0x_select,
+        banner as _x0x_banner,
+    )
+    parser.add_argument("--network", choices=["test", "prod"], default="test",
+                        help="Which fleet to target. Default 'test' (isolated testnet "
+                             "on UDP 6483/TCP 13600). Pass 'prod' to target the "
+                             "production fleet (5483/12600 — REAL USERS, 5s Ctrl-C "
+                             "window before action).")
+    parser.add_argument("--tokens-file", default=None,
+                        help="override tokens file (default: derived from --network)")
     parser.add_argument("--proof-dir", default=None,
                         help="output dir (default: proofs/launch-readiness-<ts>)")
     parser.add_argument("--burst-messages", type=int, default=200,
@@ -1754,8 +1788,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="partition_recovery: heal wait duration (default 90)")
     parser.add_argument("--recovery-poll-secs", type=int, default=10,
                         help="partition_recovery: recovery polling interval (default 10)")
-    parser.add_argument("--partition-udp-port", type=int, default=5483,
-                        help="partition_recovery: UDP source port to block (default 5483)")
+    parser.add_argument("--partition-udp-port", type=int, default=None,
+                        help="partition_recovery: UDP source port to block (default: network gossip port — 5483 prod, 6483 test)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -1764,10 +1798,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     repo_root = Path(__file__).resolve().parents[1]
-    tokens_path = (repo_root / args.tokens_file).resolve()
-    nodes = load_tokens(tokens_path)
+    # Network selection happens BEFORE any tokens / endpoint work so the
+    # banner (and the 5s prod Ctrl-C window) fire before SSH or curl.
+    _net = _x0x_select(args)
+    _x0x_banner(_net)
+    # Patch the module-level API port + gossip port that the rest of this
+    # file uses (the hot-path f-strings reference X0X_API_PORT / X0X_GOSSIP).
+    global X0X_API_PORT, X0X_GOSSIP_PORT
+    X0X_API_PORT = _net.api_port
+    X0X_GOSSIP_PORT = _net.gossip_port
+    if args.tokens_file is None:
+        tokens_path = _net.token_file
+    else:
+        tokens_path = (repo_root / args.tokens_file).resolve()
+    nodes = load_tokens(tokens_path, var_prefix=_net.var_prefix)
+    if args.partition_udp_port is None:
+        args.partition_udp_port = _net.gossip_port
     if args.anchor not in nodes:
-        LOG.error("anchor %s not in tokens file", args.anchor)
+        LOG.error("anchor %s not in tokens file %s (network=%s, expected prefix=%s)",
+                  args.anchor, tokens_path, _net.name, _net.var_prefix)
         return 2
 
     selected = [s.strip() for s in args.scenarios.split(",") if s.strip()]

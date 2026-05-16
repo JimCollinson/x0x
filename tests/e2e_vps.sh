@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+
+# ── Network selector (added 2026-05-16) — default TESTNET ─────────────
+# Source the contract module; consume --network from "$@"; banner;
+# re-export legacy NYC_TK/NYC_IP-style vars so the rest of the script
+# does not need rewriting. Pass --network prod for the production fleet
+# (REAL USERS, 5s Ctrl-C window).
+SCRIPT_DIR_X0X="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR_X0X/x0x-network.sh"
+x0x_network_select "$@"
+set -- "${X0X_FILTERED_ARGS[@]+"${X0X_FILTERED_ARGS[@]}"}"
+x0x_export_legacy_token_vars
+
 # =============================================================================
 # x0x VPS End-to-End Test — All-Pairs Matrix
 # Tests across ALL 6 bootstrap nodes (NYC, SFO, Helsinki, Nuremberg, Singapore, Sydney)
@@ -28,8 +41,8 @@ PASS=0; FAIL=0; SKIP=0; TOTAL=0
 # Unique proof token for this run
 PROOF_TOKEN="vps-proof-$(date +%s)-$$"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+RED='[0;31m'; GREEN='[0;32m'; YELLOW='[0;33m'
+CYAN='[0;36m'; BOLD='[1m'; NC='[0m'
 
 b64()  { echo -n "$1" | base64; }
 b64d() { echo "$1" | base64 --decode 2>/dev/null || echo "(decode failed)"; }
@@ -94,7 +107,7 @@ a_is_live() {
 # ── Load tokens ──────────────────────────────────────────────────────────
 if [ -f "$SCRIPT_DIR/.vps-tokens.env" ]; then
     echo "Loading tokens from .vps-tokens.env..."
-    source "$SCRIPT_DIR/.vps-tokens.env"
+    # [migrated 2026-05-16] tokens loaded by x0x-network.sh preamble
     [ -n "${NYC_TK:-}" ] && NODE_TOKENS[nyc]="$NYC_TK"
     [ -n "${SFO_TK:-}" ] && NODE_TOKENS[sfo]="$SFO_TK"
     [ -n "${HELSINKI_TK:-}" ] && NODE_TOKENS[helsinki]="$HELSINKI_TK"
@@ -123,12 +136,13 @@ vps() {
     local ip="$1" token="$2" method="$3" path="$4" body="${5:-}"
     local cmd="curl -sf -m 18 -X $method -H 'Authorization: Bearer $token' -H 'Content-Type: application/json'"
     [ -n "$body" ] && cmd="$cmd -d '$body'"
-    cmd="$cmd 'http://127.0.0.1:12600${path}'"
+    cmd="$cmd 'http://127.0.0.1:${X0X_API_PORT}${path}'"
     local out rc attempt
     for attempt in 1 2; do
         out=$($SSH "root@$ip" "$cmd" 2>/dev/null) && rc=0 || rc=$?
         if [ $rc -eq 0 ] && [ -n "$out" ]; then
-            printf '%s\n' "$out"
+            printf '%s
+' "$out"
             return 0
         fi
         sleep "$attempt"
@@ -150,7 +164,7 @@ vps_ssh() {
 
 start_remote_direct_listener() {
     local ip="$1" token="$2" outfile="$3"
-    vps_ssh "$ip" "rm -f '$outfile'; nohup sh -c \"curl -sN -m 180 -H 'Authorization: Bearer $token' 'http://127.0.0.1:12600/direct/events' > '$outfile'\" >/dev/null 2>&1 & echo \$!"
+    vps_ssh "$ip" "rm -f '$outfile'; nohup sh -c \"curl -sN -m 180 -H 'Authorization: Bearer $token' 'http://127.0.0.1:${X0X_API_PORT}/direct/events' > '$outfile'\" >/dev/null 2>&1 & echo \$!"
 }
 
 stop_remote_pid() {
@@ -166,7 +180,7 @@ fetch_remote_file() {
 
 start_tunnel() {
     local ip="$1" local_port="$2"
-    ssh -C -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -N -L "127.0.0.1:${local_port}:127.0.0.1:12600" "root@$ip" >/dev/null 2>&1 &
+    ssh -C -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -N -L "127.0.0.1:${local_port}:127.0.0.1:${X0X_API_PORT}" "root@$ip" >/dev/null 2>&1 &
     echo $!
 }
 
@@ -199,7 +213,8 @@ trap "rm -rf $TMPDIR" EXIT
 # ═════════════════════════════════════════════════════════════════════════
 # 1. HEALTH & VERSION — All 6 nodes
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[1/20] Health & Version (6 nodes)${NC}"
+echo -e "
+${CYAN}[1/20] Health & Version (6 nodes)${NC}"
 LIVE_NODES=()
 for node in "${NODES[@]}"; do
     ip="${NODE_IPS[$node]}"; tk="${NODE_TOKENS[$node]:-}"
@@ -216,7 +231,8 @@ echo "  Live nodes: ${LIVE_NODES[*]}"
 # ═════════════════════════════════════════════════════════════════════════
 # 2. IDENTITY — Distinct agent IDs across all nodes
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[2/20] Identity (distinct agents)${NC}"
+echo -e "
+${CYAN}[2/20] Identity (distinct agents)${NC}"
 for node in "${LIVE_NODES[@]}"; do
     ip="${NODE_IPS[$node]}"; tk="${NODE_TOKENS[$node]}"
     R=$(vps_get "$ip" "$tk" /agent)
@@ -251,7 +267,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 3. NETWORK MESH — Peer counts on all nodes
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[3/20] Network Mesh${NC}"
+echo -e "
+${CYAN}[3/20] Network Mesh${NC}"
 for node in "${LIVE_NODES[@]}"; do
     ip="${NODE_IPS[$node]}"; tk="${NODE_TOKENS[$node]}"
     R=$(vps_get "$ip" "$tk" /network/status)
@@ -263,7 +280,8 @@ done
 # ═════════════════════════════════════════════════════════════════════════
 # 4. AGENT CARDS — Generate and validate on all nodes
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[4/20] Agent Cards (all nodes)${NC}"
+echo -e "
+${CYAN}[4/20] Agent Cards (all nodes)${NC}"
 declare -A NODE_LINKS=()
 for node in "${LIVE_NODES[@]}"; do
     ip="${NODE_IPS[$node]}"; tk="${NODE_TOKENS[$node]}"
@@ -278,7 +296,8 @@ done
 # ═════════════════════════════════════════════════════════════════════════
 # 5. ANNOUNCE & DISCOVERY — All nodes announce, verify cross-discovery
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[5/20] Announce & Discovery${NC}"
+echo -e "
+${CYAN}[5/20] Announce & Discovery${NC}"
 for node in "${LIVE_NODES[@]}"; do
     ip="${NODE_IPS[$node]}"; tk="${NODE_TOKENS[$node]}"
     R=$(vps_post "$ip" "$tk" /announce); check_not_error "${NODE_LABELS[$node]} announce" "$R"
@@ -309,7 +328,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 6. ALL-PAIRS CARD IMPORT — Every node imports every other node's card
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[6/20] All-Pairs Card Import${NC}"
+echo -e "
+${CYAN}[6/20] All-Pairs Card Import${NC}"
 IMPORT_OK=0; IMPORT_FAIL=0
 for src in "${LIVE_NODES[@]}"; do
     src_ip="${NODE_IPS[$src]}"; src_tk="${NODE_TOKENS[$src]}"
@@ -335,7 +355,8 @@ sleep 10
 # ═════════════════════════════════════════════════════════════════════════
 # 7. ALL-PAIRS CONNECT — Every node connects to every other node
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[7/20] All-Pairs Connect${NC}"
+echo -e "
+${CYAN}[7/20] All-Pairs Connect${NC}"
 CONN_OK=0; CONN_FAIL=0
 declare -A PAIR_CONNECTED=()
 for src in "${LIVE_NODES[@]}"; do
@@ -375,7 +396,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 8. ALL-PAIRS DIRECT MESSAGING — REST API (send + SSE receive)
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[8/20] All-Pairs Direct Messaging — REST API${NC}"
+echo -e "
+${CYAN}[8/20] All-Pairs Direct Messaging — REST API${NC}"
 echo "  Testing all ${#LIVE_NODES[@]}-node round-robin + cross-continent pairs..."
 
 # Start remote SSE listeners on all nodes (capture on the VPS itself, then fetch)
@@ -459,7 +481,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 9. CLI INTERFACE PROOF — x0x direct send via CLI binary
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[9/20] CLI Interface Proof (x0x direct send)${NC}"
+echo -e "
+${CYAN}[9/20] CLI Interface Proof (x0x direct send)${NC}"
 # Use NYC→Helsinki and Sydney→SFO as CLI proof pairs with recipient-side evidence.
 CLI_PAIRS=("nyc:helsinki" "sydney:sfo")
 for pair in "${CLI_PAIRS[@]}"; do
@@ -474,7 +497,7 @@ for pair in "${CLI_PAIRS[@]}"; do
     cli_out="/tmp/x0x-vps-${PROOF_TOKEN}-${src}-to-${dst}.cli.sse"
     cli_pid=$(start_remote_direct_listener "$dst_ip" "$dst_tk" "$cli_out")
     sleep 2
-    R=$(vps_ssh "$src_ip" "X0X_API_TOKEN=$src_tk /usr/local/bin/x0x --format json --api-url http://127.0.0.1:12600 direct send '$dst_aid' '$proof'" 2>/dev/null || echo '{"error":"cli_failed"}')
+    R=$(vps_ssh "$src_ip" "X0X_API_TOKEN=$src_tk /usr/local/bin/x0x --format json --api-url http://127.0.0.1:${X0X_API_PORT} direct send '$dst_aid' '$proof'" 2>/dev/null || echo '{"error":"cli_failed"}')
     check_not_error "CLI ${NODE_LABELS[$src]}→${NODE_LABELS[$dst]} send" "$R"
     sleep 6
     stop_remote_pid "$dst_ip" "$cli_pid" >/dev/null
@@ -490,14 +513,15 @@ done
 # ═════════════════════════════════════════════════════════════════════════
 # 10. GUI INTERFACE PROOF — /gui serves HTML, /ws/direct accessible
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[10/20] GUI Interface Proof${NC}"
+echo -e "
+${CYAN}[10/20] GUI Interface Proof${NC}"
 
 # Test on NYC node via a local SSH tunnel + real headless browser.
 NYC_IP="${NODE_IPS[nyc]}"; NYC_TK="${NODE_TOKENS[nyc]:-}"
 HEL_IP="${NODE_IPS[helsinki]}"; HEL_TK="${NODE_TOKENS[helsinki]:-}"
 HEL_AID="${NODE_AIDS[helsinki]:-}"
 if [ -n "$NYC_TK" ] && [ -n "$HEL_AID" ] && [ -n "${PAIR_CONNECTED[nyc_helsinki]:-}" ]; then
-    GUI_HTML=$(vps_ssh "$NYC_IP" "curl -sf -m 15 'http://127.0.0.1:12600/gui'" 2>/dev/null || echo "")
+    GUI_HTML=$(vps_ssh "$NYC_IP" "curl -sf -m 15 'http://127.0.0.1:${X0X_API_PORT}/gui'" 2>/dev/null || echo "")
     TOTAL=$((TOTAL+1))
     if grep -q "X0X_TOKEN" <<<"$GUI_HTML" && grep -q "sendDm" <<<"$GUI_HTML"; then
         PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} GET /gui serves injected chat UI"
@@ -532,7 +556,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 11. DIRECT CONNECTIONS — Verify connection state on all nodes
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[11/20] Direct Connections State${NC}"
+echo -e "
+${CYAN}[11/20] Direct Connections State${NC}"
 for node in "${LIVE_NODES[@]}"; do
     ip="${NODE_IPS[$node]}"; tk="${NODE_TOKENS[$node]}"
     R=$(vps_get "$ip" "$tk" /direct/connections)
@@ -544,7 +569,8 @@ done
 # ═════════════════════════════════════════════════════════════════════════
 # 12. CONTACTS & TRUST — Full lifecycle
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[12/20] Contacts & Trust${NC}"
+echo -e "
+${CYAN}[12/20] Contacts & Trust${NC}"
 
 # NYC trusts Helsinki, Helsinki trusts NYC (should already be done via card import)
 NYC_IP="${NODE_IPS[nyc]}"; NYC_TK="${NODE_TOKENS[nyc]:-}"
@@ -600,7 +626,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 13. PUB/SUB — Global gossip proof
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[13/20] Pub/Sub (global gossip)${NC}"
+echo -e "
+${CYAN}[13/20] Pub/Sub (global gossip)${NC}"
 PUBSUB_TOPIC="vps-e2e-${PROOF_TOKEN}"
 
 # Subscribe on Helsinki and Sydney
@@ -623,7 +650,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 14. MLS GROUPS — Multi-continent PQC encryption
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[14/20] MLS Groups (multi-continent PQC)${NC}"
+echo -e "
+${CYAN}[14/20] MLS Groups (multi-continent PQC)${NC}"
 
 if [ -n "$NYC_TK" ]; then
     R=$(vps_get "$NYC_IP" "$NYC_TK" /mls/groups)
@@ -674,7 +702,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 15. NAMED GROUPS / SPACES — Create, invite, join, member identity, leave
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[15/20] Named Groups / Spaces${NC}"
+echo -e "
+${CYAN}[15/20] Named Groups / Spaces${NC}"
 
 if [ -n "$NYC_TK" ]; then
     R=$(vps_post "$NYC_IP" "$NYC_TK" /groups "{\"name\":\"VPS-Matrix-${PROOF_TOKEN}\",\"description\":\"All-pairs test group\"}")
@@ -756,7 +785,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 16. KV STORES — Write on one node, verify round-trip
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[16/20] KV Stores (cross-continent)${NC}"
+echo -e "
+${CYAN}[16/20] KV Stores (cross-continent)${NC}"
 
 KV_NODE=""
 a_is_live nuremberg && KV_NODE="nuremberg"
@@ -800,7 +830,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 17. TASK LISTS — CRDT lifecycle
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[17/20] Task Lists (CRDT)${NC}"
+echo -e "
+${CYAN}[17/20] Task Lists (CRDT)${NC}"
 
 TASK_NODE=""
 a_is_live sfo && TASK_NODE="sfo"
@@ -836,13 +867,15 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 18. FILE TRANSFER — Singapore→Sydney full accept/complete proof
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[18/20] File Transfer${NC}"
+echo -e "
+${CYAN}[18/20] File Transfer${NC}"
 
 SGP_IP="${NODE_IPS[singapore]}"; SGP_TK="${NODE_TOKENS[singapore]:-}"
 SYD_IP="${NODE_IPS[sydney]}"; SYD_TK="${NODE_TOKENS[sydney]:-}"; SYD_AID="${NODE_AIDS[sydney]:-}"
 if a_is_live singapore && a_is_live sydney && [ -n "$SGP_TK" ] && [ -n "$SYD_TK" ] && [ -n "$SYD_AID" ] && [ -n "${PAIR_CONNECTED[singapore_tokyo]:-}" ]; then
     SEND_PATH="/tmp/x0x-vps-file-${PROOF_TOKEN}.txt"
-    vps_ssh "$SGP_IP" "printf '%s\n' '${PROOF_TOKEN}-file-transfer-vps' > '$SEND_PATH'"
+    vps_ssh "$SGP_IP" "printf '%s
+' '${PROOF_TOKEN}-file-transfer-vps' > '$SEND_PATH'"
     FILE_SHA=$(vps_ssh "$SGP_IP" "shasum -a 256 '$SEND_PATH' | awk '{print \$1}'")
     FILE_SIZE=$(vps_ssh "$SGP_IP" "wc -c < '$SEND_PATH' | tr -d ' '")
     R=$(vps_post "$SGP_IP" "$SGP_TK" /files/send "{\"agent_id\":\"$SYD_AID\",\"filename\":\"matrix-test-${PROOF_TOKEN}.txt\",\"size\":$FILE_SIZE,\"sha256\":\"$FILE_SHA\",\"path\":\"$SEND_PATH\"}")
@@ -893,7 +926,8 @@ fi
 # Proves chunked transfer handles substantive payload sizes over MASQUE relay
 # / direct path, not just proof-token sized offers. Sha256 roundtrip verifies
 # byte-accurate delivery.
-echo -e "\n${CYAN}[18b/20] Large File Transfer (NYC→SFO)${NC}"
+echo -e "
+${CYAN}[18b/20] Large File Transfer (NYC→SFO)${NC}"
 NYC_IP="${NODE_IPS[nyc]}"; NYC_TK="${NODE_TOKENS[nyc]:-}"
 SFO_IP="${NODE_IPS[sfo]}"; SFO_TK="${NODE_TOKENS[sfo]:-}"
 if a_is_live nyc && a_is_live sfo && [ -n "$NYC_TK" ] && [ -n "$SFO_TK" ] && [ -n "${NODE_AIDS[sfo]:-}" ] && [ -n "${PAIR_CONNECTED[nyc_sfo]:-}" ]; then
@@ -904,7 +938,8 @@ if a_is_live nyc && a_is_live sfo && [ -n "$NYC_TK" ] && [ -n "$SFO_TK" ] && [ -
             16M) SIZE_BYTES=16777216 ;;
         esac
         LARGE_PATH="/tmp/x0x-vps-large-${SIZE_LABEL}-${PROOF_TOKEN}.bin"
-        vps_ssh "$NYC_IP" "head -c $SIZE_BYTES /dev/urandom > '$LARGE_PATH' && printf '%s\n' '${PROOF_TOKEN}-${SIZE_LABEL}-tail' >> '$LARGE_PATH'"
+        vps_ssh "$NYC_IP" "head -c $SIZE_BYTES /dev/urandom > '$LARGE_PATH' && printf '%s
+' '${PROOF_TOKEN}-${SIZE_LABEL}-tail' >> '$LARGE_PATH'"
         LG_SHA=$(vps_ssh "$NYC_IP" "shasum -a 256 '$LARGE_PATH' | awk '{print \$1}'")
         LG_SIZE=$(vps_ssh "$NYC_IP" "wc -c < '$LARGE_PATH' | tr -d ' '")
         R=$(vps_post "$NYC_IP" "$NYC_TK" /files/send "{\"agent_id\":\"$SFO_AID\",\"filename\":\"large-${SIZE_LABEL}-${PROOF_TOKEN}.bin\",\"size\":$LG_SIZE,\"sha256\":\"$LG_SHA\",\"path\":\"$LARGE_PATH\"}")
@@ -959,7 +994,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 19. PRESENCE — FOAF + online + find + status on all nodes
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[19/20] Presence (all nodes)${NC}"
+echo -e "
+${CYAN}[19/20] Presence (all nodes)${NC}"
 
 for node in "${LIVE_NODES[@]}"; do
     ip="${NODE_IPS[$node]}"; tk="${NODE_TOKENS[$node]}"
@@ -986,7 +1022,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 20. CONSTITUTION, UPGRADE, WEBSOCKET, STATUS — All nodes
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[20/20] Constitution, Upgrade, WebSocket, Status${NC}"
+echo -e "
+${CYAN}[20/20] Constitution, Upgrade, WebSocket, Status${NC}"
 
 for node in "${LIVE_NODES[@]}"; do
     ip="${NODE_IPS[$node]}"; tk="${NODE_TOKENS[$node]}"
@@ -1025,9 +1062,9 @@ fi
 
 # SSE endpoint probes
 if a_is_live nyc && [ -n "$NYC_TK" ]; then
-    R=$(vps_ssh "$NYC_IP" "curl -si -N -m 3 -H 'Authorization: Bearer $NYC_TK' 'http://127.0.0.1:12600/events' | head -1")
+    R=$(vps_ssh "$NYC_IP" "curl -si -N -m 3 -H 'Authorization: Bearer $NYC_TK' 'http://127.0.0.1:${X0X_API_PORT}/events' | head -1")
     check_contains "NYC /events SSE responds" "$R" "200"
-    R=$(vps_ssh "$NYC_IP" "curl -si -N -m 3 -H 'Authorization: Bearer $NYC_TK' 'http://127.0.0.1:12600/presence/events' | head -1")
+    R=$(vps_ssh "$NYC_IP" "curl -si -N -m 3 -H 'Authorization: Bearer $NYC_TK' 'http://127.0.0.1:${X0X_API_PORT}/presence/events' | head -1")
     check_contains "NYC /presence/events SSE responds" "$R" "200"
 fi
 

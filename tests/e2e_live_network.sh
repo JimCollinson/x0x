@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+
+# ── Network selector (added 2026-05-16) — default TESTNET ─────────────
+# Source the contract module; consume --network from "$@"; banner;
+# re-export legacy NYC_TK/NYC_IP-style vars so the rest of the script
+# does not need rewriting. Pass --network prod for the production fleet
+# (REAL USERS, 5s Ctrl-C window).
+SCRIPT_DIR_X0X="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR_X0X/x0x-network.sh"
+x0x_network_select "$@"
+set -- "${X0X_FILTERED_ARGS[@]+"${X0X_FILTERED_ARGS[@]}"}"
+x0x_export_legacy_token_vars
+
 # =============================================================================
 # x0x Live Network End-to-End Test
 # Starts a LOCAL x0xd node that joins the real bootstrap network (6 VPS nodes),
@@ -25,7 +38,7 @@ X0XD="${X0XD:-$PROJECT_DIR/target/release/x0xd}"
 VERSION="$(grep '^version = ' "$PROJECT_DIR/Cargo.toml" | head -1 | cut -d '"' -f2)"
 
 PASS=0; FAIL=0; SKIP=0; TOTAL=0
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+RED='[0;31m'; GREEN='[0;32m'; YELLOW='[0;33m'; CYAN='[0;36m'; NC='[0m'
 
 b64() { echo -n "$1" | base64; }
 
@@ -89,7 +102,7 @@ vps_api() {
     local ip="$1" token="$2" method="$3" path="$4" body="${5:-}"
     local cmd="curl -sf -m 10 -X $method -H 'Authorization: Bearer $token' -H 'Content-Type: application/json'"
     [ -n "$body" ] && cmd="$cmd -d '$body'"
-    cmd="$cmd 'http://127.0.0.1:12600${path}'"
+    cmd="$cmd 'http://127.0.0.1:${X0X_API_PORT}${path}'"
     $SSH "root@$ip" "$cmd" 2>/dev/null || echo '{"error":"curl_failed"}'
 }
 
@@ -128,11 +141,12 @@ echo -e "  x0xd: $X0XD"
 # ═════════════════════════════════════════════════════════════════════════
 # SETUP: Collect VPS tokens and start local node
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[Setup] Collecting VPS tokens and verifying bootstrap health...${NC}"
+echo -e "
+${CYAN}[Setup] Collecting VPS tokens and verifying bootstrap health...${NC}"
 
 # Load tokens from file if available, otherwise SSH
 if [ -f "$SCRIPT_DIR/.vps-tokens.env" ]; then
-    source "$SCRIPT_DIR/.vps-tokens.env"
+    # [migrated 2026-05-16] tokens loaded by x0x-network.sh preamble
     [ -n "${NYC_TK:-}" ] && VPS_TOKENS[nyc]="$NYC_TK"
     [ -n "${SFO_TK:-}" ] && VPS_TOKENS[sfo]="$SFO_TK"
     [ -n "${HELSINKI_TK:-}" ] && VPS_TOKENS[helsinki]="$HELSINKI_TK"
@@ -173,7 +187,8 @@ done
 echo "  NYC agent: ${VPS_AIDS[nyc]:0:16}..."
 
 # ── Start local node with default bootstrap (real network) ──────────────
-echo -e "\n${CYAN}[Setup] Starting local x0xd (joining real bootstrap network)...${NC}"
+echo -e "
+${CYAN}[Setup] Starting local x0xd (joining real bootstrap network)...${NC}"
 rm -rf /tmp/x0x-e2e-live
 mkdir -p /tmp/x0x-e2e-live
 
@@ -209,7 +224,8 @@ echo -e "  local agent=${LOCAL_AID:0:16}... machine=${LOCAL_MID:0:16}..."
 # ═════════════════════════════════════════════════════════════════════════
 # 1. LOCAL NODE HEALTH & IDENTITY
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[1/12] Local Node Health & Identity${NC}"
+echo -e "
+${CYAN}[1/12] Local Node Health & Identity${NC}"
 R=$(L /health); check_json "local health" "$R" "ok"
 check_contains "local version $VERSION" "$R" "$VERSION"
 R=$(L /status); check_json "local status" "$R" "uptime_secs"
@@ -228,7 +244,8 @@ done
 # ═════════════════════════════════════════════════════════════════════════
 # 2. BOOTSTRAP CONNECTIVITY — Join the real network
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[2/12] Bootstrap Connectivity (30s for real network join)${NC}"
+echo -e "
+${CYAN}[2/12] Bootstrap Connectivity (30s for real network join)${NC}"
 sleep 30
 
 R=$(L /network/status); check_json "network status" "$R" "connected_peers"
@@ -247,7 +264,8 @@ R=$(L /network/bootstrap-cache); check_not_error "bootstrap cache" "$R"
 # ═════════════════════════════════════════════════════════════════════════
 # 3. ANNOUNCE & DISCOVERY — Local announces, VPS nodes discover
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[3/12] Announce & Discovery (local ↔ VPS)${NC}"
+echo -e "
+${CYAN}[3/12] Announce & Discovery (local ↔ VPS)${NC}"
 
 # Local announces identity to the network
 R=$(Lp /announce); check_not_error "local announce" "$R"
@@ -282,7 +300,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 4. CONTACTS & TRUST — Local ↔ VPS
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[4/12] Contacts & Trust (local ↔ NYC)${NC}"
+echo -e "
+${CYAN}[4/12] Contacts & Trust (local ↔ NYC)${NC}"
 
 # Local adds NYC as trusted contact
 R=$(Lp /contacts "{\"agent_id\":\"$NYC_AID\",\"trust_level\":\"Trusted\",\"label\":\"NYC Bootstrap\"}")
@@ -317,7 +336,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 5. DIRECT MESSAGING — Local → VPS (bidirectional)
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[5/12] Direct Messaging (local ↔ NYC)${NC}"
+echo -e "
+${CYAN}[5/12] Direct Messaging (local ↔ NYC)${NC}"
 
 # Local connects to NYC
 R=$(Lp /agents/connect "{\"agent_id\":\"$NYC_AID\"}"); check_connect_outcome "local connects to NYC" "$R"
@@ -344,7 +364,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 6. PUB/SUB — Local publishes, VPS subscribes
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[6/12] Pub/Sub (local ↔ network)${NC}"
+echo -e "
+${CYAN}[6/12] Pub/Sub (local ↔ network)${NC}"
 
 # Subscribe on NYC
 R=$(vps_api "$NYC_IP" "$NYC_TK" POST /subscribe '{"topic":"live-e2e-test"}')
@@ -363,7 +384,8 @@ check_ok "NYC publishes to local" "$R"
 # ═════════════════════════════════════════════════════════════════════════
 # 7. MLS GROUPS — Local creates, adds VPS members
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[7/12] MLS Groups (local + VPS members)${NC}"
+echo -e "
+${CYAN}[7/12] MLS Groups (local + VPS members)${NC}"
 
 # Create MLS group on local
 R=$(Lp /mls/groups); check_json "local create MLS group" "$R" "group_id"
@@ -399,7 +421,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 8. NAMED GROUPS — Local creates, VPS joins via invite
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[8/12] Named Groups (local creates, NYC joins)${NC}"
+echo -e "
+${CYAN}[8/12] Named Groups (local creates, NYC joins)${NC}"
 
 R=$(Lp /groups '{"name":"Live Network Test Group","description":"local + VPS"}')
 check_not_error "create named group" "$R"
@@ -428,7 +451,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 9. KV STORES — Local writes, verifies
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[9/12] Key-Value Stores${NC}"
+echo -e "
+${CYAN}[9/12] Key-Value Stores${NC}"
 
 R=$(Lp /stores '{"name":"live-kv","topic":"live-kv-topic"}'); check_not_error "create store" "$R"
 SID=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('store_id',d.get('id','')))" 2>/dev/null||echo "")
@@ -445,7 +469,8 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 # 10. TASK LISTS & FILE TRANSFER
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[10/12] Task Lists & File Transfer${NC}"
+echo -e "
+${CYAN}[10/12] Task Lists & File Transfer${NC}"
 
 R=$(Lp /task-lists '{"name":"Live Tasks","topic":"live-tasks-topic"}'); check_not_error "create task list" "$R"
 TL=$(echo "$R"|python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('list_id',d.get('id','')))" 2>/dev/null||echo "")
@@ -469,7 +494,8 @@ check_not_error "file offer to NYC" "$R"
 # ═════════════════════════════════════════════════════════════════════════
 # 11. PRESENCE — Local sees VPS nodes, VPS sees local
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[11/12] Presence (local ↔ VPS mesh)${NC}"
+echo -e "
+${CYAN}[11/12] Presence (local ↔ VPS mesh)${NC}"
 
 R=$(L /presence/online); check_not_error "local presence online" "$R"
 R=$(L /presence/foaf); check_not_error "local presence foaf" "$R"
@@ -490,7 +516,8 @@ PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} presence events SSE (stream opene
 # ═════════════════════════════════════════════════════════════════════════
 # 12. UPGRADE CHECK & WEBSOCKET
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${CYAN}[12/12] Upgrade & WebSocket${NC}"
+echo -e "
+${CYAN}[12/12] Upgrade & WebSocket${NC}"
 
 R=$(L /upgrade)
 TOTAL=$((TOTAL+1))
@@ -506,7 +533,8 @@ R=$(L /ws/sessions); check_not_error "ws sessions" "$R"
 # ═════════════════════════════════════════════════════════════════════════
 # SUMMARY
 # ═════════════════════════════════════════════════════════════════════════
-echo -e "\n${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "
+${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 if [ $FAIL -eq 0 ]; then
     echo -e "${GREEN}  ALL $TOTAL TESTS PASSED ($PASS passed, $SKIP skipped)${NC}"
     echo -e "  Local node ↔ 6 bootstrap nodes, 12 categories, v$VERSION"

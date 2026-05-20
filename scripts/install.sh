@@ -94,12 +94,22 @@ trap 'rm -rf "$TMP"' EXIT
 
 echo "Downloading..."
 if command -v curl >/dev/null 2>&1; then
+    DOWNLOADER="curl"
     curl -sfL "$URL/$ARCHIVE" -o "$TMP/$ARCHIVE"
 elif command -v wget >/dev/null 2>&1; then
+    DOWNLOADER="wget"
     wget -qO "$TMP/$ARCHIVE" "$URL/$ARCHIVE"
 else
     echo "Error: need curl or wget"; exit 1
 fi
+
+http_get() {
+    if [ "$DOWNLOADER" = "curl" ]; then
+        curl -sf "$1"
+    else
+        wget -qO- "$1"
+    fi
+}
 
 mkdir -p "$BIN"
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
@@ -168,14 +178,22 @@ API=$(cat "$PORTFILE")
 
 # Wait for healthy
 TRIES=0
+HEALTH_OK=false
 while [ $TRIES -lt 15 ]; do
-    if curl -sf "http://$API/health" >/dev/null 2>&1; then break; fi
+    if HEALTH=$(http_get "http://$API/health" 2>/dev/null); then
+        HEALTH_OK=true
+        break
+    fi
     sleep 1
     TRIES=$((TRIES + 1))
 done
 
-HEALTH=$(curl -sf "http://$API/health" 2>/dev/null || echo '{"ok":false}')
-AGENT=$(curl -sf "http://$API/agent" 2>/dev/null || echo '{}')
+if [ "$HEALTH_OK" != true ]; then
+    echo "Timeout waiting for healthy daemon. Check: cat $INSTANCE_DIR/x0xd.log"
+    exit 1
+fi
+
+AGENT=$(http_get "http://$API/agent" 2>/dev/null || echo '{}')
 
 echo ""
 echo "x0x is running"

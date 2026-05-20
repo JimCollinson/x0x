@@ -23,18 +23,56 @@ REPO="saorsa-labs/x0x"
 URL="https://github.com/$REPO/releases/latest/download"
 BIN="$HOME/.local/bin"
 NAME=""
+NAME_SET=false
 AUTOSTART=false
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --autostart) AUTOSTART=true ;;
-        --name)      shift; NAME="$1" ;;
-        --name=*)    NAME="${1#*=}" ;;
+        --autostart)
+            AUTOSTART=true
+            shift
+            ;;
+        --name)
+            shift
+            NAME="${1-}"
+            NAME_SET=true
+            if [ $# -gt 0 ]; then
+                shift
+            fi
+            ;;
+        --name=*)
+            NAME="${1#*=}"
+            NAME_SET=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
     esac
-    shift
 done
+
+if [ "$NAME_SET" = true ]; then
+    if [ -z "$NAME" ] || [ ${#NAME} -gt 64 ]; then
+        echo "Error: instance name must be 1-64 characters" >&2
+        exit 1
+    fi
+    case "$NAME" in
+        [abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789]*)
+            ;;
+        *)
+            echo "Error: instance name must start with alphanumeric and contain only alphanumeric or hyphens" >&2
+            exit 1
+            ;;
+    esac
+    case "$NAME" in
+        *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-]*)
+            echo "Error: instance name must start with alphanumeric and contain only alphanumeric or hyphens" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 # ── Detect platform ──────────────────────────────────────────────────────────
 
@@ -151,14 +189,15 @@ mkdir -p "$SHARED_DIR"
 
 echo ""
 XOXD="$BIN/x0xd"
-CMD="$XOXD"
-if [ -n "$NAME" ]; then
-    CMD="$XOXD --name $NAME"
-fi
 
 mkdir -p "$INSTANCE_DIR"
-echo "Starting: $CMD"
-nohup $CMD >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
+if [ -n "$NAME" ]; then
+    echo "Starting: $XOXD --name $NAME"
+    nohup "$XOXD" --name "$NAME" >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
+else
+    echo "Starting: $XOXD"
+    nohup "$XOXD" >> "$INSTANCE_DIR/x0xd.log" 2>&1 &
+fi
 PID=$!
 
 # Wait for port file

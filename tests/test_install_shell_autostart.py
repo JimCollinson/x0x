@@ -30,6 +30,7 @@ class InstallShellAutostartTests(unittest.TestCase):
             home = tmp / "home"
             data_home = tmp / "data"
             calls = tmp / "x0x-calls.log"
+            daemon_calls = tmp / "x0xd-calls.log"
             archive = tmp / f"x0x-{PLATFORM}.tar.gz"
 
             fake_bin.mkdir()
@@ -50,6 +51,13 @@ esac
             write_executable(
                 archive_dir / "x0xd",
                 """#!/usr/bin/env sh
+{
+    printf '%s\\n' "$0"
+    printf '%s\\n' "$#"
+    for arg do
+        printf '%s\\n' "$arg"
+    done
+} >> "$XOXD_CALLS"
 NAME=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -110,6 +118,7 @@ esac
                     "PATH": f"{fake_bin}{os.pathsep}{env.get('PATH', '')}",
                     "TMPDIR": str(tmp),
                     "XOX_CALLS": str(calls),
+                    "XOXD_CALLS": str(daemon_calls),
                 }
             )
 
@@ -127,6 +136,40 @@ esac
                 calls.read_text(encoding="utf-8").splitlines(),
                 ["--name alice autostart"],
             )
+            self.assertEqual(
+                daemon_calls.read_text(encoding="utf-8").splitlines(),
+                [str(home / ".local" / "bin" / "x0xd"), "2", "--name", "alice"],
+            )
+
+    def test_invalid_name_with_option_text_is_rejected_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            home = tmp / "home"
+            data_home = tmp / "data"
+            home.mkdir()
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "XDG_DATA_HOME": str(data_home),
+                    "TMPDIR": str(tmp),
+                }
+            )
+
+            result = subprocess.run(
+                ["sh", str(INSTALL_SH), "--name", "alice --api-port 12345"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+
+            output = result.stderr + result.stdout
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("instance name must start with alphanumeric", output)
+            self.assertNotIn("Downloading", output)
 
     def test_unhealthy_daemon_fails_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

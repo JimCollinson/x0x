@@ -1420,29 +1420,7 @@ async fn main() -> Result<()> {
 
     // Load named groups from disk (if any)
     let named_groups_path = config.data_dir.join("named_groups.json");
-    let named_groups = match tokio::fs::read_to_string(&named_groups_path).await {
-        Ok(json) => match serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&json) {
-            Ok(mut groups) => {
-                for info in groups.values_mut() {
-                    info.migrate_from_v1();
-                }
-                tracing::info!(
-                    "Loaded {} named groups from {}",
-                    groups.len(),
-                    named_groups_path.display()
-                );
-                groups
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse named groups file, starting fresh: {e}");
-                HashMap::new()
-            }
-        },
-        Err(_) => {
-            tracing::info!("No named groups file found, starting fresh");
-            HashMap::new()
-        }
-    };
+    let named_groups = load_named_groups(&named_groups_path).await?;
 
     // Load or generate API bearer token for local authentication.
     let api_token = load_or_generate_api_token(&config.data_dir).await?;
@@ -13657,16 +13635,81 @@ async fn save_mls_groups(_state: &AppState) {
     // They are recreated each session.
 }
 
-async fn save_named_groups(state: &AppState) {
-    let groups = state.named_groups.read().await;
-    match serde_json::to_string_pretty(&*groups) {
+async fn load_named_groups(
+    named_groups_path: &FsPath,
+) -> Result<HashMap<String, x0x::groups::GroupInfo>> {
+    match tokio::fs::read_to_string(named_groups_path).await {
         Ok(json) => {
-            if let Err(e) = tokio::fs::write(&state.named_groups_path, json).await {
+            let mut groups = serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&json)
+                .with_context(|| {
+                    format!(
+                        "failed to parse named groups file {}",
+                        named_groups_path.display()
+                    )
+                })?;
+            for info in groups.values_mut() {
+                info.migrate_from_v1();
+            }
+            tracing::info!(
+                "Loaded {} named groups from {}",
+                groups.len(),
+                named_groups_path.display()
+            );
+            Ok(groups)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!("No named groups file found, starting fresh");
+            Ok(HashMap::new())
+        }
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "failed to read named groups file {}",
+                named_groups_path.display()
+            )
+        }),
+    }
+}
+
+async fn save_named_groups(state: &AppState) {
+    let json = {
+        let groups = state.named_groups.read().await;
+        serde_json::to_string_pretty(&*groups)
+    };
+    match json {
+        Ok(json) => {
+            if let Err(e) = write_named_groups_json_atomic(&state.named_groups_path, &json).await {
                 tracing::error!("Failed to save named groups: {e}");
             }
         }
         Err(e) => tracing::error!("Failed to serialize named groups: {e}"),
     }
+}
+
+async fn write_named_groups_json_atomic(path: &FsPath, json: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut temp_os = path.as_os_str().to_owned();
+    temp_os.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let temp_path = PathBuf::from(temp_os);
+
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await?;
+        file.write_all(json.as_bytes()).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temp_path, path).await
+    }
+    .await;
+
+    if write_result.is_err() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+
+    write_result
 }
 
 /// Decode a base64-encoded payload from a request field.
@@ -14900,6 +14943,39 @@ mod tests {
         ));
         assert!(!newer_info.withdrawn);
         assert_eq!(newer_info.state_revision, 3);
+    }
+
+    #[tokio::test]
+    async fn malformed_named_groups_file_is_rejected_without_replacing_file() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("named_groups.json");
+        let malformed_json = "{\"group\":";
+        tokio::fs::write(&path, malformed_json).await?;
+
+        let result = load_named_groups(&path).await;
+
+        assert!(result.is_err());
+        assert_eq!(tokio::fs::read_to_string(&path).await?, malformed_json);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_groups_json_write_replaces_file_without_temp_leftover() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("named_groups.json");
+
+        write_named_groups_json_atomic(&path, "{\"old\":true}").await?;
+        write_named_groups_json_atomic(&path, "{\"new\":true}").await?;
+
+        assert_eq!(tokio::fs::read_to_string(&path).await?, "{\"new\":true}");
+
+        let mut entries = tokio::fs::read_dir(dir.path()).await?;
+        let mut names = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            names.push(entry.file_name());
+        }
+        assert_eq!(names, vec![std::ffi::OsString::from("named_groups.json")]);
+        Ok(())
     }
 
     #[test]

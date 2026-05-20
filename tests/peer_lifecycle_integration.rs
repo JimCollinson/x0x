@@ -264,6 +264,7 @@ async fn peer_events_sse_emits_established_on_new_connection() {
     let alice_url = alice.url("/peers/events");
 
     // Open the SSE in a background task; collect raw lines for 12 s.
+    let (sse_ready_tx, sse_ready_rx) = tokio::sync::oneshot::channel();
     let alice_token_clone = alice_token.clone();
     let collector = tokio::spawn(async move {
         let client = reqwest::Client::builder()
@@ -276,6 +277,8 @@ async fn peer_events_sse_emits_established_on_new_connection() {
             .send()
             .await
             .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "SSE subscription failed");
+        let _ = sse_ready_tx.send(());
         let mut acc = String::new();
         let started = tokio::time::Instant::now();
         while started.elapsed() < Duration::from_secs(12) {
@@ -292,8 +295,7 @@ async fn peer_events_sse_emits_established_on_new_connection() {
         acc
     });
 
-    // Give the SSE a moment to connect.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    sse_ready_rx.await.unwrap();
 
     // Read alice's QUIC bind, then boot bob pointed at her.
     let alice_client = reqwest::Client::builder()

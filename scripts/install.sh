@@ -189,7 +189,11 @@ echo "  PID:    $PID"
 
 if [ "$AUTOSTART" = true ]; then
     echo ""
-    "$XOX" autostart
+    if [ -n "$NAME" ]; then
+        "$XOX" --name "$NAME" autostart
+    else
+        "$XOX" autostart
+    fi
 fi
 
 # ── Summary ─────────────────────────────────────────────────────────────────

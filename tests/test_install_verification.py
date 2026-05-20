@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 import tarfile
@@ -108,6 +109,31 @@ class InstallerVerificationTests(unittest.TestCase):
                 self.installer.install_daemon(key)
 
             self.assertFalse((daemon_dir / "x0xd").exists())
+
+    def test_failed_skill_verification_preserves_existing_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            install_dir = Path(tmpdir) / "install"
+            install_dir.mkdir()
+            skill = install_dir / "SKILL.md"
+            skill.write_text("trusted skill", encoding="utf-8")
+            cwd = Path.cwd()
+
+            def fake_download(url, dest):
+                Path(dest).write_text(f"downloaded from {url}", encoding="utf-8")
+
+            with mock.patch.object(self.installer, "INSTALL_DIR", install_dir), \
+                 mock.patch.object(self.installer, "check_gpg", return_value=True), \
+                 mock.patch.object(self.installer, "download_file", fake_download), \
+                 mock.patch.object(self.installer, "verify_signature", return_value=False), \
+                 mock.patch.object(self.installer, "install_daemon") as install_daemon:
+                try:
+                    with self.assertRaises(SystemExit):
+                        self.installer.main()
+                finally:
+                    os.chdir(cwd)
+
+            self.assertEqual(skill.read_text(encoding="utf-8"), "trusted skill")
+            install_daemon.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -12,7 +12,6 @@ Works on any platform with Python 3.6+.
 import os
 import sys
 import platform
-import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -294,7 +293,7 @@ def main():
     INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     os.chdir(INSTALL_DIR)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory(dir=INSTALL_DIR) as tmpdir:
         tmp = Path(tmpdir)
         downloaded_skill_file = tmp / "SKILL.md"
         downloaded_sig_file = tmp / "SKILL.md.sig"
@@ -317,13 +316,13 @@ def main():
         skill_file = INSTALL_DIR / "SKILL.md"
         sig_file = INSTALL_DIR / "SKILL.md.sig"
         key_file = INSTALL_DIR / "SAORSA_PUBLIC_KEY.asc"
-        shutil.copy2(downloaded_skill_file, skill_file)
-        shutil.copy2(downloaded_sig_file, sig_file)
-        shutil.copy2(downloaded_key_file, key_file)
+        os.replace(downloaded_sig_file, sig_file)
+        os.replace(downloaded_key_file, key_file)
+        os.replace(downloaded_skill_file, skill_file)
 
         # Install the x0xd daemon binary
         print()
-        install_daemon(downloaded_key_file)
+        install_daemon(key_file)
 
     print()
     print_color("✓ Installation complete", GREEN)

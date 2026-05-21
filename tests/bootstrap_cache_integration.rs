@@ -3,6 +3,8 @@
 
 //! Integration tests for the bootstrap cache (ant_quic::BootstrapCache) integration.
 
+use saorsa_gossip_coordinator::{AddrHint, CoordinatorAdvert, CoordinatorRoles, NatClass};
+use saorsa_gossip_types::PeerId;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -10,7 +12,7 @@ use std::{
 };
 use tempfile::TempDir;
 use tokio::sync::Mutex;
-use x0x::Agent;
+use x0x::{network::NetworkConfig, Agent};
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -38,12 +40,23 @@ impl Drop for EnvVarOverride {
 
 fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
     let message = error.to_string();
-    message.contains("All socket binds failed") && message.contains("Operation not permitted")
+    message.contains("Operation not permitted")
+        && (message.contains("All socket binds failed")
+            || message.contains("Failed to bind UDP socket"))
 }
 
 fn path_snapshot(path: &Path) -> Option<(bool, u64, Option<SystemTime>)> {
     let metadata = std::fs::metadata(path).ok()?;
     Some((metadata.is_dir(), metadata.len(), metadata.modified().ok()))
+}
+
+fn loopback_network_config() -> NetworkConfig {
+    NetworkConfig {
+        bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr literal")),
+        bootstrap_nodes: Vec::new(),
+        port_mapping_enabled: false,
+        ..NetworkConfig::default()
+    }
 }
 
 /// Helper: build an agent with a temp peer cache directory.
@@ -55,6 +68,24 @@ async fn agent_with_cache(temp_dir: &TempDir) -> Agent {
         .build()
         .await
         .expect("failed to build agent")
+}
+
+async fn agent_with_network_cache(
+    temp_dir: &TempDir,
+    cache_dir: &Path,
+) -> x0x::error::Result<Option<Agent>> {
+    match Agent::builder()
+        .with_machine_key(temp_dir.path().join("machine.key"))
+        .with_agent_key_path(temp_dir.path().join("agent.key"))
+        .with_peer_cache_dir(cache_dir)
+        .with_network_config(loopback_network_config())
+        .build()
+        .await
+    {
+        Ok(agent) => Ok(Some(agent)),
+        Err(err) if is_network_bind_permission_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 #[tokio::test]
@@ -107,31 +138,53 @@ async fn test_shutdown_saves_cache() {
 async fn test_cache_persists_across_restarts() {
     let temp = TempDir::new().unwrap();
     let cache_dir = temp.path().join("peers");
+    let peer_id = PeerId::new([17u8; 32]);
+    let addr = "127.0.0.1:5483".parse().unwrap();
+    let advert = CoordinatorAdvert::new(
+        peer_id,
+        CoordinatorRoles::default(),
+        vec![AddrHint::new(addr)],
+        NatClass::Unknown,
+        60_000,
+    );
 
-    // First agent: create cache and connect to build entries.
+    // First agent: seed a real cache entry and save it on shutdown.
     {
-        let agent = Agent::builder()
-            .with_machine_key(temp.path().join("machine.key"))
-            .with_agent_key_path(temp.path().join("agent.key"))
-            .with_peer_cache_dir(&cache_dir)
-            .with_network_config(x0x::network::NetworkConfig::default())
-            .build()
+        let Some(agent) = agent_with_network_cache(&temp, &cache_dir)
             .await
-            .expect("failed to build first agent");
+            .expect("failed to build first agent")
+        else {
+            return;
+        };
+        let adapter = agent
+            .gossip_cache_adapter()
+            .expect("network agent should expose cache adapter");
+
+        assert!(adapter.insert_advert(advert).await);
+        assert_eq!(adapter.peer_count().await, 1);
 
         agent.shutdown().await;
     }
 
-    // Second agent: should load from same cache dir without error.
+    // Second agent: load from the same cache dir and observe the saved peer.
     {
-        let agent = Agent::builder()
-            .with_machine_key(temp.path().join("machine.key"))
-            .with_agent_key_path(temp.path().join("agent.key"))
-            .with_peer_cache_dir(&cache_dir)
-            .with_network_config(x0x::network::NetworkConfig::default())
-            .build()
+        let agent = agent_with_network_cache(&temp, &cache_dir)
             .await
-            .expect("failed to build second agent");
+            .expect("failed to build second agent")
+            .expect("network should still be available for second agent");
+        let adapter = agent
+            .gossip_cache_adapter()
+            .expect("network agent should expose cache adapter");
+        let cached_peer = adapter
+            .get_peer(&peer_id)
+            .await
+            .expect("seeded peer should persist across restart");
+
+        assert_eq!(cached_peer.peer_id, ant_quic::PeerId(*peer_id.as_bytes()));
+        assert!(
+            cached_peer.addresses.contains(&addr),
+            "persisted peer should retain seeded address"
+        );
 
         agent.shutdown().await;
     }

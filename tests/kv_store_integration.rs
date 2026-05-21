@@ -379,26 +379,28 @@ fn test_large_value_over_limit_rejected() {
 }
 
 #[test]
-fn test_exactly_at_limit_rejected() {
+fn test_large_value_exact_limit_allowed() {
     let peer = test_peer(1);
     let mut store = make_store(1, "Exact", 1);
 
-    // Exactly MAX_INLINE_SIZE (65536) should be rejected (> check, not >=).
+    // Exactly MAX_INLINE_SIZE (65536) is allowed; only larger values are rejected.
     let value = vec![0u8; 65_536];
     let result = store.put(
         "exact".to_string(),
-        value,
+        value.clone(),
         "application/octet-stream".to_string(),
         peer,
     );
 
-    // The implementation uses `value.len() > MAX_INLINE_SIZE`, so 65536 is not > 65536.
-    // This test documents the boundary behavior.
-    if result.is_ok() {
-        let entry = store.get("exact").expect("get");
+    assert!(result.is_ok(), "exactly MAX_INLINE_SIZE should be accepted");
+    assert_eq!(store.len(), 1);
+
+    let entry = store.get("exact");
+    assert!(entry.is_some(), "exact-limit value should be stored");
+    if let Some(entry) = entry {
         assert_eq!(entry.value.len(), 65_536);
+        assert_eq!(entry.value, value);
     }
-    // Either way, the behavior is documented.
 }
 
 // ---------------------------------------------------------------------------

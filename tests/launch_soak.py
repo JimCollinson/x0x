@@ -488,11 +488,17 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
     def _is_dispatcher_violation(msg: str) -> bool:
         return "dispatcher_timed_out delta" in msg
 
-    def _is_phase_a_violation(msg: str) -> bool:
-        return (
-            "phase A received" in msg
-            or "scenario errored: phase A exit code" in msg
-        )
+    def _is_phase_a_violation(row: Dict[str, str], msg: str) -> bool:
+        if "scenario errored: phase A exit code" in msg:
+            return not _phase_a_ok(row)
+        match = re.search(r"phase A (received|sent) (\d+) < gate (\d+)", msg)
+        if not match:
+            return False
+        metric, observed_text, gate_text = match.groups()
+        key = f"phase_a_{metric}"
+        observed = int(observed_text)
+        gate = int(gate_text)
+        return observed == _int_field(row, key) and observed < gate
 
     def _only_dispatcher_timeout_violations(row: Dict[str, str]) -> bool:
         messages = _violation_messages(row)
@@ -508,7 +514,7 @@ def write_summary(soak_dir: Path, gate: str, rows: List[Dict[str, str]]) -> bool
         """
         messages = _violation_messages(row)
         return bool(messages) and all(
-            _is_dispatcher_violation(m) or _is_phase_a_violation(m)
+            _is_dispatcher_violation(m) or _is_phase_a_violation(row, m)
             for m in messages
         )
 

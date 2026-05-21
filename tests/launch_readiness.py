@@ -1525,6 +1525,11 @@ def evaluate_slos(
             violations.append(
                 f"phase A received {rcv} < gate {g['min_phase_a_pairs']}"
             )
+        sent = scenario.extra_metrics.get("phase_a_sent", 0)
+        if sent < g["min_phase_a_pairs"]:
+            violations.append(
+                f"phase A sent {sent} < gate {g['min_phase_a_pairs']}"
+            )
 
     if scenario.name == "restart_storm":
         max_rec = scenario.extra_metrics.get("max_recovery_secs", 0)

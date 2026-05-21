@@ -428,6 +428,7 @@ class LaunchSoakSummaryTests(unittest.TestCase):
                 disp_to=1,
                 violation_messages=(
                     "scenario errored: phase A exit code 1 || "
+                    "phase A sent 29 < gate 30 || "
                     "helsinki: dispatcher_timed_out delta 1 > gate 0"
                 ),
                 start_unix="1",
@@ -454,14 +455,14 @@ class LaunchSoakSummaryTests(unittest.TestCase):
                 verdict="NO-GO",
                 phase_a_sent=29,
                 phase_a_received=30,
-                violation_messages="phase A received 30 < gate 30",
+                violation_messages="phase A sent 29 < gate 30",
                 start_unix="1",
             ),
             self._make_row(
                 verdict="NO-GO",
                 phase_a_sent=29,
                 phase_a_received=30,
-                violation_messages="phase A received 30 < gate 30",
+                violation_messages="phase A sent 29 < gate 30",
                 start_unix="2",
             ),
             self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="3"),
@@ -475,6 +476,28 @@ class LaunchSoakSummaryTests(unittest.TestCase):
         self.assertIn("Overall verdict: **GO**", md)
         self.assertIn("aggregate Phase A sent: **118/120**", md)
         self.assertIn("aggregate Phase A SLO: **PASS**", md)
+
+    def test_write_summary_rejects_malformed_phase_a_violation_message(self) -> None:
+        rows = [
+            self._make_row(
+                verdict="NO-GO",
+                phase_a_sent=29,
+                phase_a_received=30,
+                violation_messages="phase A received 30 < gate 30",
+                start_unix="1",
+            ),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="2"),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="3"),
+            self._make_row(phase_a_sent=30, phase_a_received=30, start_unix="4"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            passed = self.soak.write_summary(Path(tmp), "broad-launch", rows)
+            md = (Path(tmp) / "summary.md").read_text(encoding="utf-8")
+
+        self.assertFalse(passed, md)
+        self.assertIn("aggregate Phase A SLO: **PASS**", md)
+        self.assertIn("tolerated phase-A tail windows: **none**", md)
+        self.assertIn("effective failed windows: **1**", md)
 
     def test_aggregate_phase_a_just_below_98_percent_fails(self) -> None:
         # 4 windows: 29, 29, 29, 30 sent → 117/120 = 97.5% < 98% SLO.

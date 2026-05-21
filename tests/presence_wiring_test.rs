@@ -5,6 +5,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+use saorsa_gossip_identity::MlDsaKeyPair;
+use saorsa_gossip_presence::PresenceMessage;
 use saorsa_gossip_types::{PeerId, PresenceRecord};
 use tempfile::TempDir;
 use x0x::identity::{AgentId, MachineId};
@@ -159,17 +161,26 @@ async fn test_online_agents_uses_presence_beacon_liveness() -> Result<(), Box<dy
         })
         .await;
 
-    agent
+    let peer_id = PeerId::new(peer_bytes);
+    let mut record = PresenceRecord::new([3u8; 32], Vec::new(), 300);
+    let signing_key = MlDsaKeyPair::generate().unwrap();
+    record.signature = signing_key.sign(&record.signable_bytes()).unwrap();
+    record.signer_pubkey = signing_key.public_key.clone();
+    let message = PresenceMessage::Beacon {
+        topic_id: x0x::presence::global_presence_topic(),
+        sender: peer_id,
+        record,
+        epoch: 0,
+    };
+    let data = postcard::to_stdvec(&message).unwrap();
+    let source = agent
         .presence_system()
         .unwrap()
         .manager()
-        .handle_beacon(
-            x0x::presence::global_presence_topic(),
-            PeerId::new(peer_bytes),
-            PresenceRecord::new([3u8; 32], Vec::new(), 300),
-        )
+        .handle_presence_message(&data)
         .await
         .unwrap();
+    assert_eq!(source, Some(peer_id));
 
     let online = agent.online_agents().await.unwrap();
     let refreshed = online

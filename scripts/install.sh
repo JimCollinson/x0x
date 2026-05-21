@@ -128,7 +128,9 @@ echo "  Install:  $BIN"
 
 ARCHIVE="x0x-${PLATFORM}.tar.gz"
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+NEW_XOXD=""
+NEW_XOX=""
+trap 'rm -rf "$TMP"; rm -f "$NEW_XOXD" "$NEW_XOX"' EXIT
 
 echo "Downloading..."
 if command -v curl >/dev/null 2>&1; then
@@ -152,15 +154,22 @@ http_get() {
 mkdir -p "$BIN"
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 
-INSTALLED=""
 for bin in x0xd x0x; do
     SRC="$TMP/x0x-${PLATFORM}/$bin"
-    if [ -f "$SRC" ]; then
-        cp "$SRC" "$BIN/$bin"
-        chmod +x "$BIN/$bin"
-        INSTALLED="$INSTALLED $bin"
+    if [ ! -f "$SRC" ] || [ -L "$SRC" ] || [ ! -x "$SRC" ]; then
+        echo "Error: release archive missing executable $bin" >&2
+        exit 1
     fi
 done
+
+NEW_XOXD="$BIN/x0xd.new.$$"
+NEW_XOX="$BIN/x0x.new.$$"
+cp "$TMP/x0x-${PLATFORM}/x0xd" "$NEW_XOXD"
+cp "$TMP/x0x-${PLATFORM}/x0x" "$NEW_XOX"
+chmod +x "$NEW_XOXD" "$NEW_XOX"
+mv "$NEW_XOXD" "$BIN/x0xd"
+mv "$NEW_XOX" "$BIN/x0x"
+INSTALLED=" x0xd x0x"
 echo "Installed:$INSTALLED"
 
 # Clean up stale x0x-bootstrap binary (removed in v0.8.0)

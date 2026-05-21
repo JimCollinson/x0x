@@ -171,6 +171,119 @@ esac
             self.assertIn("instance name must start with alphanumeric", output)
             self.assertNotIn("Downloading", output)
 
+    def test_missing_daemon_binary_fails_before_starting_stale_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fake_bin = tmp / "fake-bin"
+            archive_dir = tmp / "archive" / f"x0x-{PLATFORM}"
+            home = tmp / "home"
+            data_home = tmp / "data"
+            install_bin = home / ".local" / "bin"
+            archive = tmp / f"x0x-{PLATFORM}.tar.gz"
+            nohup_calls = tmp / "nohup-calls.log"
+
+            fake_bin.mkdir()
+            archive_dir.mkdir(parents=True)
+            install_bin.mkdir(parents=True)
+
+            write_executable(
+                fake_bin / "uname",
+                """#!/usr/bin/env sh
+case "$1" in
+    -s) echo Linux ;;
+    -m) echo x86_64 ;;
+    *) exit 1 ;;
+esac
+""",
+            )
+
+            write_executable(
+                fake_bin / "nohup",
+                """#!/usr/bin/env sh
+printf '%s\\n' "$*" >> "$NOHUP_CALLS"
+exit 0
+""",
+            )
+
+            write_executable(
+                fake_bin / "sleep",
+                """#!/usr/bin/env sh
+:
+""",
+            )
+
+            write_executable(
+                archive_dir / "x0x",
+                """#!/usr/bin/env sh
+printf '%s\\n' new-cli
+""",
+            )
+
+            stale_cli = """#!/usr/bin/env sh
+exit 0
+"""
+            stale_daemon = """#!/usr/bin/env sh
+printf '%s\\n' stale-daemon
+"""
+            write_executable(install_bin / "x0x", stale_cli)
+            write_executable(install_bin / "x0xd", stale_daemon)
+
+            with tarfile.open(archive, "w:gz") as tar:
+                tar.add(archive_dir / "x0x", arcname=f"x0x-{PLATFORM}/x0x")
+
+            write_executable(
+                fake_bin / "curl",
+                f"""#!/usr/bin/env sh
+OUT=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) shift; OUT="$1" ;;
+    esac
+    shift
+done
+if [ -n "$OUT" ]; then
+    cp "{archive}" "$OUT"
+    exit 0
+fi
+exit 1
+""",
+            )
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "XDG_DATA_HOME": str(data_home),
+                    "PATH": f"{fake_bin}{os.pathsep}{env.get('PATH', '')}",
+                    "TMPDIR": str(tmp),
+                    "NOHUP_CALLS": str(nohup_calls),
+                }
+            )
+
+            result = subprocess.run(
+                ["sh", str(INSTALL_SH)],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+            )
+
+            output = result.stderr + result.stdout
+            self.assertNotEqual(result.returncode, 0, output)
+            self.assertIn("release archive missing executable x0xd", output)
+            self.assertNotIn("Installed:", output)
+            self.assertNotIn("Starting:", output)
+            self.assertFalse(nohup_calls.exists())
+            self.assertEqual(
+                (install_bin / "x0x").read_text(encoding="utf-8"),
+                stale_cli,
+            )
+            self.assertEqual(
+                (install_bin / "x0xd").read_text(encoding="utf-8"),
+                stale_daemon,
+            )
+
     def test_unhealthy_daemon_fails_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

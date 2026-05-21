@@ -1,12 +1,20 @@
 //! CRDT Partition Tolerance Tests
 //!
 //! Verifies that CRDTs repair correctly after network partitions and message loss.
-//! Tests anti-entropy, IBLT reconciliation, and eventual consistency.
+//! Tests direct state merges, delta-based anti-entropy repair, and eventual consistency.
 
+use anyhow::{anyhow, ensure, Result};
+use saorsa_gossip_crdt_sync::{AntiEntropyManager, DeltaCrdt};
 use saorsa_gossip_types::PeerId;
-use std::time::{SystemTime, UNIX_EPOCH};
-use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
+use x0x::crdt::{TaskId, TaskItem, TaskList, TaskListDelta, TaskListId, TaskMetadata};
 use x0x::identity::AgentId;
+
+type AntiEntropyFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 /// Helper to create unique agent ID
 fn agent_id(n: u8) -> AgentId {
@@ -58,6 +66,138 @@ fn unix_timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn anti_entropy_callback(
+    target: Arc<AntiEntropyManager<TaskList>>,
+    sender: PeerId,
+) -> impl Fn(PeerId, TaskListDelta) -> AntiEntropyFuture + Send + Sync + 'static {
+    move |_target_peer, delta| {
+        let target = Arc::clone(&target);
+        Box::pin(async move { target.apply_delta(sender, &delta, delta.version).await })
+    }
+}
+
+async fn generated_delta(
+    replica: &Arc<RwLock<TaskList>>,
+    since_version: u64,
+) -> Result<TaskListDelta> {
+    let list = replica.read().await;
+    DeltaCrdt::delta(&*list, since_version)
+        .ok_or_else(|| anyhow!("expected a delta since version {since_version}"))
+}
+
+fn has_exact_tasks(replica: &TaskList, task_ids: &[TaskId]) -> bool {
+    replica.tasks_ordered().len() == task_ids.len()
+        && task_ids
+            .iter()
+            .all(|task_id| replica.get_task(task_id).is_some())
+}
+
+async fn wait_for_convergence(
+    replica_a: &Arc<RwLock<TaskList>>,
+    replica_b: &Arc<RwLock<TaskList>>,
+    task_ids: &[TaskId],
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+
+    loop {
+        let converged = {
+            let a = replica_a.read().await;
+            let b = replica_b.read().await;
+            has_exact_tasks(&a, task_ids) && has_exact_tasks(&b, task_ids)
+        };
+
+        if converged {
+            return true;
+        }
+
+        if Instant::now() >= deadline {
+            return false;
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Test 0: Dropped delta repaired through anti-entropy.
+///
+/// Scenario: A normal update is omitted during a partition. When the partition
+/// heals, the production anti-entropy manager generates and applies deltas until
+/// both task lists converge without using full-state TaskList::merge as repair.
+#[tokio::test]
+async fn test_anti_entropy_repairs_dropped_delta() -> Result<()> {
+    let task_list_id = list_id(6);
+    let peer_a = peer_id(1);
+    let peer_b = peer_id(2);
+
+    let replica_a = Arc::new(RwLock::new(TaskList::new(
+        task_list_id,
+        "Anti-Entropy".to_string(),
+        peer_a,
+    )));
+    let replica_b = Arc::new(RwLock::new(TaskList::new(
+        task_list_id,
+        "Anti-Entropy".to_string(),
+        peer_b,
+    )));
+
+    let anti_entropy_a = Arc::new(AntiEntropyManager::new(Arc::clone(&replica_a), 1));
+    let anti_entropy_b = Arc::new(AntiEntropyManager::new(Arc::clone(&replica_b), 1));
+
+    anti_entropy_a.add_peer(peer_b).await;
+    anti_entropy_b.add_peer(peer_a).await;
+
+    {
+        let mut a = replica_a.write().await;
+        let task = TaskItem::new(
+            task_id(1),
+            metadata("Delivered before partition", 1),
+            peer_a,
+        );
+        a.add_task(task, peer_a, 1)?;
+    }
+
+    let delivered_delta = generated_delta(&replica_a, 0).await?;
+    anti_entropy_b
+        .apply_delta(peer_a, &delivered_delta, delivered_delta.version)
+        .await?;
+
+    {
+        let mut a = replica_a.write().await;
+        let task = TaskItem::new(task_id(2), metadata("Dropped during partition", 1), peer_a);
+        a.add_task(task, peer_a, 2)?;
+    }
+
+    {
+        let mut b = replica_b.write().await;
+        let task = TaskItem::new(task_id(3), metadata("Created on far side", 2), peer_b);
+        b.add_task(task, peer_b, 3)?;
+    }
+
+    {
+        let a = replica_a.read().await;
+        let b = replica_b.read().await;
+        ensure!(a.get_task(&task_id(3)).is_none());
+        ensure!(b.get_task(&task_id(2)).is_none());
+    }
+
+    anti_entropy_a
+        .start(anti_entropy_callback(Arc::clone(&anti_entropy_b), peer_a))
+        .await?;
+    anti_entropy_b
+        .start(anti_entropy_callback(Arc::clone(&anti_entropy_a), peer_b))
+        .await?;
+
+    let required_tasks = [task_id(1), task_id(2), task_id(3)];
+    let converged = wait_for_convergence(&replica_a, &replica_b, &required_tasks).await;
+
+    anti_entropy_a.stop().await?;
+    anti_entropy_b.stop().await?;
+
+    ensure!(converged, "anti-entropy repair did not converge");
+
+    Ok(())
 }
 
 /// Test 1: Simple partition - add tasks on both sides, verify merge

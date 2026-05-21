@@ -69,8 +69,10 @@ proptest! {
         let json = serde_json::to_string(&offer).unwrap();
         let parsed: FileOffer = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(parsed.transfer_id, offer.transfer_id);
+        prop_assert_eq!(parsed.filename, offer.filename);
         prop_assert_eq!(parsed.size, offer.size);
         prop_assert_eq!(parsed.sha256, offer.sha256);
+        prop_assert_eq!(parsed.chunk_size, offer.chunk_size);
         prop_assert_eq!(parsed.total_chunks, offer.total_chunks);
     }
 

@@ -24,7 +24,8 @@ async fn build_networked() -> (Agent, TempDir) {
     let agent = Agent::builder()
         .with_machine_key(tmp.path().join("machine.key"))
         .with_agent_key_path(tmp.path().join("agent.key"))
-        .with_network_config(NetworkConfig::default())
+        .with_peer_cache_disabled()
+        .with_network_config(loopback_network_config(Vec::new()))
         .build()
         .await
         .unwrap();
@@ -109,6 +110,24 @@ async fn wait_for_online_event(
         }
     }
     false
+}
+
+#[test]
+fn test_loopback_network_config_is_hermetic() {
+    let config = loopback_network_config(Vec::new());
+    assert_eq!(
+        config.bind_addr,
+        Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        "networked presence tests must bind loopback only"
+    );
+    assert!(
+        config.bootstrap_nodes.is_empty(),
+        "networked presence tests must not inherit default bootstrap peers"
+    );
+    assert!(
+        !config.port_mapping_enabled,
+        "networked presence tests must not enable port mapping"
+    );
 }
 
 // ---------------------------------------------------------------------------

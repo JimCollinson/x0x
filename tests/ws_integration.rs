@@ -538,29 +538,34 @@ async fn ws_message_ordering() {
             .expect("publish");
     }
 
-    // Receive and verify ordering
-    let mut received = Vec::new();
-    for _ in 0..n {
-        if let Some(msg) = ws_recv_text(&mut ws, 10).await {
-            received.push(msg);
+    let expected_payloads = (0..n).map(|i| format!("seq-{i:04}")).collect::<Vec<_>>();
+    let mut received_payloads = Vec::with_capacity(n);
+    for idx in 0..n {
+        let Some(frame) = ws_recv_topic_message(&mut ws, &topic, 10).await else {
+            break;
+        };
+        let decoded = frame["payload"]
+            .as_str()
+            .and_then(|payload| {
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload).ok()
+            })
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+        assert!(
+            decoded.is_some(),
+            "ordered message {idx} should contain a base64 UTF-8 payload: {frame}"
+        );
+        if let Some(decoded) = decoded {
+            received_payloads.push(decoded);
         }
     }
 
-    // Verify received messages are in order (by checking sequence in payload)
-    for window in received.windows(2) {
-        // Parse both messages and compare sequence numbers if extractable
-        // At minimum, verify we got messages in the order they were published
-        assert!(
-            !window[0].is_empty() && !window[1].is_empty(),
-            "messages should not be empty"
-        );
-    }
-
+    assert_eq!(
+        received_payloads, expected_payloads,
+        "received payloads should match the published FIFO sequence"
+    );
     assert!(
-        received.len() >= n / 2,
-        "should receive at least half of {} messages, got {}",
-        n,
-        received.len()
+        ws_recv_topic_message(&mut ws, &topic, 1).await.is_none(),
+        "received more than {n} ordered topic messages"
     );
 
     ws.close(None).await.expect("close");

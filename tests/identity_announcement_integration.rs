@@ -275,7 +275,7 @@ fn test_shard_topic_deterministic() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_shard_distribution_uniform() {
+fn test_shard_distribution_uniform() -> Result<(), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
     let n = 10_000u32;
     let mut counts: HashMap<u16, u32> = HashMap::new();
@@ -284,19 +284,22 @@ fn test_shard_distribution_uniform() {
         id_bytes[..4].copy_from_slice(&i.to_le_bytes());
         let agent_id = x0x::identity::AgentId(id_bytes);
         let topic = x0x::shard_topic_for_agent(&agent_id);
-        let shard: u16 = topic
-            .trim_start_matches("x0x.identity.shard.v2.")
-            .parse()
-            .unwrap();
+        let shard: u16 = topic.trim_start_matches("x0x.identity.shard.v2.").parse()?;
         *counts.entry(shard).or_insert(0) += 1;
     }
-    // With 65536 shards and 10000 samples, the expected count per shard is ~0.15.
-    // No single shard should account for more than 0.5% (50 out of 10000).
+    // Expected occupancy for 10000 samples over 65536 shards is ~9274 distinct shards.
+    let distinct_shards = counts.len();
+    assert!(
+        distinct_shards > 9_000,
+        "shard distribution covered too few shards: {distinct_shards} distinct shards"
+    );
+    // Keep a conservative per-shard collision ceiling as a backstop.
     let max_count = counts.values().copied().max().unwrap_or(0);
     assert!(
-        max_count <= 50,
+        max_count <= 10,
         "shard distribution too skewed: max count per shard = {max_count}"
     );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

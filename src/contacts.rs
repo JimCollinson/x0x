@@ -455,6 +455,11 @@ impl ContactStore {
             contact.machines.retain(|m| m.machine_id != *machine_id);
             let removed = contact.machines.len() < before;
             if removed {
+                if contact.identity_type == IdentityType::Pinned
+                    && !contact.machines.iter().any(|m| m.pinned)
+                {
+                    contact.identity_type = IdentityType::Known;
+                }
                 let _ = self.save();
             }
             removed

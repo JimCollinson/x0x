@@ -1067,7 +1067,7 @@ async fn named_group_creator_removal_propagates_to_removed_peer() {
 
 #[tokio::test]
 #[ignore]
-async fn invite_join_preserves_genesis_creation_nonce() {
+async fn named_group_invite_join_preserves_genesis_creation_nonce() {
     let pair = pair().await;
     let alice = &pair.alice;
     let bob = &pair.bob;

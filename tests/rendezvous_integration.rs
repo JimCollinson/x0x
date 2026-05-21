@@ -94,11 +94,18 @@ fn test_shard_assignment_deterministic() -> TestResult {
 
 /// Test 2: Shard collision resistance
 ///
-/// Verifies that 10,000 random agent IDs distribute across shards
-/// with minimal collisions (uniform distribution).
+/// Verifies that 10,000 deterministic agent IDs have an occupancy profile
+/// consistent with uniform hashing. With 65,536 shards the expected per-shard
+/// load is only 0.15, so this checks occupancy and hot-shard bounds instead of
+/// an impossible per-shard percentage deviation.
 #[test]
 fn test_shard_collision_resistance() -> TestResult {
     const SAMPLE_COUNT: u32 = 10_000;
+    // Uniform hashing expects about 9,274 occupied shards for this sample size.
+    const MIN_OCCUPIED_SHARDS: usize = 9_000;
+    const MAX_OCCUPIED_SHARDS: usize = 9_600;
+    const MAX_SHARD_LOAD: u16 = 6;
+
     let mut counts = vec![0u16; SHARD_COUNT];
 
     for seed in 0..SAMPLE_COUNT {
@@ -111,16 +118,12 @@ fn test_shard_collision_resistance() -> TestResult {
     let collisions = SAMPLE_COUNT as usize - occupied;
 
     assert!(
-        occupied >= 9_000,
-        "10,000 agent IDs should occupy at least 9,000 shards, got {occupied}"
+        (MIN_OCCUPIED_SHARDS..=MAX_OCCUPIED_SHARDS).contains(&occupied),
+        "10,000 agent IDs should occupy {MIN_OCCUPIED_SHARDS}..={MAX_OCCUPIED_SHARDS} shards, got {occupied} ({collisions} collisions)"
     );
     assert!(
-        collisions <= 1_000,
-        "too many shard collisions for 10,000 agent IDs: {collisions}"
-    );
-    assert!(
-        max_count <= 6,
-        "no shard should receive more than 6 of 10,000 deterministic IDs, got {max_count}"
+        max_count <= MAX_SHARD_LOAD,
+        "no shard should receive more than {MAX_SHARD_LOAD} of 10,000 deterministic IDs, got {max_count}"
     );
 
     Ok(())
@@ -190,6 +193,10 @@ async fn test_coordinator_failover() {
 fn test_shard_load_balancing() -> TestResult {
     const SAMPLE_COUNT: u32 = 100_000;
     const BUCKET_COUNT: usize = 256;
+    const MAX_SHARD_LOAD: u16 = 12;
+    // 255 degrees of freedom; loose 99.9% upper-tail bound for bucket uniformity.
+    const CHI_SQUARED_999_UPPER_BOUND: f64 = 340.0;
+
     let mut shard_counts = vec![0u16; SHARD_COUNT];
     let mut bucket_counts = [0u32; BUCKET_COUNT];
 
@@ -201,18 +208,21 @@ fn test_shard_load_balancing() -> TestResult {
 
     let max_shard_count = shard_counts.iter().copied().max().unwrap_or(0);
     let expected_per_bucket = f64::from(SAMPLE_COUNT) / BUCKET_COUNT as f64;
-    let max_bucket_deviation = bucket_counts
+    let chi_squared = bucket_counts
         .iter()
-        .map(|count| (f64::from(*count) - expected_per_bucket).abs())
-        .fold(0.0, f64::max);
+        .map(|count| {
+            let deviation = f64::from(*count) - expected_per_bucket;
+            deviation * deviation / expected_per_bucket
+        })
+        .sum::<f64>();
 
     assert!(
-        max_shard_count <= 12,
-        "no shard should receive more than 12 of 100,000 deterministic IDs, got {max_shard_count}"
+        max_shard_count <= MAX_SHARD_LOAD,
+        "no shard should receive more than {MAX_SHARD_LOAD} of 100,000 deterministic IDs, got {max_shard_count}"
     );
     assert!(
-        max_bucket_deviation <= expected_per_bucket * 0.20,
-        "256-shard buckets should stay within 20% of the mean; max deviation {max_bucket_deviation:.2}, mean {expected_per_bucket:.2}"
+        chi_squared <= CHI_SQUARED_999_UPPER_BOUND,
+        "256 coarse buckets should pass chi-squared uniformity check; statistic {chi_squared:.2}, bound {CHI_SQUARED_999_UPPER_BOUND:.2}"
     );
 
     Ok(())

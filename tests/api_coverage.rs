@@ -10,172 +10,459 @@
 use std::collections::HashSet;
 use x0x::api::{Method, ENDPOINTS};
 
-/// Every endpoint (method, path) that has a test somewhere in the test suite.
+#[derive(Clone, Copy)]
+struct CoveredEndpoint {
+    method: Method,
+    path: &'static str,
+    marker: &'static str,
+}
+
+macro_rules! covered {
+    ($method:ident, $path:literal, $marker:ident) => {
+        CoveredEndpoint {
+            method: Method::$method,
+            path: $path,
+            marker: stringify!($marker),
+        }
+    };
+    ($method:ident, $path:literal, $marker:literal) => {
+        CoveredEndpoint {
+            method: Method::$method,
+            path: $path,
+            marker: $marker,
+        }
+    };
+}
+
+/// Every endpoint (method, path) that has a marker in the test suite.
 ///
 /// When you add a new endpoint to `src/api/mod.rs:ENDPOINTS`, you MUST add a
-/// corresponding entry here AND write the actual test in `rest_coverage.rs`,
-/// `cli_coverage.rs`, or another test file.
+/// corresponding entry here AND set `marker` to the test function or external
+/// probe label that exercises it.
 ///
-/// This is deliberately manual — the failing test message tells you exactly
-/// what is missing.
-const COVERED: &[(Method, &str)] = &[
+/// This is deliberately manual, but the marker must exist outside this file so
+/// a tuple alone cannot claim coverage.
+const COVERED: &[CoveredEndpoint] = &[
     // ── Status ──────────────────────────────────────────────────────────
-    (Method::Get, "/health"),
-    (Method::Get, "/status"),
-    (Method::Post, "/shutdown"),
+    covered!(Get, "/health", daemon_api_health),
+    covered!(Get, "/status", daemon_api_status),
+    covered!(Post, "/shutdown", daemon_api_shutdown_with_sse_client),
     // ── Identity ────────────────────────────────────────────────────────
-    (Method::Get, "/agent"),
-    (Method::Post, "/announce"),
-    (Method::Get, "/agent/user-id"),
-    (Method::Get, "/agent/card"),
-    (Method::Get, "/introduction"),
-    (Method::Post, "/agent/card/import"),
+    covered!(Get, "/agent", daemon_api_agent),
+    covered!(Post, "/announce", daemon_api_announce),
+    covered!(Get, "/agent/user-id", "GET /agent/user-id"),
+    covered!(Get, "/agent/card", "GET /agent/card"),
+    covered!(Get, "/introduction", "GET /introduction"),
+    covered!(
+        Post,
+        "/agent/card/import",
+        daemon_api_import_card_invalid_trust_level_rejected
+    ),
     // ── Network ─────────────────────────────────────────────────────────
-    (Method::Get, "/peers"),
+    covered!(Get, "/peers", daemon_api_peers),
     // ── Presence ────────────────────────────────────────────────────────
-    (Method::Get, "/presence"),
-    (Method::Get, "/presence/online"),
-    (Method::Get, "/presence/foaf"),
-    (Method::Get, "/presence/find/:id"),
-    (Method::Get, "/presence/status/:id"),
-    (Method::Get, "/presence/events"),
+    covered!(Get, "/presence", "GET /presence"),
+    covered!(Get, "/presence/online", "GET /presence/online"),
+    covered!(Get, "/presence/foaf", "presence/foaf body shape"),
+    covered!(Get, "/presence/find/:id", "GET /presence/find/:id"),
+    covered!(Get, "/presence/status/:id", "GET /presence/status/:id"),
+    covered!(Get, "/presence/events", "GET /presence/events"),
     // ── Network (cont.) ─────────────────────────────────────────────────
-    (Method::Get, "/network/status"),
-    (Method::Get, "/network/bootstrap-cache"),
-    (Method::Get, "/diagnostics/connectivity"),
-    (Method::Get, "/diagnostics/ack"),
-    (Method::Get, "/diagnostics/gossip"),
-    (Method::Get, "/diagnostics/dm"),
-    (Method::Get, "/diagnostics/groups"),
-    (Method::Get, "/diagnostics/exec"),
-    (Method::Post, "/peers/:peer_id/probe"),
-    (Method::Get, "/peers/:peer_id/health"),
-    (Method::Get, "/peers/events"),
+    covered!(Get, "/network/status", daemon_api_network_status),
+    covered!(Get, "/network/bootstrap-cache", daemon_api_bootstrap_cache),
+    covered!(
+        Get,
+        "/diagnostics/connectivity",
+        daemon_api_diagnostics_connectivity
+    ),
+    covered!(Get, "/diagnostics/ack", daemon_api_diagnostics_ack),
+    covered!(
+        Get,
+        "/diagnostics/gossip",
+        "/diagnostics/gossip endpoint proves"
+    ),
+    covered!(Get, "/diagnostics/dm", daemon_api_diagnostics_dm),
+    covered!(
+        Get,
+        "/diagnostics/groups",
+        member_joined_event_propagates_to_inviter
+    ),
+    covered!(Get, "/diagnostics/exec", daemon_api_diagnostics_exec),
+    covered!(
+        Post,
+        "/peers/:peer_id/probe",
+        peer_probe_returns_finite_rtt_against_live_peer
+    ),
+    covered!(
+        Get,
+        "/peers/:peer_id/health",
+        peer_health_snapshot_observable_for_live_peer
+    ),
+    covered!(
+        Get,
+        "/peers/events",
+        peer_events_sse_emits_established_on_new_connection
+    ),
     // ── Messaging ───────────────────────────────────────────────────────
-    (Method::Post, "/publish"),
-    (Method::Post, "/subscribe"),
-    (Method::Delete, "/subscribe/:id"),
-    (Method::Get, "/events"),
+    covered!(Post, "/publish", daemon_api_subscribe_publish),
+    covered!(Post, "/subscribe", daemon_api_subscribe_publish),
+    covered!(Delete, "/subscribe/:id", daemon_api_unsubscribe),
+    covered!(Get, "/events", daemon_api_events_sse),
     // ── Discovery ───────────────────────────────────────────────────────
-    (Method::Get, "/agents/discovered"),
-    (Method::Get, "/agents/discovered/:agent_id"),
-    (Method::Get, "/agents/:agent_id/machine"),
-    (Method::Get, "/machines/discovered"),
-    (Method::Get, "/machines/discovered/:machine_id"),
-    (Method::Get, "/agents/reachability/:agent_id"),
-    (Method::Post, "/agents/find/:agent_id"),
-    (Method::Get, "/users/:user_id/agents"),
-    (Method::Get, "/users/:user_id/machines"),
+    covered!(Get, "/agents/discovered", daemon_api_discovered_agents),
+    covered!(
+        Get,
+        "/agents/discovered/:agent_id",
+        "GET /agents/discovered/:id"
+    ),
+    covered!(
+        Get,
+        "/agents/:agent_id/machine",
+        machine_for_agent_returns_linked_endpoint
+    ),
+    covered!(Get, "/machines/discovered", gui_api_paths_exist_in_registry),
+    covered!(
+        Get,
+        "/machines/discovered/:machine_id",
+        gui_api_paths_exist_in_registry
+    ),
+    covered!(
+        Get,
+        "/agents/reachability/:agent_id",
+        daemon_api_reachability_unknown
+    ),
+    covered!(
+        Post,
+        "/agents/find/:agent_id",
+        daemon_api_find_agent_unknown
+    ),
+    covered!(Get, "/users/:user_id/agents", daemon_api_agents_by_user),
+    covered!(
+        Get,
+        "/users/:user_id/machines",
+        gui_api_paths_exist_in_registry
+    ),
     // ── Contacts ────────────────────────────────────────────────────────
-    (Method::Get, "/contacts"),
-    (Method::Post, "/contacts"),
-    (Method::Post, "/contacts/trust"),
-    (Method::Patch, "/contacts/:agent_id"),
-    (Method::Delete, "/contacts/:agent_id"),
-    (Method::Post, "/contacts/:agent_id/revoke"),
-    (Method::Get, "/contacts/:agent_id/revocations"),
+    covered!(Get, "/contacts", daemon_api_list_contacts),
+    covered!(Post, "/contacts", daemon_api_add_contact),
+    covered!(Post, "/contacts/trust", daemon_api_quick_trust),
+    covered!(Patch, "/contacts/:agent_id", daemon_api_update_contact),
+    covered!(Delete, "/contacts/:agent_id", daemon_api_delete_contact),
+    covered!(
+        Post,
+        "/contacts/:agent_id/revoke",
+        daemon_api_revoke_contact
+    ),
+    covered!(
+        Get,
+        "/contacts/:agent_id/revocations",
+        daemon_api_list_revocations
+    ),
     // ── Machines ────────────────────────────────────────────────────────
-    (Method::Get, "/contacts/:agent_id/machines"),
-    (Method::Post, "/contacts/:agent_id/machines"),
-    (Method::Delete, "/contacts/:agent_id/machines/:machine_id"),
-    (Method::Post, "/contacts/:agent_id/machines/:machine_id/pin"),
-    (
-        Method::Delete,
+    covered!(Get, "/contacts/:agent_id/machines", "machines GET"),
+    covered!(Post, "/contacts/:agent_id/machines", daemon_api_add_machine),
+    covered!(
+        Delete,
+        "/contacts/:agent_id/machines/:machine_id",
+        "DELETE /contacts/:id/machines/:mid"
+    ),
+    covered!(
+        Post,
         "/contacts/:agent_id/machines/:machine_id/pin",
+        daemon_api_pin_unpin_machine
+    ),
+    covered!(
+        Delete,
+        "/contacts/:agent_id/machines/:machine_id/pin",
+        daemon_api_pin_unpin_machine
     ),
     // ── Trust ───────────────────────────────────────────────────────────
-    (Method::Post, "/trust/evaluate"),
+    covered!(Post, "/trust/evaluate", daemon_api_evaluate_trust),
     // ── Direct messaging ────────────────────────────────────────────────
-    (Method::Post, "/agents/connect"),
-    (Method::Post, "/machines/connect"),
-    (Method::Post, "/direct/send"),
-    (Method::Get, "/direct/connections"),
-    (Method::Get, "/direct/events"),
+    covered!(Post, "/agents/connect", daemon_api_connect_unknown),
+    covered!(Post, "/machines/connect", gui_api_paths_exist_in_registry),
+    covered!(Post, "/direct/send", daemon_api_direct_send_not_found),
+    covered!(Get, "/direct/connections", daemon_api_direct_connections),
+    covered!(Get, "/direct/events", daemon_api_direct_events_sse),
     // ── Exec ───────────────────────────────────────────────────────────
-    (Method::Post, "/exec/run"),
-    (Method::Post, "/exec/cancel"),
-    (Method::Get, "/exec/sessions"),
+    covered!(Post, "/exec/run", daemon_api_exec_run_bad_agent_id),
+    covered!(Post, "/exec/cancel", daemon_api_exec_cancel_bad_request_id),
+    covered!(Get, "/exec/sessions", daemon_api_exec_sessions),
     // ── MLS groups ──────────────────────────────────────────────────────
-    (Method::Post, "/mls/groups"),
-    (Method::Get, "/mls/groups"),
-    (Method::Get, "/mls/groups/:id"),
-    (Method::Post, "/mls/groups/:id/members"),
-    (Method::Delete, "/mls/groups/:id/members/:agent_id"),
-    (Method::Post, "/mls/groups/:id/encrypt"),
-    (Method::Post, "/mls/groups/:id/decrypt"),
-    (Method::Post, "/mls/groups/:id/welcome"),
+    covered!(Post, "/mls/groups", daemon_api_create_group),
+    covered!(Get, "/mls/groups", daemon_api_list_groups),
+    covered!(Get, "/mls/groups/:id", daemon_api_get_group),
+    covered!(Post, "/mls/groups/:id/members", daemon_api_add_member),
+    covered!(
+        Delete,
+        "/mls/groups/:id/members/:agent_id",
+        daemon_api_remove_member
+    ),
+    covered!(Post, "/mls/groups/:id/encrypt", daemon_api_encrypt_decrypt),
+    covered!(Post, "/mls/groups/:id/decrypt", daemon_api_encrypt_decrypt),
+    covered!(Post, "/mls/groups/:id/welcome", daemon_api_mls_welcome),
     // ── Named groups ────────────────────────────────────────────────────
-    (Method::Post, "/groups"),
-    (Method::Get, "/groups"),
-    (Method::Get, "/groups/:id"),
-    (Method::Get, "/groups/:id/members"),
-    (Method::Post, "/groups/:id/members"),
-    (Method::Delete, "/groups/:id/members/:agent_id"),
+    covered!(
+        Post,
+        "/groups",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(Get, "/groups", "GET /groups"),
+    covered!(
+        Get,
+        "/groups/:id",
+        d4_join_request_events_converge_via_signed_commits
+    ),
+    covered!(
+        Get,
+        "/groups/:id/members",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Post,
+        "/groups/:id/members",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Delete,
+        "/groups/:id/members/:agent_id",
+        d4_stateful_events_converge_via_signed_commits
+    ),
     // ── Phase E: public-group messaging ─────────────────────────────────
-    (Method::Post, "/groups/:id/send"),
-    (Method::Get, "/groups/:id/messages"),
-    (Method::Post, "/groups/:id/invite"),
-    (Method::Post, "/groups/join"),
-    (Method::Put, "/groups/:id/display-name"),
-    (Method::Delete, "/groups/:id"),
+    covered!(
+        Post,
+        "/groups/:id/send",
+        e_moderated_public_positive_cross_daemon_receive
+    ),
+    covered!(
+        Get,
+        "/groups/:id/messages",
+        e_moderated_public_positive_cross_daemon_receive
+    ),
+    covered!(
+        Post,
+        "/groups/:id/invite",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Post,
+        "/groups/join",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Put,
+        "/groups/:id/display-name",
+        "PUT /groups/:id/display-name"
+    ),
+    covered!(
+        Delete,
+        "/groups/:id",
+        d4_stateful_events_converge_via_signed_commits
+    ),
     // ── Named groups: policy/roles/requests/discovery ───────────────────
-    (Method::Patch, "/groups/:id"),
-    (Method::Patch, "/groups/:id/policy"),
-    (Method::Patch, "/groups/:id/members/:agent_id/role"),
-    (Method::Post, "/groups/:id/ban/:agent_id"),
-    (Method::Delete, "/groups/:id/ban/:agent_id"),
-    (Method::Get, "/groups/:id/requests"),
-    (Method::Post, "/groups/:id/requests"),
-    (Method::Post, "/groups/:id/requests/:request_id/approve"),
-    (Method::Post, "/groups/:id/requests/:request_id/reject"),
-    (Method::Delete, "/groups/:id/requests/:request_id"),
-    (Method::Get, "/groups/discover"),
+    covered!(
+        Patch,
+        "/groups/:id",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Patch,
+        "/groups/:id/policy",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Patch,
+        "/groups/:id/members/:agent_id/role",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Post,
+        "/groups/:id/ban/:agent_id",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Delete,
+        "/groups/:id/ban/:agent_id",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Get,
+        "/groups/:id/requests",
+        d4_join_request_events_converge_via_signed_commits
+    ),
+    covered!(
+        Post,
+        "/groups/:id/requests",
+        d4_join_request_events_converge_via_signed_commits
+    ),
+    covered!(
+        Post,
+        "/groups/:id/requests/:request_id/approve",
+        d4_join_request_events_converge_via_signed_commits
+    ),
+    covered!(
+        Post,
+        "/groups/:id/requests/:request_id/reject",
+        d4_join_request_events_converge_via_signed_commits
+    ),
+    covered!(
+        Delete,
+        "/groups/:id/requests/:request_id",
+        d4_join_request_events_converge_via_signed_commits
+    ),
+    covered!(
+        Get,
+        "/groups/discover",
+        c2_publicdirectory_discovered_via_shard_only_nearby_witness
+    ),
     // ── Phase C.2: shard discovery ──────────────────────────────────────
-    (Method::Get, "/groups/discover/nearby"),
-    (Method::Get, "/groups/discover/subscriptions"),
-    (Method::Post, "/groups/discover/subscribe"),
-    (Method::Delete, "/groups/discover/subscribe/:kind/:shard"),
-    (Method::Get, "/groups/cards/:id"),
-    (Method::Post, "/groups/cards/import"),
-    (Method::Post, "/groups/:id/secure/encrypt"),
-    (Method::Post, "/groups/:id/secure/decrypt"),
-    (Method::Post, "/groups/:id/secure/reseal"),
-    (Method::Post, "/groups/secure/open-envelope"),
+    covered!(
+        Get,
+        "/groups/discover/nearby",
+        c2_publicdirectory_discovered_via_shard_only_nearby_witness
+    ),
+    covered!(
+        Get,
+        "/groups/discover/subscriptions",
+        c2_publicdirectory_discovered_via_shard_only_nearby_witness
+    ),
+    covered!(
+        Post,
+        "/groups/discover/subscribe",
+        c2_publicdirectory_discovered_via_shard_only_nearby_witness
+    ),
+    covered!(
+        Delete,
+        "/groups/discover/subscribe/:kind/:shard",
+        "BDEL /groups/discover/subscribe/tag/$SUB_SHARD"
+    ),
+    covered!(
+        Get,
+        "/groups/cards/:id",
+        c2_publicdirectory_discovered_via_shard_only_nearby_witness
+    ),
+    covered!(
+        Post,
+        "/groups/cards/import",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Post,
+        "/groups/:id/secure/encrypt",
+        "/groups/$GID_D2/secure/encrypt"
+    ),
+    covered!(
+        Post,
+        "/groups/:id/secure/decrypt",
+        "/groups/$GID_D2_REMOTE/secure/decrypt"
+    ),
+    covered!(
+        Post,
+        "/groups/:id/secure/reseal",
+        "/groups/$GID_ADV/secure/reseal"
+    ),
+    covered!(
+        Post,
+        "/groups/secure/open-envelope",
+        "/groups/secure/open-envelope rejects random-bytes envelope"
+    ),
     // ── Phase D.3: state-commit chain ───────────────────────────────────
-    (Method::Get, "/groups/:id/state"),
-    (Method::Post, "/groups/:id/state/seal"),
-    (Method::Post, "/groups/:id/state/withdraw"),
+    covered!(
+        Get,
+        "/groups/:id/state",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Post,
+        "/groups/:id/state/seal",
+        d4_stateful_events_converge_via_signed_commits
+    ),
+    covered!(
+        Post,
+        "/groups/:id/state/withdraw",
+        c2_late_subscriber_recovers_via_digest_pull_without_republish
+    ),
     // ── Task lists ──────────────────────────────────────────────────────
-    (Method::Get, "/task-lists"),
-    (Method::Post, "/task-lists"),
-    (Method::Get, "/task-lists/:id/tasks"),
-    (Method::Post, "/task-lists/:id/tasks"),
-    (Method::Patch, "/task-lists/:id/tasks/:tid"),
+    covered!(Get, "/task-lists", daemon_api_list_tasks),
+    covered!(Post, "/task-lists", daemon_api_create_task_list),
+    covered!(Get, "/task-lists/:id/tasks", "GET /task-lists/:id/tasks"),
+    covered!(Post, "/task-lists/:id/tasks", daemon_api_add_task),
+    covered!(Patch, "/task-lists/:id/tasks/:tid", daemon_api_claim_task),
     // ── Key-value stores ────────────────────────────────────────────────
-    (Method::Get, "/stores"),
-    (Method::Post, "/stores"),
-    (Method::Post, "/stores/:id/join"),
-    (Method::Get, "/stores/:id/keys"),
-    (Method::Put, "/stores/:id/:key"),
-    (Method::Get, "/stores/:id/:key"),
-    (Method::Delete, "/stores/:id/:key"),
+    covered!(Get, "/stores", "GET /stores"),
+    covered!(Post, "/stores", "POST /stores"),
+    covered!(Post, "/stores/:id/join", "POST /stores/:id/join"),
+    covered!(Get, "/stores/:id/keys", "GET /stores/:id/keys"),
+    covered!(Put, "/stores/:id/:key", "PUT /stores/:id/:key"),
+    covered!(Get, "/stores/:id/:key", "GET /stores/:id/:key"),
+    covered!(Delete, "/stores/:id/:key", "DELETE /stores/:id/:key"),
     // ── Files ───────────────────────────────────────────────────────────
-    (Method::Post, "/files/send"),
-    (Method::Get, "/files/transfers"),
-    (Method::Get, "/files/transfers/:id"),
-    (Method::Post, "/files/accept/:id"),
-    (Method::Post, "/files/reject/:id"),
+    covered!(Post, "/files/send", "POST /files/send"),
+    covered!(Get, "/files/transfers", "GET /files/transfers"),
+    covered!(Get, "/files/transfers/:id", "GET /files/transfers/:id"),
+    covered!(Post, "/files/accept/:id", "POST /files/accept/:id"),
+    covered!(Post, "/files/reject/:id", "POST /files/reject/:id"),
     // ── Constitution ────────────────────────────────────────────────────
-    (Method::Get, "/constitution"),
-    (Method::Get, "/constitution/json"),
+    covered!(Get, "/constitution", "GET /constitution"),
+    covered!(Get, "/constitution/json", "GET /constitution/json"),
     // ── Upgrade ─────────────────────────────────────────────────────────
-    (Method::Get, "/upgrade"),
-    (Method::Post, "/upgrade/apply"),
+    covered!(Get, "/upgrade", daemon_api_upgrade_check),
+    covered!(Post, "/upgrade/apply", "gui-upgrade-apply"),
     // ── WebSocket ───────────────────────────────────────────────────────
-    (Method::Get, "/ws"),
-    (Method::Get, "/ws/direct"),
-    (Method::Get, "/ws/sessions"),
-    (Method::Get, "/gui"),
+    covered!(Get, "/ws", daemon_api_ws_connect),
+    covered!(Get, "/ws/direct", ws_direct_endpoint),
+    covered!(Get, "/ws/sessions", daemon_api_ws_sessions),
+    covered!(Get, "/gui", gui_html_contains_brand),
+];
+
+const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
+    (
+        "tests/daemon_api_integration.rs",
+        include_str!("daemon_api_integration.rs"),
+    ),
+    (
+        "tests/peer_lifecycle_integration.rs",
+        include_str!("peer_lifecycle_integration.rs"),
+    ),
+    (
+        "tests/named_group_d4_apply.rs",
+        include_str!("named_group_d4_apply.rs"),
+    ),
+    (
+        "tests/named_group_c2_live.rs",
+        include_str!("named_group_c2_live.rs"),
+    ),
+    (
+        "tests/named_group_e_live.rs",
+        include_str!("named_group_e_live.rs"),
+    ),
+    (
+        "tests/named_group_join_metadata_event.rs",
+        include_str!("named_group_join_metadata_event.rs"),
+    ),
+    (
+        "tests/connectivity_test.rs",
+        include_str!("connectivity_test.rs"),
+    ),
+    ("tests/gui_smoke.rs", include_str!("gui_smoke.rs")),
+    ("tests/ws_integration.rs", include_str!("ws_integration.rs")),
+    ("tests/e2e_full_audit.sh", include_str!("e2e_full_audit.sh")),
+    (
+        "tests/e2e_comprehensive.sh",
+        include_str!("e2e_comprehensive.sh"),
+    ),
+    (
+        "tests/e2e_named_groups.sh",
+        include_str!("e2e_named_groups.sh"),
+    ),
+    (
+        "tests/e2e_stress_gossip.sh",
+        include_str!("e2e_stress_gossip.sh"),
+    ),
+    (
+        "tests/e2e_gui_chrome.mjs",
+        include_str!("e2e_gui_chrome.mjs"),
+    ),
 ];
 
 /// Verifies every endpoint in the ENDPOINTS registry has a corresponding
@@ -183,8 +470,10 @@ const COVERED: &[(Method, &str)] = &[
 /// endpoints when a new endpoint is added without test coverage.
 #[test]
 fn all_endpoints_covered() {
-    let covered: HashSet<(String, &str)> =
-        COVERED.iter().map(|(m, p)| (format!("{m}"), *p)).collect();
+    let covered: HashSet<(String, &str)> = COVERED
+        .iter()
+        .map(|entry| (format!("{}", entry.method), entry.path))
+        .collect();
 
     let mut missing = Vec::new();
     for ep in ENDPOINTS {
@@ -201,7 +490,23 @@ fn all_endpoints_covered() {
         missing.is_empty(),
         "\n\nEndpoints missing test coverage ({} missing):\n{}\n\n\
          To fix: add the endpoint to COVERED in tests/api_coverage.rs\n\
-         AND write the actual test in tests/rest_coverage.rs\n",
+         AND point it at a real test marker outside tests/api_coverage.rs\n",
+        missing.len(),
+        missing.join("\n")
+    );
+}
+
+/// Verifies every COVERED entry points at a real test function or probe label
+/// outside this file, so a tuple in this guardian cannot claim coverage alone.
+#[test]
+fn covered_entries_reference_real_test_markers() {
+    let missing = missing_coverage_markers(COVERED, COVERAGE_MARKER_SOURCES);
+
+    assert!(
+        missing.is_empty(),
+        "\n\nCoverage entries without real test markers ({} missing):\n{}\n\n\
+         To fix: add or rename the endpoint's marker in the actual test/probe \
+         source, not only in tests/api_coverage.rs\n",
         missing.len(),
         missing.join("\n")
     );
@@ -218,10 +523,10 @@ fn no_stale_coverage_entries() {
         .collect();
 
     let mut stale = Vec::new();
-    for (method, path) in COVERED {
-        let key = (format!("{method}"), *path);
+    for entry in COVERED {
+        let key = (format!("{}", entry.method), entry.path);
         if !endpoints.contains(&key) {
-            stale.push(format!("  {method} {path}"));
+            stale.push(format!("  {} {}", entry.method, entry.path));
         }
     }
 
@@ -238,10 +543,10 @@ fn no_stale_coverage_entries() {
 fn no_duplicate_coverage_entries() {
     let mut seen = HashSet::new();
     let mut dupes = Vec::new();
-    for (method, path) in COVERED {
-        let key = (format!("{method}"), *path);
+    for entry in COVERED {
+        let key = (format!("{}", entry.method), entry.path);
         if !seen.insert(key.clone()) {
-            dupes.push(format!("  {method} {path}"));
+            dupes.push(format!("  {} {}", entry.method, entry.path));
         }
     }
 
@@ -262,6 +567,98 @@ fn coverage_count_matches_endpoint_count() {
         COVERED.len(),
         ENDPOINTS.len()
     );
+}
+
+#[test]
+fn missing_marker_detection_rejects_tuple_without_test_marker() {
+    let declared = [covered!(Get, "/health", missing_health_marker)];
+    let sources = [(
+        "tests/fake_endpoint_test.rs",
+        "#[test]\nfn real_test() {}\n",
+    )];
+
+    assert_eq!(
+        missing_coverage_markers(&declared, &sources),
+        vec![String::from(
+            r#"  GET /health -> marker "missing_health_marker""#
+        )]
+    );
+}
+
+fn missing_coverage_markers(covered: &[CoveredEndpoint], sources: &[(&str, &str)]) -> Vec<String> {
+    let rust_test_symbols = collect_rust_test_symbols(sources);
+
+    covered
+        .iter()
+        .filter(|entry| !coverage_marker_exists(entry.marker, sources, &rust_test_symbols))
+        .map(|entry| {
+            format!(
+                r#"  {} {} -> marker "{}""#,
+                entry.method, entry.path, entry.marker
+            )
+        })
+        .collect()
+}
+
+fn coverage_marker_exists(
+    marker: &str,
+    sources: &[(&str, &str)],
+    rust_test_symbols: &HashSet<String>,
+) -> bool {
+    if is_rust_identifier(marker) {
+        return rust_test_symbols.contains(marker);
+    }
+
+    sources.iter().any(|(_, source)| source.contains(marker))
+}
+
+fn collect_rust_test_symbols(sources: &[(&str, &str)]) -> HashSet<String> {
+    let mut symbols = HashSet::new();
+
+    for (path, source) in sources {
+        if !path.ends_with(".rs") {
+            continue;
+        }
+
+        let mut pending_test_attr = false;
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("#[test]") || trimmed.starts_with("#[tokio::test]") {
+                pending_test_attr = true;
+                continue;
+            }
+
+            if pending_test_attr && trimmed.starts_with("#[") {
+                continue;
+            }
+
+            if pending_test_attr {
+                if let Some(symbol) = extract_test_fn_name(trimmed) {
+                    symbols.insert(symbol.to_string());
+                }
+                pending_test_attr = false;
+            }
+        }
+    }
+
+    symbols
+}
+
+fn extract_test_fn_name(line: &str) -> Option<&str> {
+    let line = line.strip_prefix("async ").unwrap_or(line);
+    let rest = line.strip_prefix("fn ")?;
+    let end = rest.find('(')?;
+    Some(&rest[..end])
+}
+
+fn is_rust_identifier(marker: &str) -> bool {
+    let mut chars = marker.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// Verifies all cli_name values in ENDPOINTS are unique.

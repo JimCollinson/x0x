@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Integration tests for the upgrade module.
 //!
 //! Tests ML-DSA-65 sign/verify round-trips, staged rollout distribution,

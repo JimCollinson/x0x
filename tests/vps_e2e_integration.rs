@@ -418,6 +418,10 @@ async fn test_vps_identity_announcement_and_discovery() {
         .unwrap();
     agent_b.join_network().await.unwrap();
 
+    // B is now directly connected to A; re-announce so the announcement
+    // is delivered while B's PlumTree peer set includes A.
+    agent_a.announce_identity(false, false).await.unwrap();
+
     let found = wait_for_discovery(
         &agent_b,
         agent_a.agent_id(),
@@ -553,6 +557,10 @@ async fn test_vps_user_identity_discovery() {
         .await
         .unwrap();
     agent_b.join_network().await.unwrap();
+
+    // Both A and B are now connected. Re-announce with user identity so
+    // B's PlumTree receives the user-bearing announcement.
+    agent_a.announce_identity(true, true).await.unwrap();
 
     let found = wait_for_discovery(
         &agent_b,

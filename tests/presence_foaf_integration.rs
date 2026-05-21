@@ -8,10 +8,12 @@
 
 #![allow(clippy::unwrap_used)]
 
-use std::time::Duration;
+use saorsa_gossip_types::PeerId;
+use std::{net::SocketAddr, time::Duration};
 use tempfile::TempDir;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
-use x0x::{network::NetworkConfig, Agent};
+use x0x::{identity::AgentId, network::NetworkConfig, presence::PresenceEvent, Agent};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -47,6 +49,113 @@ async fn build_offline_agent() -> (Agent, TempDir) {
         .await
         .unwrap();
     (agent, tmp)
+}
+
+fn loopback_network_config(bootstrap_nodes: Vec<SocketAddr>) -> NetworkConfig {
+    NetworkConfig {
+        bind_addr: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
+        bootstrap_nodes,
+        port_mapping_enabled: false,
+        ..NetworkConfig::default()
+    }
+}
+
+async fn build_loopback_agent(
+    tmp: &TempDir,
+    name: &str,
+    bootstrap_nodes: Vec<SocketAddr>,
+) -> Result<Option<Agent>, Box<dyn std::error::Error>> {
+    match Agent::builder()
+        .with_machine_key(tmp.path().join(format!("{name}-machine.key")))
+        .with_agent_key_path(tmp.path().join(format!("{name}-agent.key")))
+        .with_peer_cache_disabled()
+        .with_network_config(loopback_network_config(bootstrap_nodes))
+        .with_presence_beacon_interval(1)
+        .with_presence_event_poll_interval(1)
+        .build()
+        .await
+    {
+        Ok(agent) => Ok(Some(agent)),
+        Err(error) if is_network_bind_permission_error(&error) => Ok(None),
+        Err(error) => Err(Box::new(error)),
+    }
+}
+
+fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string();
+    message.contains("Operation not permitted")
+        && (message.contains("bind UDP socket")
+            || message.contains("network initialization failed"))
+}
+
+async fn wait_for_cached_agent(agent: &Agent, target: &AgentId, timeout: Duration) -> bool {
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < timeout {
+        if agent.cached_agent(target).await.is_some() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+async fn wait_for_online_event(
+    rx: &mut tokio::sync::broadcast::Receiver<PresenceEvent>,
+    target: AgentId,
+    timeout: Duration,
+) -> bool {
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < timeout {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(PresenceEvent::AgentOnline { agent_id, .. })) if agent_id == target => {
+                return true;
+            }
+            Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => {}
+            Ok(Err(RecvError::Closed)) | Err(_) => return false,
+        }
+    }
+    false
+}
+
+async fn wait_for_self_presence_record(agent: &Agent, timeout: Duration) -> bool {
+    let Some(presence) = agent.presence_system() else {
+        return false;
+    };
+    let topic = x0x::presence::global_presence_topic();
+    let self_peer = PeerId::new(agent.machine_id().0);
+    let started = tokio::time::Instant::now();
+
+    while started.elapsed() < timeout {
+        if presence
+            .manager()
+            .get_online_peers(topic)
+            .await
+            .contains(&self_peer)
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    false
+}
+
+async fn wait_for_connected_peer(
+    agent: &Agent,
+    target: PeerId,
+    timeout: Duration,
+) -> Option<Vec<PeerId>> {
+    let started = tokio::time::Instant::now();
+    while started.elapsed() < timeout {
+        if let Ok(peers) = agent.peers().await {
+            if peers.contains(&target) {
+                return Some(peers);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -189,6 +298,87 @@ async fn test_foaf_find_specific_agent() {
         found.is_none(),
         "Unconnected agent must not be discoverable"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Connected local topology regression
+//
+// This keeps the no-peer contract tests above, but also verifies the integration
+// path against a real loopback peer: network join, identity cache, presence
+// event delivery, FOAF TTL=1 discovery, and find-by-id for that connected peer.
+// ---------------------------------------------------------------------------
+
+/// Connected loopback agents surface each other through presence and FOAF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_connected_loopback_presence_and_foaf_discovers_peer(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tmp = TempDir::new().unwrap();
+
+    let Some(agent_a) = build_loopback_agent(&tmp, "agent-a", Vec::new()).await? else {
+        return Ok(());
+    };
+    agent_a.join_network().await?;
+    let mut rx = agent_a.subscribe_presence().await?;
+    let Some(agent_a_addr) = agent_a.bound_addr().await else {
+        agent_a.shutdown().await;
+        return Err(std::io::Error::other("agent A did not bind to a loopback address").into());
+    };
+
+    let Some(agent_b) = build_loopback_agent(&tmp, "agent-b", vec![agent_a_addr]).await? else {
+        agent_a.shutdown().await;
+        return Ok(());
+    };
+    agent_b.join_network().await?;
+    agent_b.announce_identity(false, false).await?;
+
+    assert!(
+        wait_for_cached_agent(&agent_a, &agent_b.agent_id(), Duration::from_secs(5)).await,
+        "agent A must cache agent B from a real loopback identity announcement"
+    );
+    assert!(
+        wait_for_online_event(&mut rx, agent_b.agent_id(), Duration::from_secs(5)).await,
+        "agent A must emit AgentOnline for agent B from a real loopback presence beacon"
+    );
+    assert!(
+        wait_for_self_presence_record(&agent_b, Duration::from_secs(2)).await,
+        "agent B must have a local self beacon available for FOAF responses"
+    );
+
+    let agent_b_peer = PeerId::new(agent_b.machine_id().0);
+    let connected_peers = wait_for_connected_peer(&agent_a, agent_b_peer, Duration::from_secs(5))
+        .await
+        .ok_or_else(|| {
+            std::io::Error::other("agent A did not report agent B as a connected peer")
+        })?;
+    agent_a
+        .presence_system()
+        .unwrap()
+        .manager()
+        .replace_broadcast_peers(connected_peers)
+        .await;
+
+    let foaf_agents =
+        timeout(Duration::from_secs(3), agent_a.discover_agents_foaf(1, 500)).await??;
+    assert!(
+        foaf_agents
+            .iter()
+            .any(|agent| agent.agent_id == agent_b.agent_id()),
+        "TTL=1 FOAF must return connected agent B"
+    );
+
+    let found = timeout(
+        Duration::from_secs(3),
+        agent_a.discover_agent_by_id(agent_b.agent_id(), 1, 500),
+    )
+    .await??;
+    assert!(
+        found.is_some_and(|agent| agent.agent_id == agent_b.agent_id()),
+        "discover_agent_by_id must find connected agent B"
+    );
+
+    agent_b.shutdown().await;
+    agent_a.shutdown().await;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

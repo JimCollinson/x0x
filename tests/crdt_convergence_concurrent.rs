@@ -578,7 +578,6 @@ async fn test_convergence_time() {
     use std::time::Instant;
 
     let task_list_id = list_id(6);
-    let start = Instant::now();
 
     // Create 10 replicas
     let mut replicas: Vec<TaskList> = (1..=10)
@@ -599,6 +598,7 @@ async fn test_convergence_time() {
 
     // Full mesh merge
     let clones: Vec<TaskList> = replicas.clone();
+    let start = Instant::now();
     for replica in &mut replicas {
         for other in &clones {
             replica.merge(other).expect("Failed to merge");

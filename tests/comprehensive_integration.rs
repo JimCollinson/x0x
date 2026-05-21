@@ -4,10 +4,19 @@
 //! security validation, performance benchmarking placeholders, and
 //! test automation documentation.
 
+#![allow(clippy::unwrap_used)]
+
 use proptest::prelude::*;
 use saorsa_gossip_types::PeerId;
+use std::time::Duration;
 use x0x::crdt::{CheckboxState, TaskId, TaskItem, TaskList, TaskListId, TaskMetadata};
-use x0x::identity::AgentId;
+use x0x::dm::{
+    now_unix_ms, DedupeKey, DmAckBody, DmAckOutcome, DmBody, DmEnvelope, RecentDeliveryCache,
+    DM_PROTOCOL_VERSION,
+};
+use x0x::dm_inbox::verify_envelope_signature;
+use x0x::identity::{AgentId, AgentKeypair};
+use x0x::mls::{MlsCipher, MlsGroup, MlsKeySchedule};
 
 // ============================================================================
 // TASK 8: Property-Based CRDT Tests
@@ -215,6 +224,43 @@ proptest! {
 // TASK 10: Security Validation Tests
 // ============================================================================
 
+fn test_agent_id(seed: u8) -> AgentId {
+    let mut bytes = [0u8; 32];
+    bytes[0] = seed;
+    AgentId(bytes)
+}
+
+fn unsigned_ack_envelope(sender_keypair: &AgentKeypair, recipient: AgentId) -> DmEnvelope {
+    let now = now_unix_ms();
+    DmEnvelope {
+        protocol_version: DM_PROTOCOL_VERSION,
+        request_id: [1u8; 16],
+        sender_agent_id: *sender_keypair.agent_id().as_bytes(),
+        sender_machine_id: [2u8; 32],
+        recipient_agent_id: *recipient.as_bytes(),
+        created_at_unix_ms: now,
+        expires_at_unix_ms: now + 60_000,
+        body: DmBody::Ack(DmAckBody {
+            acks_request_id: [3u8; 16],
+            outcome: DmAckOutcome::Accepted,
+        }),
+        signature: Vec::new(),
+    }
+}
+
+fn sign_ack_envelope(
+    envelope: &mut DmEnvelope,
+    sender_keypair: &AgentKeypair,
+) -> anyhow::Result<()> {
+    let signed_bytes = envelope.signed_bytes()?;
+    let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        sender_keypair.secret_key(),
+        &signed_bytes,
+    )?;
+    envelope.signature = signature.as_bytes().to_vec();
+    Ok(())
+}
+
 #[test]
 fn test_agent_id_uniqueness() {
     // Verify different agents have different IDs
@@ -233,39 +279,142 @@ fn test_peer_id_derivation() {
 }
 
 #[test]
-#[ignore = "requires ML-DSA signature implementation"]
-fn test_message_signature_validation() {
-    // TODO: Sign a message with ML-DSA-65
-    // TODO: Verify signature with public key
-    // TODO: Verify tampered message fails validation
-    // TODO: Verify wrong public key fails validation
+fn test_message_signature_validation() -> anyhow::Result<()> {
+    let sender_keypair = AgentKeypair::generate()?;
+    let wrong_keypair = AgentKeypair::generate()?;
+    let recipient = test_agent_id(4);
+    let mut envelope = unsigned_ack_envelope(&sender_keypair, recipient);
+    sign_ack_envelope(&mut envelope, &sender_keypair)?;
+
+    assert!(
+        verify_envelope_signature(&envelope, sender_keypair.public_key().as_bytes()),
+        "valid signed DM envelope must verify"
+    );
+
+    let mut tampered = envelope.clone();
+    tampered.body = DmBody::Ack(DmAckBody {
+        acks_request_id: [9u8; 16],
+        outcome: DmAckOutcome::Accepted,
+    });
+    assert!(
+        !verify_envelope_signature(&tampered, sender_keypair.public_key().as_bytes()),
+        "tampered signed payload must fail verification"
+    );
+
+    assert!(
+        !verify_envelope_signature(&envelope, wrong_keypair.public_key().as_bytes()),
+        "wrong public key must fail verification"
+    );
+    Ok(())
 }
 
 #[test]
-#[ignore = "requires message deduplication cache"]
 fn test_replay_attack_prevention() {
-    // TODO: Send same message twice
-    // TODO: Verify second message is rejected (duplicate message ID)
-    // TODO: Verify message IDs cached for 5 minutes
-    // TODO: Verify old messages (> 5min) can be replayed (cache expired)
+    let cache = RecentDeliveryCache::new(Duration::from_millis(20), 16);
+    let key = DedupeKey::new([7u8; 32], [8u8; 16]);
+
+    assert!(
+        cache.lookup(&key).is_none(),
+        "first delivery should not be treated as a replay"
+    );
+
+    cache.insert(key, DmAckOutcome::Accepted);
+    assert!(
+        cache.lookup(&key).is_some(),
+        "duplicate message ID inside the cache window must be detected"
+    );
+
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        cache.lookup(&key).is_none(),
+        "message ID should be accepted again after the replay cache expires"
+    );
 }
 
-#[test]
-#[ignore = "requires MLS implementation from Phase 1.5"]
-fn test_mls_forward_secrecy() {
-    // TODO: Create MLS group with 2 members
-    // TODO: Send encrypted message
-    // TODO: Rotate keys (commit)
-    // TODO: Verify old keys cannot decrypt new messages
+#[tokio::test]
+async fn test_mls_forward_secrecy() -> anyhow::Result<()> {
+    let mut group =
+        MlsGroup::new(b"comprehensive-forward-secrecy".to_vec(), test_agent_id(1)).await?;
+    let aad = b"security-validation";
+    let epoch0 = MlsKeySchedule::from_group(&group)?;
+    let old_cipher = MlsCipher::new(
+        epoch0.encryption_key().to_vec(),
+        epoch0.base_nonce().to_vec(),
+    );
+
+    let old_ciphertext = old_cipher.encrypt(b"epoch-zero", aad, 0)?;
+    assert_eq!(old_cipher.decrypt(&old_ciphertext, aad, 0)?, b"epoch-zero");
+
+    let commit = group.commit()?;
+    group.apply_commit(&commit)?;
+    let epoch1 = MlsKeySchedule::from_group(&group)?;
+    assert_ne!(
+        epoch0.encryption_key(),
+        epoch1.encryption_key(),
+        "MLS key rotation must derive a fresh epoch key"
+    );
+
+    let new_cipher = MlsCipher::new(
+        epoch1.encryption_key().to_vec(),
+        epoch1.base_nonce().to_vec(),
+    );
+    let new_ciphertext = new_cipher.encrypt(b"epoch-one", aad, 0)?;
+    assert!(
+        old_cipher.decrypt(&new_ciphertext, aad, 0).is_err(),
+        "old epoch key must not decrypt new epoch messages"
+    );
+    assert!(
+        new_cipher.decrypt(&old_ciphertext, aad, 0).is_err(),
+        "new epoch key must not decrypt prior epoch messages"
+    );
+    Ok(())
 }
 
-#[test]
-#[ignore = "requires MLS implementation from Phase 1.5"]
-fn test_mls_post_compromise_security() {
-    // TODO: Create MLS group
-    // TODO: Member leaves
-    // TODO: Verify departed member cannot decrypt new messages
-    // TODO: Verify new epoch keys generated
+#[tokio::test]
+async fn test_mls_post_compromise_security() -> anyhow::Result<()> {
+    let owner = test_agent_id(1);
+    let departing_member = test_agent_id(2);
+    let mut group = MlsGroup::new(b"comprehensive-post-compromise".to_vec(), owner).await?;
+    group.add_member(departing_member).await?;
+    assert!(group.is_member(&departing_member));
+
+    let departed_epoch = MlsKeySchedule::from_group(&group)?;
+    let departed_cipher = MlsCipher::new(
+        departed_epoch.encryption_key().to_vec(),
+        departed_epoch.base_nonce().to_vec(),
+    );
+    let epoch_before_remove = group.current_epoch();
+
+    let remove_commit = group.remove_member(departing_member).await?;
+    assert_eq!(remove_commit.epoch(), epoch_before_remove);
+    assert!(!group.is_member(&departing_member));
+    assert!(
+        group.current_epoch() > epoch_before_remove,
+        "member removal must advance the MLS epoch"
+    );
+
+    let current_epoch = MlsKeySchedule::from_group(&group)?;
+    assert_ne!(
+        departed_epoch.encryption_key(),
+        current_epoch.encryption_key(),
+        "removing a member must derive a fresh epoch key"
+    );
+
+    let current_cipher = MlsCipher::new(
+        current_epoch.encryption_key().to_vec(),
+        current_epoch.base_nonce().to_vec(),
+    );
+    let aad = b"post-compromise-security";
+    let ciphertext = current_cipher.encrypt(b"after-removal", aad, 0)?;
+    assert_eq!(
+        current_cipher.decrypt(&ciphertext, aad, 0)?,
+        b"after-removal"
+    );
+    assert!(
+        departed_cipher.decrypt(&ciphertext, aad, 0).is_err(),
+        "departed member's old key must not decrypt new epoch messages"
+    );
+    Ok(())
 }
 
 // ============================================================================

@@ -94,7 +94,7 @@ enum Commands {
     /// Presence and agent discovery operations.
     Presence {
         #[command(subcommand)]
-        sub: PresenceSub,
+        sub: Option<PresenceSub>,
     },
     /// Network diagnostics.
     Network {
@@ -221,7 +221,7 @@ enum Commands {
     #[command(hide = true)]
     Ws {
         #[command(subcommand)]
-        sub: WsSub,
+        sub: Option<WsSub>,
     },
     /// Open the x0x GUI in your browser.
     Gui,
@@ -1125,17 +1125,18 @@ async fn run(
         } => commands::identity::announce(&client, include_user, consent).await,
         Commands::Peers => commands::network::peers(&client).await,
         Commands::Presence { sub } => match sub {
-            PresenceSub::Online => commands::presence::online(&client).await,
-            PresenceSub::Foaf { ttl, timeout_ms } => {
+            None => commands::network::presence(&client).await,
+            Some(PresenceSub::Online) => commands::presence::online(&client).await,
+            Some(PresenceSub::Foaf { ttl, timeout_ms }) => {
                 commands::presence::foaf(&client, ttl, timeout_ms).await
             }
-            PresenceSub::Find {
+            Some(PresenceSub::Find {
                 id,
                 ttl,
                 timeout_ms,
-            } => commands::presence::find(&client, &id, ttl, timeout_ms).await,
-            PresenceSub::Status { id } => commands::presence::status(&client, &id).await,
-            PresenceSub::Events => commands::presence::events(&client).await,
+            }) => commands::presence::find(&client, &id, ttl, timeout_ms).await,
+            Some(PresenceSub::Status { id }) => commands::presence::status(&client, &id).await,
+            Some(PresenceSub::Events) => commands::presence::events(&client).await,
         },
         Commands::Network { sub } => match sub {
             NetworkSub::Status => commands::network::network_status(&client).await,
@@ -1527,8 +1528,9 @@ async fn run(
         },
         Commands::Upgrade { .. } => unreachable!(),
         Commands::Ws { sub } => match sub {
-            WsSub::Sessions => commands::ws::sessions(&client).await,
-            WsSub::Direct => commands::ws::direct(&client).await,
+            None => commands::ws::general(&client).await,
+            Some(WsSub::Sessions) => commands::ws::sessions(&client).await,
+            Some(WsSub::Direct) => commands::ws::direct(&client).await,
         },
         Commands::Stop => commands::daemon::stop(&client).await,
         Commands::Doctor => commands::daemon::doctor(&client).await,
@@ -1561,6 +1563,29 @@ async fn run(
         | Commands::Start { .. }
         | Commands::Instances
         | Commands::Autostart { .. } => unreachable!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_presence_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "presence"])?;
+        match cli.command {
+            Commands::Presence { sub: None } => Ok(()),
+            _ => anyhow::bail!("expected bare presence to parse without nested subcommand"),
+        }
+    }
+
+    #[test]
+    fn bare_ws_alias_parses_without_nested_subcommand() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "ws"])?;
+        match cli.command {
+            Commands::Ws { sub: None } => Ok(()),
+            _ => anyhow::bail!("expected bare ws to parse without nested subcommand"),
+        }
     }
 }
 

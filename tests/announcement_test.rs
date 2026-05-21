@@ -14,15 +14,26 @@ use x0x::{
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn test_peer_cache_dir(dir: &TempDir) -> std::path::PathBuf {
+    dir.path().join("peers")
+}
+
 async fn build_agent(dir: &TempDir) -> Agent {
-    Agent::builder()
+    let peer_cache_dir = test_peer_cache_dir(dir);
+    let agent = Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
-        .with_peer_cache_dir(dir.path().join("peers"))
+        .with_peer_cache_dir(&peer_cache_dir)
         .with_network_config(NetworkConfig::default())
         .build()
         .await
-        .unwrap()
+        .unwrap();
+
+    assert!(
+        peer_cache_dir.exists(),
+        "networked tests must use the TempDir peer cache"
+    );
+    agent
 }
 
 #[derive(serde::Serialize)]
@@ -204,7 +215,7 @@ async fn announcement_with_user_identity_round_trip() {
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
         .with_user_key(user_kp)
-        .with_peer_cache_dir(dir.path().join("peers"))
+        .with_peer_cache_dir(test_peer_cache_dir(&dir))
         .with_network_config(NetworkConfig::default())
         .build()
         .await
@@ -496,7 +507,7 @@ async fn self_announcement_populates_discovery_cache() {
     let agent = Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
-        .with_peer_cache_dir(dir.path().join("peers"))
+        .with_peer_cache_dir(test_peer_cache_dir(&dir))
         .with_network_config(NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: vec![],
@@ -603,7 +614,7 @@ async fn self_announcement_populates_machine_cache() {
     let agent = Agent::builder()
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
-        .with_peer_cache_dir(dir.path().join("peers"))
+        .with_peer_cache_dir(test_peer_cache_dir(&dir))
         .with_network_config(NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: vec![],
@@ -632,7 +643,7 @@ async fn user_and_agent_link_to_discovered_machine() {
         .with_machine_key(dir.path().join("machine.key"))
         .with_agent_key_path(dir.path().join("agent.key"))
         .with_user_key(user_kp)
-        .with_peer_cache_dir(dir.path().join("peers"))
+        .with_peer_cache_dir(test_peer_cache_dir(&dir))
         .with_network_config(NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: vec![],

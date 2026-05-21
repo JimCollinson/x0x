@@ -161,6 +161,7 @@ async fn test_default_cache_dir_when_not_specified() {
     let default_cache_dir = home_dir.join(".x0x").join("peers");
     std::fs::create_dir_all(&home_dir).expect("create isolated home");
     let _home = EnvVarOverride::set("HOME", &home_dir);
+    let _user_profile = EnvVarOverride::set("USERPROFILE", &home_dir);
     let _xdg_cache = EnvVarOverride::set("XDG_CACHE_HOME", &xdg_cache_dir);
     let _xdg_config = EnvVarOverride::set("XDG_CONFIG_HOME", &xdg_config_dir);
     let _xdg_data = EnvVarOverride::set("XDG_DATA_HOME", &xdg_data_dir);

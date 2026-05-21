@@ -601,12 +601,10 @@ fn gui_renders_admin_controls_inline() {
     assert!(GUI_HTML.contains("data-nag-state-withdraw"));
 }
 
-/// Summary printer that always runs. Writes to a persistent file so
-/// the exact covered/deferred/missing split is visible without
-/// needing stdout capture.
-#[test]
-fn emit_gui_parity_report() -> std::io::Result<()> {
-    use std::io::Write as _;
+const GUI_PARITY_REPORT_PATH: &str = "tests/proof-reports/parity/gui-named-groups-coverage.txt";
+const REGEN_GUI_PARITY_REPORT_ENV: &str = "X0X_REGEN_GUI_PARITY_REPORT";
+
+fn render_gui_parity_report() -> String {
     let all = named_group_endpoints();
     let call_sites = gui_api_calls();
     let deferred = deferred_paths();
@@ -645,15 +643,53 @@ fn emit_gui_parity_report() -> std::io::Result<()> {
         all.len()
     ));
 
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/proof-reports/parity/gui-named-groups-coverage.txt"
-    );
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(parent)?;
+    let mut report = lines.join("\n");
+    report.push('\n');
+    report
+}
+
+fn gui_parity_report_abs_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(GUI_PARITY_REPORT_PATH)
+}
+
+/// Summary verifier that always runs. Normal test runs compare the
+/// committed report without mutating the checkout. Set
+/// X0X_REGEN_GUI_PARITY_REPORT=1 to rewrite the source-tree artifact.
+#[test]
+fn emit_gui_parity_report() -> std::io::Result<()> {
+    let expected = render_gui_parity_report();
+    let path = gui_parity_report_abs_path();
+
+    if std::env::var(REGEN_GUI_PARITY_REPORT_ENV).is_ok() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, &expected)?;
+        eprintln!("[gui_named_group_parity] regenerated {}", path.display());
+        return Ok(());
     }
-    let mut f = std::fs::File::create(path)?;
-    writeln!(f, "{}", lines.join("\n"))?;
-    eprintln!("[gui_named_group_parity] coverage report → {path}");
+
+    let actual = std::fs::read_to_string(&path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to read {}: {error}\n\
+                 Generate it with: {REGEN_GUI_PARITY_REPORT_ENV}=1 cargo test --test \
+                 gui_named_group_parity emit_gui_parity_report",
+                path.display()
+            ),
+        )
+    })?;
+
+    if actual != expected {
+        return Err(std::io::Error::other(format!(
+            "{} is stale vs tests/gui_named_group_parity.rs.\n\
+             Regenerate with: {REGEN_GUI_PARITY_REPORT_ENV}=1 cargo test --test \
+             gui_named_group_parity emit_gui_parity_report",
+            path.display()
+        )));
+    }
+
+    eprintln!("[gui_named_group_parity] verified {}", path.display());
     Ok(())
 }

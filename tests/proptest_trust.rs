@@ -75,14 +75,22 @@ proptest! {
         prop_assert_eq!(before, format!("{:?}", s));
     }
 
-    #[test]
-    fn trust_level_ordering(_seed in 0u64..100) {
-        let levels = [TrustLevel::Blocked, TrustLevel::Unknown, TrustLevel::Known, TrustLevel::Trusted];
-        let jsons: Vec<String> = levels.iter().map(|l| serde_json::to_string(l).unwrap()).collect();
-        for i in 0..jsons.len() {
-            for j in (i+1)..jsons.len() {
-                prop_assert_ne!(&jsons[i], &jsons[j]);
-            }
-        }
+}
+
+#[test]
+fn trust_level_ordering() -> Result<(), serde_json::Error> {
+    let levels = [
+        (TrustLevel::Blocked, "\"blocked\""),
+        (TrustLevel::Unknown, "\"unknown\""),
+        (TrustLevel::Known, "\"known\""),
+        (TrustLevel::Trusted, "\"trusted\""),
+    ];
+
+    assert_eq!(levels.map(|(level, _)| level.rank()), [0, 1, 2, 3]);
+
+    for (level, expected_json) in levels {
+        assert_eq!(serde_json::to_string(&level)?, expected_json);
     }
+
+    Ok(())
 }

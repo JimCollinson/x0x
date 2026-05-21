@@ -377,16 +377,24 @@ fn categories_are_valid() {
 #[test]
 fn gui_api_calls_match_endpoints() {
     let gui_html = include_str!("../src/gui/x0x-gui.html");
-    let endpoint_paths: HashSet<&str> = ENDPOINTS.iter().map(|e| e.path).collect();
-    let unknown = unknown_gui_api_paths(gui_html, &endpoint_paths);
+    let endpoints: HashSet<(String, &str)> = ENDPOINTS
+        .iter()
+        .map(|e| (format!("{}", e.method), e.path))
+        .collect();
+    let unknown = unknown_gui_api_calls(gui_html, &endpoints);
 
     assert!(
         unknown.is_empty(),
-        "\nGUI calls {} API paths not found in ENDPOINTS:\n{}\n",
+        "\nGUI calls {} API endpoints not found in ENDPOINTS:\n{}\n",
         unknown.len(),
         unknown.join("\n")
     );
 }
+
+const REVIEWED_GUI_DYNAMIC_METHODS: &[(&str, &str)] = &[(
+    "/contacts/:/machines/:/pin",
+    "togglePin chooses POST or DELETE, and both methods are registered",
+)];
 
 #[derive(Debug, PartialEq, Eq)]
 enum GuiPathSegment {
@@ -394,21 +402,44 @@ enum GuiPathSegment {
     Dynamic,
 }
 
-fn unknown_gui_api_paths(gui_html: &str, endpoint_paths: &HashSet<&str>) -> Vec<String> {
-    extract_gui_api_path_exprs(gui_html)
+#[derive(Debug, PartialEq, Eq)]
+enum GuiApiMethod {
+    Static(String),
+    Dynamic(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GuiApiCall {
+    path_expr: String,
+    normalized_path: String,
+    method: GuiApiMethod,
+}
+
+fn unknown_gui_api_calls(gui_html: &str, endpoints: &HashSet<(String, &str)>) -> Vec<String> {
+    extract_gui_api_calls(gui_html)
         .into_iter()
-        .filter_map(|expr| {
-            let normalized = normalize_gui_api_expr(&expr);
-            if matches_any_endpoint(&normalized, endpoint_paths) {
-                None
-            } else {
-                Some(format!("  {normalized} (from api({expr}))"))
+        .filter_map(|call| match &call.method {
+            GuiApiMethod::Static(method) => {
+                if matches_any_endpoint(method, &call.normalized_path, endpoints) {
+                    None
+                } else {
+                    Some(format_gui_api_error(&call, endpoints))
+                }
+            }
+            GuiApiMethod::Dynamic(_) => {
+                if is_reviewed_dynamic_method_call(&call.normalized_path)
+                    && matching_endpoint_methods(&call.normalized_path, endpoints).len() > 1
+                {
+                    None
+                } else {
+                    Some(format_gui_api_error(&call, endpoints))
+                }
             }
         })
         .collect()
 }
 
-fn extract_gui_api_path_exprs(gui_html: &str) -> Vec<String> {
+fn extract_gui_api_calls(gui_html: &str) -> Vec<GuiApiCall> {
     let bytes = gui_html.as_bytes();
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -421,10 +452,14 @@ fn extract_gui_api_path_exprs(gui_html: &str) -> Vec<String> {
                 continue;
             };
             let args = &gui_html[start..end];
-            let (expr, _) = split_top_level_comma(args);
+            let (expr, options) = split_top_level_comma(args);
             let expr = expr.trim();
             if looks_like_path_arg(expr) {
-                out.push(expr.to_string());
+                out.push(GuiApiCall {
+                    path_expr: expr.to_string(),
+                    normalized_path: normalize_gui_api_expr(expr),
+                    method: extract_gui_api_method(options),
+                });
             }
             i = end + 1;
         } else {
@@ -433,6 +468,159 @@ fn extract_gui_api_path_exprs(gui_html: &str) -> Vec<String> {
     }
 
     out
+}
+
+fn extract_gui_api_method(options: &str) -> GuiApiMethod {
+    let trimmed = options.trim_start();
+    if trimmed.is_empty() {
+        return GuiApiMethod::Static(String::from("GET"));
+    }
+
+    let trimmed = trimmed
+        .strip_prefix(',')
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
+
+    if trimmed.is_empty() {
+        return GuiApiMethod::Static(String::from("GET"));
+    }
+
+    if !trimmed.starts_with('{') {
+        return GuiApiMethod::Dynamic(trimmed.to_string());
+    }
+
+    let Some(method_value) = find_top_level_object_property(trimmed, "method") else {
+        return GuiApiMethod::Static(String::from("GET"));
+    };
+    let method_value = method_value.trim();
+    let bytes = method_value.as_bytes();
+
+    if let Some(quote) = bytes
+        .first()
+        .copied()
+        .filter(|q| matches!(q, b'\'' | b'"' | b'`'))
+    {
+        let mut method = String::new();
+        append_literal_until_quote(method_value, quote, &mut method);
+        GuiApiMethod::Static(method.to_ascii_uppercase())
+    } else {
+        GuiApiMethod::Dynamic(method_value.to_string())
+    }
+}
+
+fn find_top_level_object_property<'a>(source: &'a str, property: &str) -> Option<&'a str> {
+    let bytes = source.as_bytes();
+    let property_bytes = property.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+        } else {
+            match c {
+                b'\'' | b'"' | b'`' => in_str = Some(c),
+                b'{' => depth += 1,
+                b'}' => {
+                    if depth == 1 {
+                        return None;
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+                b'(' | b'[' => depth += 1,
+                b')' | b']' => depth = depth.saturating_sub(1),
+                _ if depth == 1 && source[i..].starts_with(property) => {
+                    let after = i + property_bytes.len();
+                    if is_identifier_boundary(bytes, i, after) {
+                        let value = source[after..].trim_start();
+                        if let Some(value) = value.strip_prefix(':') {
+                            return Some(read_property_value(value));
+                        }
+                        if value.starts_with(',') || value.starts_with('}') {
+                            return Some(&source[i..after]);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn is_identifier_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
+    let before = start.checked_sub(1).and_then(|index| bytes.get(index));
+    let after = bytes.get(end);
+    !before.is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+        && !after.is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+}
+
+fn read_property_value(source: &str) -> &str {
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+        } else {
+            match c {
+                b'\'' | b'"' | b'`' => in_str = Some(c),
+                b'(' | b'{' | b'[' => depth += 1,
+                b')' | b'}' | b']' => {
+                    if depth == 0 {
+                        return source[..i].trim();
+                    }
+                    depth -= 1;
+                }
+                b',' if depth == 0 => return source[..i].trim(),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+
+    source.trim()
+}
+
+fn append_literal_until_quote(source: &str, quote: u8, out: &mut String) {
+    let bytes = source.as_bytes();
+    let mut i = 1usize;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' {
+            if let Some(next) = bytes.get(i + 1) {
+                out.push(*next as char);
+                i += 2;
+                continue;
+            }
+            return;
+        }
+        if c == quote {
+            return;
+        }
+        out.push(c as char);
+        i += 1;
+    }
 }
 
 fn find_api_args_end(bytes: &[u8], start: usize) -> Option<usize> {
@@ -662,53 +850,165 @@ fn path_segments(path: &str) -> Vec<GuiPathSegment> {
         .collect()
 }
 
-fn matches_any_endpoint(path: &str, endpoints: &HashSet<&str>) -> bool {
+fn matches_any_endpoint(method: &str, path: &str, endpoints: &HashSet<(String, &str)>) -> bool {
     let path_parts = path_segments(path);
-    endpoints.iter().any(|ep_path| {
-        let ep_parts = path_segments(ep_path);
-        path_parts.len() == ep_parts.len()
-            && path_parts
-                .iter()
-                .zip(ep_parts.iter())
-                .all(|(path_part, ep_part)| match ep_part {
-                    GuiPathSegment::Dynamic => true,
-                    GuiPathSegment::Literal(ep_literal) => {
-                        matches!(path_part, GuiPathSegment::Literal(path_literal) if path_literal == ep_literal)
-                    }
-                })
+    endpoints.iter().any(|(ep_method, ep_path)| {
+        ep_method.as_str() == method && endpoint_path_matches(&path_parts, ep_path)
     })
+}
+
+fn matching_endpoint_methods(path: &str, endpoints: &HashSet<(String, &str)>) -> Vec<String> {
+    let path_parts = path_segments(path);
+    let mut methods: Vec<String> = endpoints
+        .iter()
+        .filter(|(_, ep_path)| endpoint_path_matches(&path_parts, ep_path))
+        .map(|(method, _)| method.to_string())
+        .collect();
+    methods.sort();
+    methods.dedup();
+    methods
+}
+
+fn endpoint_path_matches(path_parts: &[GuiPathSegment], ep_path: &str) -> bool {
+    let ep_parts = path_segments(ep_path);
+    path_parts.len() == ep_parts.len()
+        && path_parts
+            .iter()
+            .zip(ep_parts.iter())
+            .all(|(path_part, ep_part)| match ep_part {
+                GuiPathSegment::Dynamic => true,
+                GuiPathSegment::Literal(ep_literal) => {
+                    matches!(path_part, GuiPathSegment::Literal(path_literal) if path_literal == ep_literal)
+                }
+            })
+}
+
+fn is_reviewed_dynamic_method_call(path: &str) -> bool {
+    REVIEWED_GUI_DYNAMIC_METHODS
+        .iter()
+        .any(|(reviewed_path, _reason)| *reviewed_path == path)
+}
+
+fn format_gui_api_error(call: &GuiApiCall, endpoints: &HashSet<(String, &str)>) -> String {
+    let methods = matching_endpoint_methods(&call.normalized_path, endpoints);
+    let api_args = format_gui_api_args(call);
+    if methods.is_empty() {
+        format!(
+            "  {} {} (from api({api_args}); no matching path in ENDPOINTS)",
+            format_gui_method(&call.method),
+            call.normalized_path,
+        )
+    } else {
+        format!(
+            "  {} {} (from api({api_args}); registered methods: {})",
+            format_gui_method(&call.method),
+            call.normalized_path,
+            methods.join(", ")
+        )
+    }
+}
+
+fn format_gui_method(method: &GuiApiMethod) -> &str {
+    match method {
+        GuiApiMethod::Static(method) => method,
+        GuiApiMethod::Dynamic(_) => "<dynamic method>",
+    }
+}
+
+fn format_gui_api_args(call: &GuiApiCall) -> String {
+    match &call.method {
+        GuiApiMethod::Static(method) if method == "GET" => call.path_expr.clone(),
+        GuiApiMethod::Static(method) => format!("{}, {{method:'{}'}}", call.path_expr, method),
+        GuiApiMethod::Dynamic(method) => format!("{}, {{method:{method}}}", call.path_expr),
+    }
 }
 
 #[test]
 fn gui_api_path_checker_rejects_unknown_static_path() {
-    let endpoint_paths: HashSet<&str> = ["/health"].into_iter().collect();
-    let unknown = unknown_gui_api_paths(
+    let endpoints: HashSet<(String, &str)> =
+        [(String::from("GET"), "/health")].into_iter().collect();
+    let unknown = unknown_gui_api_calls(
         r#"
         api('/health');
         api("/not-in-ENDPOINTS");
         "#,
-        &endpoint_paths,
+        &endpoints,
     );
 
     assert_eq!(
         unknown,
         vec![String::from(
-            r#"  /not-in-ENDPOINTS (from api("/not-in-ENDPOINTS"))"#
+            r#"  GET /not-in-ENDPOINTS (from api("/not-in-ENDPOINTS"); no matching path in ENDPOINTS)"#
         )]
     );
 }
 
 #[test]
 fn gui_api_path_checker_accepts_dynamic_endpoint_shapes() {
-    let endpoint_paths: HashSet<&str> = ["/stores/:id/:key"].into_iter().collect();
-    let unknown = unknown_gui_api_paths(
+    let endpoints: HashSet<(String, &str)> = [(String::from("GET"), "/stores/:id/:key")]
+        .into_iter()
+        .collect();
+    let unknown = unknown_gui_api_calls(
         "api('/stores/'+storeId+'/channels_index'); api(`/stores/${storeId}/${key}`);",
-        &endpoint_paths,
+        &endpoints,
     );
 
     assert!(
         unknown.is_empty(),
         "dynamic GUI paths should match parameterized endpoints: {unknown:?}"
+    );
+}
+
+#[test]
+fn gui_api_path_checker_rejects_dynamic_suffixes() {
+    let endpoints: HashSet<(String, &str)> =
+        [(String::from("GET"), "/groups/:id")].into_iter().collect();
+    let unknown = unknown_gui_api_calls("api('/groups/'+gid+'/bogus');", &endpoints);
+
+    assert_eq!(
+        unknown,
+        vec![String::from(
+            "  GET /groups/:/bogus (from api('/groups/'+gid+'/bogus'); no matching path in ENDPOINTS)"
+        )]
+    );
+}
+
+#[test]
+fn gui_api_path_checker_rejects_method_mismatches() {
+    let endpoints: HashSet<(String, &str)> =
+        [(String::from("GET"), "/groups/:id")].into_iter().collect();
+    let unknown = unknown_gui_api_calls("api('/groups/'+gid,{method:'POST'});", &endpoints);
+
+    assert_eq!(
+        unknown,
+        vec![String::from(
+            "  POST /groups/: (from api('/groups/'+gid, {method:'POST'}); registered methods: GET)"
+        )]
+    );
+}
+
+#[test]
+fn gui_api_path_checker_allows_reviewed_dynamic_methods() {
+    let endpoints: HashSet<(String, &str)> = [
+        (
+            String::from("DELETE"),
+            "/contacts/:agent_id/machines/:machine_id/pin",
+        ),
+        (
+            String::from("POST"),
+            "/contacts/:agent_id/machines/:machine_id/pin",
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let unknown = unknown_gui_api_calls(
+        "api('/contacts/'+agentId+'/machines/'+machineId+'/pin',{method});",
+        &endpoints,
+    );
+
+    assert!(
+        unknown.is_empty(),
+        "reviewed dynamic method call should pass: {unknown:?}"
     );
 }
 

@@ -285,6 +285,15 @@ fn generate_manifest(
         let archive_sha256: [u8; 32] = Sha256::digest(&archive_data).into();
 
         let sig_name = format!("{archive_name}.sig");
+        let sig_path = assets_dir.join(&sig_name);
+        if !sig_path.is_file() {
+            return Err(format!(
+                "signature file missing for {archive_name}: {}",
+                sig_path.display()
+            )
+            .into());
+        }
+
         let archive_url = format!("{repo_url}/v{version}/{archive_name}");
         let signature_url = format!("{repo_url}/v{version}/{sig_name}");
 

@@ -389,23 +389,31 @@ async fn ws_requires_auth() {
     let url = format!("ws://{}/ws", d.api_addr());
     let result = tokio_tungstenite::connect_async(&url).await;
 
-    // Should either fail to connect or get an error frame
+    // Should either fail to connect, close immediately, or get an auth error frame.
     match result {
         Err(_) => {} // Expected — connection rejected
         Ok((mut ws, _)) => {
-            // May connect but send an auth error
-            let msg = ws_recv_text(&mut ws, 5).await;
-            if let Some(text) = msg {
-                let frame: Value = serde_json::from_str(&text).unwrap_or_default();
-                // Either an error or the server closes immediately
-                if frame["type"] == "error" {
-                    // Good — auth error
-                } else {
-                    // The server allowed connection — this is fine if it has
-                    // a permissive auth model for WS
-                }
-            }
+            let (rejected, observed) =
+                match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+                    Err(_) => (false, "no frame before timeout".to_string()),
+                    Ok(None) => (true, "connection closed".to_string()),
+                    Ok(Some(Err(err))) => (true, format!("read error: {err}")),
+                    Ok(Some(Ok(Message::Close(_)))) => (true, "close frame".to_string()),
+                    Ok(Some(Ok(Message::Text(text)))) => {
+                        let frame = serde_json::from_str::<Value>(&text);
+                        let is_error = matches!(
+                            frame.as_ref().ok().and_then(|frame| frame["type"].as_str()),
+                            Some("error")
+                        );
+                        (is_error, format!("text frame: {text}"))
+                    }
+                    Ok(Some(Ok(frame))) => (false, format!("non-error frame: {frame:?}")),
+                };
             ws.close(None).await.ok();
+            assert!(
+                rejected,
+                "unauthenticated websocket accepted connection without closing or sending an auth error: {observed}"
+            );
         }
     }
 }

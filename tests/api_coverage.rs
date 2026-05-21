@@ -377,109 +377,339 @@ fn categories_are_valid() {
 #[test]
 fn gui_api_calls_match_endpoints() {
     let gui_html = include_str!("../src/gui/x0x-gui.html");
-
-    // Extract API paths from the GUI JavaScript.
-    // The GUI uses: api("/path", ...) or api(`/path`, ...)
-    let mut gui_paths = Vec::new();
-    for line in gui_html.lines() {
-        let trimmed = line.trim();
-        // Match patterns like: api("/health" or api(`/health` or api('/health'
-        if let Some(start) = trimmed.find("api(\"") {
-            if let Some(path) = extract_api_path(&trimmed[start + 4..]) {
-                gui_paths.push(path);
-            }
-        }
-        if let Some(start) = trimmed.find("api(`") {
-            if let Some(path) = extract_api_path(&trimmed[start + 4..]) {
-                gui_paths.push(path);
-            }
-        }
-        if let Some(start) = trimmed.find("api('") {
-            if let Some(path) = extract_api_path(&trimmed[start + 4..]) {
-                gui_paths.push(path);
-            }
-        }
-    }
-
-    // Normalize paths: /stores/${storeId}/key -> /stores/:id/:key
     let endpoint_paths: HashSet<&str> = ENDPOINTS.iter().map(|e| e.path).collect();
+    let unknown = unknown_gui_api_paths(gui_html, &endpoint_paths);
 
-    let mut unknown = Vec::new();
-    for path in &gui_paths {
-        // Normalize dynamic segments: remove ${...} and replace with :param
-        let normalized = normalize_gui_path(path);
-        if !endpoint_paths.contains(normalized.as_str()) {
-            // Check if it matches a parameterized endpoint
-            if !matches_any_endpoint(&normalized, &endpoint_paths) {
-                unknown.push(format!("  {path} (normalized: {normalized})"));
+    assert!(
+        unknown.is_empty(),
+        "\nGUI calls {} API paths not found in ENDPOINTS:\n{}\n",
+        unknown.len(),
+        unknown.join("\n")
+    );
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GuiPathSegment {
+    Literal(String),
+    Dynamic,
+}
+
+fn unknown_gui_api_paths(gui_html: &str, endpoint_paths: &HashSet<&str>) -> Vec<String> {
+    extract_gui_api_path_exprs(gui_html)
+        .into_iter()
+        .filter_map(|expr| {
+            let normalized = normalize_gui_api_expr(&expr);
+            if matches_any_endpoint(&normalized, endpoint_paths) {
+                None
+            } else {
+                Some(format!("  {normalized} (from api({expr}))"))
+            }
+        })
+        .collect()
+}
+
+fn extract_gui_api_path_exprs(gui_html: &str) -> Vec<String> {
+    let bytes = gui_html.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+
+    while i + 4 <= bytes.len() {
+        if &bytes[i..i + 4] == b"api(" {
+            let start = i + 4;
+            let Some(end) = find_api_args_end(bytes, start) else {
+                i += 4;
+                continue;
+            };
+            let args = &gui_html[start..end];
+            let (expr, _) = split_top_level_comma(args);
+            let expr = expr.trim();
+            if looks_like_path_arg(expr) {
+                out.push(expr.to_string());
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    out
+}
+
+fn find_api_args_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut i = start;
+    let mut in_str: Option<u8> = None;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+        } else {
+            match c {
+                b'\'' | b'"' | b'`' => in_str = Some(c),
+                b'(' | b'{' | b'[' => depth += 1,
+                b')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+
+    None
+}
+
+fn split_top_level_comma(args: &str) -> (&str, &str) {
+    let bytes = args.as_bytes();
+    let mut depth = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+        } else {
+            match c {
+                b'\'' | b'"' | b'`' => in_str = Some(c),
+                b'(' | b'{' | b'[' => depth += 1,
+                b')' | b'}' | b']' => depth = depth.saturating_sub(1),
+                b',' if depth == 0 => return (&args[..i], &args[i..]),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+
+    (args, "")
+}
+
+fn looks_like_path_arg(expr: &str) -> bool {
+    let trimmed = expr.trim_start();
+    let bytes = trimmed.as_bytes();
+    bytes.len() >= 3 && matches!(bytes[0], b'\'' | b'"' | b'`') && bytes[1] == b'/'
+}
+
+fn normalize_gui_api_expr(expr: &str) -> String {
+    let bytes = expr.as_bytes();
+    let mut normalized = String::new();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => i = append_quoted_literal(expr, i, &mut normalized),
+            b'`' => i = append_template_literal(expr, i, &mut normalized),
+            b'+' | b' ' | b'\n' | b'\r' | b'\t' => i += 1,
+            _ => {
+                normalized.push(':');
+                i = skip_dynamic_operand(bytes, i);
             }
         }
     }
 
-    // This is informational — GUI may use computed paths that are hard to
-    // statically extract. We warn but don't fail for now.
-    if !unknown.is_empty() {
-        eprintln!(
-            "\nGUI calls {} API paths not directly found in ENDPOINTS:\n{}\n\
-             (These may be dynamically constructed — verify manually)\n",
-            unknown.len(),
-            unknown.join("\n")
-        );
+    if let Some(index) = normalized.find('?') {
+        normalized.truncate(index);
     }
+    normalized
 }
 
-fn extract_api_path(s: &str) -> Option<String> {
-    // Find the closing quote/backtick
-    let _quote = s.chars().next()?;
-    let rest = &s[1..]; // skip opening quote
-    let end = rest.find(['"', '\'', '`', ','])?;
-    let path = &rest[..end];
-    if path.starts_with('/') {
-        Some(path.to_string())
-    } else {
-        None
+fn append_quoted_literal(expr: &str, start: usize, normalized: &mut String) -> usize {
+    let bytes = expr.as_bytes();
+    let quote = bytes[start];
+    let mut i = start + 1;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' {
+            if let Some(next) = bytes.get(i + 1) {
+                normalized.push(*next as char);
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if c == quote {
+            return i + 1;
+        }
+        if c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+            normalized.push(':');
+            i = skip_template_placeholder(bytes, i + 2);
+            continue;
+        }
+        normalized.push(c as char);
+        i += 1;
     }
+
+    i
 }
 
-fn normalize_gui_path(path: &str) -> String {
-    // Replace ${variable} with :param
-    let mut result = String::new();
-    let mut chars = path.chars().peekable();
-    #[allow(clippy::while_let_on_iterator)]
-    while let Some(c) = chars.next() {
-        if c == '$' && chars.peek() == Some(&'{') {
-            chars.next(); // skip {
-                          // Skip until }
-            while let Some(c2) = chars.next() {
-                if c2 == '}' {
-                    break;
+fn append_template_literal(expr: &str, start: usize, normalized: &mut String) -> usize {
+    let bytes = expr.as_bytes();
+    let mut i = start + 1;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if let Some(next) = bytes.get(i + 1) {
+                    normalized.push(*next as char);
+                    i += 2;
+                } else {
+                    i += 1;
                 }
             }
-            result.push_str(":id");
-        } else {
-            result.push(c);
+            b'`' => return i + 1,
+            b'$' if bytes.get(i + 1) == Some(&b'{') => {
+                normalized.push(':');
+                i = skip_template_placeholder(bytes, i + 2);
+            }
+            c => {
+                normalized.push(c as char);
+                i += 1;
+            }
         }
     }
-    result
+
+    i
+}
+
+fn skip_dynamic_operand(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut i = start;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+        } else {
+            match c {
+                b'\'' | b'"' | b'`' => in_str = Some(c),
+                b'(' | b'{' | b'[' => depth += 1,
+                b')' | b'}' | b']' => depth = depth.saturating_sub(1),
+                b'+' if depth == 0 => return i,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+
+    i
+}
+
+fn skip_template_placeholder(bytes: &[u8], start: usize) -> usize {
+    let mut depth = 1usize;
+    let mut in_str: Option<u8> = None;
+    let mut i = start;
+
+    while i < bytes.len() && depth > 0 {
+        let c = bytes[i];
+        if let Some(q) = in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == q {
+                in_str = None;
+            }
+        } else {
+            match c {
+                b'\'' | b'"' | b'`' => in_str = Some(c),
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+
+    i
+}
+
+fn path_segments(path: &str) -> Vec<GuiPathSegment> {
+    path.split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| {
+            if segment == ":" || segment.starts_with(':') {
+                GuiPathSegment::Dynamic
+            } else {
+                GuiPathSegment::Literal(segment.to_string())
+            }
+        })
+        .collect()
 }
 
 fn matches_any_endpoint(path: &str, endpoints: &HashSet<&str>) -> bool {
-    // Simple matching: split by / and check if any endpoint matches
-    // with :param wildcards
-    let path_parts: Vec<&str> = path.split('/').collect();
-    for ep_path in endpoints {
-        let ep_parts: Vec<&str> = ep_path.split('/').collect();
-        if path_parts.len() == ep_parts.len() {
-            let matches = path_parts
+    let path_parts = path_segments(path);
+    endpoints.iter().any(|ep_path| {
+        let ep_parts = path_segments(ep_path);
+        path_parts.len() == ep_parts.len()
+            && path_parts
                 .iter()
                 .zip(ep_parts.iter())
-                .all(|(p, e)| e.starts_with(':') || p == e);
-            if matches {
-                return true;
-            }
-        }
-    }
-    false
+                .all(|(path_part, ep_part)| match ep_part {
+                    GuiPathSegment::Dynamic => true,
+                    GuiPathSegment::Literal(ep_literal) => {
+                        matches!(path_part, GuiPathSegment::Literal(path_literal) if path_literal == ep_literal)
+                    }
+                })
+    })
+}
+
+#[test]
+fn gui_api_path_checker_rejects_unknown_static_path() {
+    let endpoint_paths: HashSet<&str> = ["/health"].into_iter().collect();
+    let unknown = unknown_gui_api_paths(
+        r#"
+        api('/health');
+        api("/not-in-ENDPOINTS");
+        "#,
+        &endpoint_paths,
+    );
+
+    assert_eq!(
+        unknown,
+        vec![String::from(
+            r#"  /not-in-ENDPOINTS (from api("/not-in-ENDPOINTS"))"#
+        )]
+    );
+}
+
+#[test]
+fn gui_api_path_checker_accepts_dynamic_endpoint_shapes() {
+    let endpoint_paths: HashSet<&str> = ["/stores/:id/:key"].into_iter().collect();
+    let unknown = unknown_gui_api_paths(
+        "api('/stores/'+storeId+'/channels_index'); api(`/stores/${storeId}/${key}`);",
+        &endpoint_paths,
+    );
+
+    assert!(
+        unknown.is_empty(),
+        "dynamic GUI paths should match parameterized endpoints: {unknown:?}"
+    );
 }
 
 fn extract_route_defs(source: &str) -> HashSet<(String, String)> {

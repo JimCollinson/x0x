@@ -65,7 +65,13 @@ async fn build_loopback_agent(
         .with_peer_cache_disabled()
         .with_network_config(loopback_network_config(bootstrap_nodes))
         .with_presence_beacon_interval(1)
-        .with_presence_event_poll_interval(10)
+        // Poll faster than the beacon TTL. The beacon TTL is
+        // beacon_interval * 3 = 3 s; an event-poll interval of 10 s would
+        // almost always land between live beacons (TTL < poll), so a peer
+        // would never be observed online within the test window. Production
+        // keeps the invariant the other way (beacon_interval 30 s → TTL 90 s
+        // ≫ 10 s poll); this fast-beacon test must mirror that ordering.
+        .with_presence_event_poll_interval(1)
         .build()
         .await
     {

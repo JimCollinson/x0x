@@ -7253,8 +7253,14 @@ impl AgentBuilder {
             if let Some(secs) = self.presence_offline_timeout_secs {
                 presence_config.adaptive_timeout_fallback_secs = secs;
             }
+            // Sign presence beacons with the machine keypair that backs
+            // `peer_id` (= net.local_peer_id()). The presence layer binds the
+            // signer key to the claimed sender, so a beacon signed by any
+            // other key would be rejected by every receiver (including this
+            // node's own loopback path).
             let pw = presence::PresenceWrapper::new(
                 peer_id,
+                identity.machine_keypair().to_bytes(),
                 std::sync::Arc::clone(net),
                 presence_config,
                 bootstrap_cache.clone(),

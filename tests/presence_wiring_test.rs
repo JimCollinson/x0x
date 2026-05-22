@@ -129,7 +129,14 @@ async fn test_online_agents_uses_presence_beacon_liveness() -> Result<(), Box<dy
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let peer_bytes = [42u8; 32];
+    // The presence layer binds the beacon signer key to the claimed sender:
+    // a signed beacon is only accepted when
+    // `PeerId::from_pubkey(signer_pubkey) == sender`. Derive the sender (and
+    // the discovered agent's machine_id) from the very keypair we sign with so
+    // the binding holds — a fixed [42; 32] sender signed by an unrelated key is
+    // correctly rejected.
+    let signing_key = MlDsaKeyPair::generate().unwrap();
+    let peer_bytes = *signing_key.peer_id().as_bytes();
     let agent_id = AgentId([7u8; 32]);
     let stale = now.saturating_sub(3_600);
 
@@ -163,7 +170,6 @@ async fn test_online_agents_uses_presence_beacon_liveness() -> Result<(), Box<dy
 
     let peer_id = PeerId::new(peer_bytes);
     let mut record = PresenceRecord::new([3u8; 32], Vec::new(), 300);
-    let signing_key = MlDsaKeyPair::generate().unwrap();
     record.signature = signing_key.sign(&record.signable_bytes()).unwrap();
     record.signer_pubkey = signing_key.public_key.clone();
     let message = PresenceMessage::Beacon {

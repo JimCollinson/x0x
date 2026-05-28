@@ -28,3 +28,28 @@ pub async fn create(output: Option<PathBuf>) -> Result<()> {
     println!("Created user identity keypair at {}", path.display());
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::load_user_keypair_from;
+    use anyhow::ensure;
+
+    #[tokio::test]
+    async fn create_writes_loadable_user_keypair() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("user.key");
+
+        create(Some(path.clone())).await?;
+
+        ensure!(path.is_file(), "user key file should exist");
+        ensure!(
+            path.metadata()?.len() > 0,
+            "user key file should not be empty"
+        );
+        let loaded = load_user_keypair_from(&path).await?;
+        let _user_id = loaded.user_id();
+
+        Ok(())
+    }
+}

@@ -330,6 +330,7 @@ enum AgentSub {
 #[derive(Subcommand)]
 enum UserIdSub {
     /// Create a new user identity keypair (ML-DSA-65). Defaults to ~/.x0x/user.key.
+    /// Overwrites any existing file at the target path without prompting.
     Create {
         /// Output path. Existing file at this path is overwritten.
         path: Option<PathBuf>,

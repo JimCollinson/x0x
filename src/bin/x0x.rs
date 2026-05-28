@@ -1086,7 +1086,11 @@ async fn run(
             };
         }
         Commands::UserId { sub } => match sub {
-            UserIdSub::Create { path } => return commands::user_id::create(path.clone()).await,
+            UserIdSub::Create { path } => {
+                let resolved = commands::user_id::create(path.clone()).await?;
+                println!("Created user identity keypair at {}", resolved.display());
+                return Ok(());
+            }
         },
         _ => {}
     }

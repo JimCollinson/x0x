@@ -13,7 +13,7 @@ pub fn default_user_key_path() -> Result<PathBuf> {
 }
 
 /// `x0x user-id create [PATH]` — create a user identity keypair on disk.
-pub async fn create(output: Option<PathBuf>) -> Result<()> {
+pub async fn create(output: Option<PathBuf>) -> Result<PathBuf> {
     let path = match output {
         Some(path) => path,
         None => default_user_key_path()?,
@@ -25,8 +25,7 @@ pub async fn create(output: Option<PathBuf>) -> Result<()> {
         .await
         .with_context(|| format!("failed to write user keypair to {}", path.display()))?;
 
-    println!("Created user identity keypair at {}", path.display());
-    Ok(())
+    Ok(path)
 }
 
 #[cfg(test)]
@@ -40,8 +39,12 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         let path = temp_dir.path().join("user.key");
 
-        create(Some(path.clone())).await?;
+        let resolved = create(Some(path.clone())).await?;
 
+        ensure!(
+            resolved == path,
+            "resolved path should match requested path"
+        );
         ensure!(path.is_file(), "user key file should exist");
         ensure!(
             path.metadata()?.len() > 0,

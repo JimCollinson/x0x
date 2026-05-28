@@ -3,11 +3,19 @@
 //! This binary remains buildable from source for scripts that invoke it
 //! directly. New code should use `x0x user-id create [PATH]`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let output = std::env::args().nth(1).map(PathBuf::from);
-    x0x::cli::commands::user_id::create(output).await
+    eprintln!("warning: x0x-user-keygen is deprecated; use `x0x user-id create [PATH]` instead.");
+
+    let output = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .context("usage: x0x-user-keygen <output-path>")?;
+
+    let resolved = x0x::cli::commands::user_id::create(Some(output)).await?;
+    println!("{}", resolved.display());
+    Ok(())
 }

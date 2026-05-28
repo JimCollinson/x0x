@@ -80,6 +80,11 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<AgentSub>,
     },
+    /// Manage user identity.
+    UserId {
+        #[command(subcommand)]
+        sub: UserIdSub,
+    },
     /// Announce identity to network.
     Announce {
         /// Include user identity in announcement.
@@ -319,6 +324,15 @@ enum AgentSub {
         /// Base64-encoded bytes to sign.
         #[arg(long)]
         payload_b64: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserIdSub {
+    /// Create a new user identity keypair (ML-DSA-65). Defaults to ~/.x0x/user.key.
+    Create {
+        /// Output path. Existing file at this path is overwritten.
+        path: Option<PathBuf>,
     },
 }
 
@@ -1070,6 +1084,9 @@ async fn run(
                 commands::daemon::autostart(name).await
             };
         }
+        Commands::UserId { sub } => match sub {
+            UserIdSub::Create { path } => return commands::user_id::create(path.clone()).await,
+        },
         _ => {}
     }
 
@@ -1574,6 +1591,7 @@ async fn run(
         | Commands::Uninstall
         | Commands::Purge
         | Commands::Constitution { .. }
+        | Commands::UserId { .. }
         | Commands::Start { .. }
         | Commands::Instances
         | Commands::Autostart { .. } => unreachable!(),
@@ -1598,6 +1616,7 @@ x0x (v{VERSION})
 |   |   +-- user-id        Show user ID
 |   |   +-- card           Generate shareable identity card
 |   |   +-- import         Import an agent card to contacts
+|   +-- user-id create     Create user identity keypair
 |   +-- announce           Announce identity to network
 |
 +-- Network

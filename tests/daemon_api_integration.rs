@@ -240,7 +240,9 @@ async fn daemon_api_shutdown_with_sse_client() {
         .unwrap();
     assert_eq!(shutdown_response.status(), StatusCode::OK);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // GHA runners are noticeably slower than local — a 5 s deadline flaked
+    // intermittently. Bumped to 30 s; observed local shutdown is <1 s.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = d.try_wait().unwrap() {
             assert!(status.success(), "daemon exited with {status}");

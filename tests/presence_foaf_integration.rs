@@ -357,8 +357,12 @@ async fn test_connected_loopback_presence_and_foaf_discovers_peer(
         .replace_broadcast_peers(connected_peers)
         .await;
 
-    let foaf_agents =
-        timeout(Duration::from_secs(3), agent_a.discover_agents_foaf(1, 500)).await??;
+    // 3 s flaked on GHA runners; bumped to 15 s. Local discovery converges in <500 ms.
+    let foaf_agents = timeout(
+        Duration::from_secs(15),
+        agent_a.discover_agents_foaf(1, 500),
+    )
+    .await??;
     assert!(
         foaf_agents
             .iter()
@@ -367,7 +371,7 @@ async fn test_connected_loopback_presence_and_foaf_discovers_peer(
     );
 
     let found = timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(15),
         agent_a.discover_agent_by_id(agent_b.agent_id(), 1, 500),
     )
     .await??;

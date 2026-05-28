@@ -228,6 +228,11 @@ pub struct Agent {
     identity_ttl_secs: u64,
     /// Handle for the running heartbeat task, if started.
     heartbeat_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Handle for the background discovery cache reaper task (periodic
+    /// TTL pruning of identity/machine/user discovery caches). Added as
+    /// the primary x0x-owned mitigation for the historical unbounded
+    /// memory growth observed on long-running nodes.
+    discovery_cache_reaper_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Whether a rendezvous `ProviderSummary` advertisement is active.
     rendezvous_advertised: std::sync::atomic::AtomicBool,
     /// Contact store for trust evaluation of incoming identity announcements.
@@ -279,6 +284,11 @@ impl Drop for Agent {
     fn drop(&mut self) {
         if let Ok(mut handle_guard) = self.heartbeat_handle.try_lock() {
             if let Some(handle) = handle_guard.take() {
+                handle.abort();
+            }
+        }
+        if let Ok(mut reaper_guard) = self.discovery_cache_reaper_handle.try_lock() {
+            if let Some(handle) = reaper_guard.take() {
                 handle.abort();
             }
         }
@@ -502,6 +512,13 @@ pub const IDENTITY_TTL_SECS: u64 = 900;
 
 const DISCOVERY_REBROADCAST_STATE_CAP: usize = 1024;
 const DISCOVERY_REBROADCAST_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Interval (seconds) between runs of the background discovery cache reaper.
+/// The reaper performs TTL-based pruning using the same identity_ttl
+/// horizon as the query paths on the identity / machine / user discovery
+/// HashMaps. This converts the caches from unbounded growth (only filtered
+/// at read time) into bounded working-set + retention-window structures.
+const DISCOVERY_CACHE_REAPER_INTERVAL_SECS: u64 = 120;
 
 fn discovery_record_is_live(_announced_at: u64, last_seen: u64, cutoff: u64) -> bool {
     last_seen >= cutoff
@@ -2787,6 +2804,7 @@ impl Agent {
     /// but this guarantees a final save.
     pub async fn shutdown(&self) {
         self.stop_identity_heartbeat().await;
+        self.stop_discovery_cache_reaper().await;
 
         // Shut down presence beacons.
         if let Some(ref pw) = self.presence {
@@ -2819,6 +2837,81 @@ impl Agent {
                 Err(e) => tracing::warn!("Identity heartbeat task failed during shutdown: {e}"),
             }
         }
+    }
+
+    async fn stop_discovery_cache_reaper(&self) {
+        let handle = {
+            let mut handle_guard = self.discovery_cache_reaper_handle.lock().await;
+            handle_guard.take()
+        };
+
+        if let Some(handle) = handle {
+            handle.abort();
+            match handle.await {
+                Ok(()) => tracing::debug!("Discovery cache reaper stopped"),
+                Err(e) if e.is_cancelled() => {
+                    tracing::debug!("Discovery cache reaper aborted")
+                }
+                Err(e) => tracing::warn!("Discovery cache reaper failed during shutdown: {e}"),
+            }
+        }
+    }
+
+    /// Background task body: periodically prunes the three discovery caches
+    /// using the same TTL logic as the query paths (last_seen >= cutoff).
+    /// This is the active counterpart to the previous read-only filtering,
+    /// preventing unbounded accumulation on long-running daemons.
+    async fn discovery_cache_reaper_loop(
+        identity_cache: std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        machine_cache: std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
+        >,
+        user_cache: std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::UserId, DiscoveredUser>>,
+        >,
+        ttl_secs: u64,
+        interval: std::time::Duration,
+    ) {
+        loop {
+            tokio::time::sleep(interval).await;
+            let cutoff = Self::unix_timestamp_secs().saturating_sub(ttl_secs);
+            // Identity cache
+            {
+                let mut c = identity_cache.write().await;
+                c.retain(|_, a| a.last_seen >= cutoff);
+            }
+            // Machine cache
+            {
+                let mut c = machine_cache.write().await;
+                c.retain(|_, m| m.last_seen >= cutoff);
+            }
+            // User cache
+            {
+                let mut c = user_cache.write().await;
+                c.retain(|_, u| u.last_seen >= cutoff);
+            }
+        }
+    }
+
+    async fn start_discovery_cache_reaper(&self) -> error::Result<()> {
+        let mut guard = self.discovery_cache_reaper_handle.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+
+        let identity = std::sync::Arc::clone(&self.identity_discovery_cache);
+        let machine = std::sync::Arc::clone(&self.machine_discovery_cache);
+        let user = std::sync::Arc::clone(&self.user_discovery_cache);
+        let ttl = self.identity_ttl_secs;
+        let interval = std::time::Duration::from_secs(DISCOVERY_CACHE_REAPER_INTERVAL_SECS);
+
+        let handle = tokio::spawn(Self::discovery_cache_reaper_loop(
+            identity, machine, user, ttl, interval,
+        ));
+        *guard = Some(handle);
+        Ok(())
     }
 
     // === Direct Messaging ===
@@ -4174,10 +4267,12 @@ impl Agent {
         Ok(agents)
     }
 
-    /// Return all discovered agents regardless of TTL.
+    /// Return all currently retained discovered agents, regardless of TTL.
     ///
-    /// Unlike [`Self::discovered_agents`], this method skips TTL filtering and
-    /// returns all cache entries, including stale ones. Useful for debugging.
+    /// Unlike [`Self::discovered_agents`], this method skips read-time TTL
+    /// filtering. After [`Self::join_network`] starts the background discovery
+    /// cache reaper, stale entries may still be physically removed, so this is
+    /// a retained-cache view rather than an "all agents ever seen" archive.
     ///
     /// # Errors
     ///
@@ -4238,7 +4333,12 @@ impl Agent {
         Ok(machines)
     }
 
-    /// Return all discovered machines regardless of TTL.
+    /// Return all currently retained discovered machines, regardless of TTL.
+    ///
+    /// Unlike [`Self::discovered_machines`], this method skips read-time TTL
+    /// filtering. After [`Self::join_network`] starts the background discovery
+    /// cache reaper, stale entries may still be physically removed, so this is
+    /// a retained-cache view rather than an "all machines ever seen" archive.
     ///
     /// # Errors
     ///
@@ -4436,6 +4536,20 @@ impl Agent {
             .collect();
         users.sort_by_key(|u| u.user_id.0);
         Ok(users)
+    }
+
+    /// Return the current retained entry counts for the three discovery caches.
+    ///
+    /// Primarily intended for diagnostics and soak monitoring. The reaper
+    /// (started by `join_network`) keeps these bounded by physically removing
+    /// stale entries; without the reaper the counts grow monotonically with
+    /// every unique agent/machine/user ever observed.
+    #[must_use]
+    pub async fn discovery_cache_entry_counts(&self) -> (usize, usize, usize) {
+        let id = self.identity_discovery_cache.read().await.len();
+        let mach = self.machine_discovery_cache.read().await.len();
+        let usr = self.user_discovery_cache.read().await.len();
+        (id, mach, usr)
     }
 
     async fn start_identity_listener(&self) -> error::Result<()> {
@@ -5330,6 +5444,9 @@ impl Agent {
         }
         if let Err(e) = self.start_identity_heartbeat().await {
             tracing::warn!("Failed to start identity heartbeat: {e}");
+        }
+        if let Err(e) = self.start_discovery_cache_reaper().await {
+            tracing::warn!("Failed to start discovery cache reaper: {e}");
         }
 
         // Schedule a fresh re-announcement after gossip topology stabilizes.
@@ -7302,6 +7419,7 @@ impl AgentBuilder {
                 .unwrap_or(IDENTITY_HEARTBEAT_INTERVAL_SECS),
             identity_ttl_secs: self.identity_ttl_secs.unwrap_or(IDENTITY_TTL_SECS),
             heartbeat_handle: tokio::sync::Mutex::new(None),
+            discovery_cache_reaper_handle: tokio::sync::Mutex::new(None),
             rendezvous_advertised: std::sync::atomic::AtomicBool::new(false),
             contact_store,
             direct_messaging,

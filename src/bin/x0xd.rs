@@ -13138,6 +13138,7 @@ async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
         Some(snap) => {
             let pubsub_stages =
                 augment_pubsub_stage_diagnostics(state.agent.gossip_pubsub_stage_stats());
+            let (agents, machines, users) = state.agent.discovery_cache_entry_counts().await;
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -13146,6 +13147,11 @@ async fn gossip_diagnostics(State(state): State<Arc<AppState>>) -> impl IntoResp
                 "pubsub_stages": pubsub_stages,
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
+                "discovery_cache_entries": {
+                    "agents": agents,
+                    "machines": machines,
+                    "users": users,
+                },
                 })),
             )
         }

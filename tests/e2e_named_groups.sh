@@ -31,7 +31,7 @@ set -uo pipefail
 
 ROOT="$(pwd)"
 X0XD="${X0XD:-$ROOT/target/release/x0xd}"
-X0X_USER_KEYGEN="${X0X_USER_KEYGEN:-$ROOT/target/release/x0x-user-keygen}"
+X0X="${X0X:-$ROOT/target/release/x0x}"
 AA="http://127.0.0.1:19911"
 BA="http://127.0.0.1:19912"
 CA="http://127.0.0.1:19913"
@@ -56,8 +56,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ ! -x "$X0XD" ] || [ ! -x "$X0X_USER_KEYGEN" ]; then
-  echo "Build first: cargo build --release --bin x0xd --bin x0x-user-keygen" >&2
+if [ ! -x "$X0XD" ] || [ ! -x "$X0X" ]; then
+  echo "Build first: cargo build --release --bin x0xd --bin x0x" >&2
   exit 1
 fi
 
@@ -171,7 +171,7 @@ printf "${CYAN}║    Run: $TS                                 ║${NC}\n"
 printf "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}\n"
 
 # Generate shared user key so daemons have a common user identity.
-"$X0X_USER_KEYGEN" "$USER_KEY_PATH" >/dev/null
+"$X0X" user-id create "$USER_KEY_PATH" >/dev/null
 
 info "Starting 3 daemons..."
 AP=$(start_daemon "$ADIR" alice 19921 19911 '"127.0.0.1:19922"')

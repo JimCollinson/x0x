@@ -20,6 +20,7 @@ pub mod purge;
 pub mod store;
 pub mod tasks;
 pub mod upgrade;
+pub mod user_id;
 pub mod ws;
 
 use crate::api;

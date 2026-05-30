@@ -717,6 +717,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     _net = _x0x_select(args)
     _x0x_banner(_net)
 
+    # Scale the aggregate Phase A target to the active node set. Phase A is an
+    # all-directed-pairs DM matrix (n*(n-1) pairs), so excluding a node from the
+    # token file must scale this bar instead of failing every window. 6 nodes
+    # -> 30 (unchanged), 5 -> 20. Mirrors the per-window scaling in
+    # launch_readiness.py. This corrects the denominator for the matrix size; it
+    # is not a relaxation of the per-pair delivery requirement.
+    global SOAK_MIN_PHASE_A_PAIRS
+    try:
+        _node_count = sum(
+            1 for _ln in Path(_net.token_file).read_text().splitlines()
+            if re.search(r"_IP\s*=", _ln)
+        )
+        if _node_count >= 2:
+            SOAK_MIN_PHASE_A_PAIRS = _node_count * (_node_count - 1)
+            LOG.info(
+                "phase A aggregate target scaled to %d pairs for %d-node set",
+                SOAK_MIN_PHASE_A_PAIRS, _node_count,
+            )
+    except OSError as _e:
+        LOG.warning("could not read token file to scale phase A target: %s", _e)
+
     repo_root = Path(__file__).resolve().parents[1]
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     soak_dir = Path(args.soak_dir) if args.soak_dir else (

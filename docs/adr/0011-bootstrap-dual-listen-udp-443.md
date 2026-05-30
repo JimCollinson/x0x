@@ -92,7 +92,9 @@ unprivileged and inbound is relayed anyway.
   second service (e.g. `x0xd-443.service`) running as root with its own state
   dir and `bind_address = "[::]:443"`; the existing `:5483` service is
   unchanged. Deploy with `.deployment/deploy-443.sh` (generates the `:443`
-  config from the host's live `/etc/x0x/x0xd.toml` so it can't drift).
+  config from the host's live `/etc/x0x/config.toml`, overriding `bind_address`,
+  `data_dir`, `machine_key_path`, and `api_address` (→ `12643`, distinct from
+  the prod `12600`) so it can't drift and can't collide on the API port).
 - **Self-update caveat:** both services exec the same `/opt/x0x/x0xd`, but the
   self-updater only restarts `x0xd.service`. After a binary upgrade the `:443`
   instance keeps running the old image until it is restarted

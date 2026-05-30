@@ -331,34 +331,52 @@ pub fn assess_transport_environment(obs: &TransportObservation) -> TransportEnvi
         ));
     }
 
-    // 4. No direct reachability with no working connections — a generic
-    //    "handshakes aren't completing" signal, most actionable when paired
-    //    with a VPN/MTU signal above.
-    let no_inbound_no_peers = obs.can_receive_direct == Some(false) && obs.connected_peers == 0;
-    if no_inbound_no_peers {
+    // 4. Is connectivity actually impaired? A node with connected peers is
+    //    working — even at the 1200-byte QUIC MTU floor with some black-holed
+    //    larger-packet probes (a real, common case on tunnelled paths). So
+    //    constrained-MTU is *informational*, not a degradation: flagging a
+    //    node with live peers "degraded" only cries wolf. "Degraded" is
+    //    reserved for paths genuinely breaking connectivity:
+    //      - a full-tunnel VPN egress (Cloudflare WARP) — known-hostile to the
+    //        high UDP ports x0x uses, worth surfacing even if some connections
+    //        currently succeed; or
+    //      - zero connected peers together with an explaining cause (CGNAT /
+    //        no inbound / a constrained path).
+    let no_peers = obs.connected_peers == 0;
+    let no_inbound = obs.can_receive_direct == Some(false);
+    if no_peers && no_inbound {
         reasons.push("node cannot receive direct inbound and has no connected peers".to_string());
     }
 
-    let degraded = vpn_suspected || constrained_mtu || (cgnat_suspected && no_inbound_no_peers);
+    let degraded =
+        vpn_suspected || (no_peers && (cgnat_suspected || no_inbound || constrained_mtu));
 
-    let guidance = if !degraded {
-        None
-    } else if vpn_suspected || constrained_mtu {
+    let guidance = if vpn_suspected {
         Some(
-            "Full-tunnel VPN (e.g. Cloudflare WARP) or constrained-MTU path detected; \
-             x0x P2P is degraded. Use split-tunnel mode and exclude x0x, or switch the VPN \
-             to DNS-only / 1.1.1.1 mode. x0x bootstrap nodes also listen on UDP/443, which \
-             traverses most port-throttling networks; MTU below 1200 cannot run QUIC on any \
-             port."
+            "Full-tunnel VPN (e.g. Cloudflare WARP) detected; it throttles/drops the high UDP \
+             ports x0x uses and degrades P2P even when some connections succeed. Use \
+             split-tunnel mode and exclude x0x, or switch the VPN to DNS-only / 1.1.1.1 mode. \
+             x0x bootstrap nodes also listen on UDP/443, which traverses most port-throttling \
+             networks (but cannot raise a sub-1200 path MTU)."
                 .to_string(),
         )
-    } else {
+    } else if degraded && cgnat_suspected {
         Some(
             "Carrier-grade NAT detected and no peers connected; direct inbound is impossible. \
              x0x will relay through bootstrap/relay nodes — ensure UDP/443 and UDP/5483 \
              outbound are not blocked."
                 .to_string(),
         )
+    } else if degraded {
+        Some(
+            "No peers connected and the path looks constrained (low MTU / black-holed large \
+             packets / no inbound). x0x bootstrap nodes listen on UDP/443, which traverses most \
+             port-throttling networks; a path that cannot carry QUIC's 1200-byte Initial cannot \
+             run QUIC on any port."
+                .to_string(),
+        )
+    } else {
+        None
     };
 
     TransportEnvironment {
@@ -634,24 +652,50 @@ mod tests {
     }
 
     #[test]
-    fn sub_floor_mtu_is_critical_and_degraded() {
-        // WHY: an MTU near/below the 1200 QUIC floor is the hard-failure case;
-        // it must surface as critical so the user knows port 443 won't save them.
-        let mut o = obs(&["203.0.113.7:5483"]);
-        o.min_observed_mtu = Some(1232);
+    fn constrained_mtu_with_peers_connected_is_not_degraded() {
+        // WHY (learned from a live :443 probe that reported MTU 1200 + 13 black
+        // holes while 8 peers were connected): a node with live peers is working
+        // even at the QUIC MTU floor. Constrained-MTU is informational here, not
+        // a degradation — labelling a connected node "degraded" only cries wolf.
+        let mut o = obs(&["203.0.113.7:5483"]); // helper sets connected_peers = 5
+        o.min_observed_mtu = Some(1200);
+        o.black_holes_detected = 13;
         let env = assess_transport_environment(&o);
-        assert!(env.constrained_mtu);
+        assert!(
+            env.constrained_mtu,
+            "low MTU + black holes is still flagged"
+        );
         assert!(env.mtu_critical);
-        assert!(env.degraded);
+        assert!(
+            !env.degraded,
+            "a node with connected peers must never be labelled degraded"
+        );
+        assert!(env.guidance.is_none());
     }
 
     #[test]
-    fn lost_plpmtud_probes_alone_signal_constrained_mtu() {
+    fn lost_plpmtud_probes_signal_constrained_mtu_but_not_degraded_when_connected() {
         let mut o = obs(&["203.0.113.7:5483"]);
         o.lost_plpmtud_probes = 3;
         let env = assess_transport_environment(&o);
         assert!(env.constrained_mtu);
-        assert!(env.degraded);
+        assert!(
+            !env.degraded,
+            "lossy probes while connected is not an outage"
+        );
         assert!(!env.mtu_critical, "no MTU value reported, so not critical");
+    }
+
+    #[test]
+    fn no_peers_with_no_inbound_is_degraded_with_actionable_guidance() {
+        // WHY: the actual silent-failure case ADR-0011 §4 targets — a client
+        // that cannot connect at all must get explicit guidance, not silence.
+        let mut o = obs(&["203.0.113.7:5483"]);
+        o.connected_peers = 0;
+        o.can_receive_direct = Some(false);
+        let env = assess_transport_environment(&o);
+        assert!(env.degraded);
+        assert!(!env.vpn_suspected && !env.cgnat_suspected);
+        assert!(env.guidance.unwrap().contains("UDP/443"));
     }
 }

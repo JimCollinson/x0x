@@ -25,14 +25,15 @@
 //! per-group **keys** (`verifying_key` / `agreement_key`) are distinct and
 //! unlinkable across groups.
 //!
-//! Unlinkability caveat: the keys are per-group, but the `MemberId` is **not** —
-//! it is bridged from the [`AgentId`] (first 16 bytes) via
-//! [`crate::mls::agent_id_to_member_id`] and is therefore the **same label in
-//! every group the agent joins**, and it is embedded in the signed credential
-//! inside each `KeyPackage`. A member who shares two groups with the agent can
-//! correlate them by `MemberId`. If full cross-group unlinkability is required,
-//! derive the `MemberId` per group too (tracked for the Phase 2 wiring decision,
-//! ADR-0012).
+//! Unlinkability: both the per-group **keys** (`verifying_key` /
+//! `agreement_key`) and the saorsa-mls `MemberId` are derived from the per-group
+//! seed (see [`member_id_from_seed`]), so the `MemberId` label embedded in each
+//! `KeyPackage` credential is **distinct and unlinkable across the groups an
+//! agent joins** — a member who shares two groups with the agent cannot
+//! correlate them by `MemberId`. This is the per-group decision recorded in
+//! ADR-0012 (review finding #2). The legacy GSS plane ([`crate::mls::group`])
+//! keeps the stable per-agent [`crate::mls::agent_id_to_member_id`] label; the
+//! two planes deliberately use different `MemberId`s.
 //!
 //! Determinism contract: the same `(agent, seed)` yields the same *public keys*
 //! (so a restored identity re-attaches to its leaf), but **not** a byte-identical
@@ -41,7 +42,7 @@
 //! join.
 
 use crate::identity::AgentId;
-use crate::mls::{agent_id_to_member_id, MlsError, Result};
+use crate::mls::{MlsError, Result};
 use saorsa_mls::{
     treekem_group::{ApplicationCiphertext, TreeKemCommit, TreeKemGroup, TreeKemWelcome},
     CipherSuite, KeyPackage, MemberIdentity,
@@ -66,6 +67,26 @@ pub fn derive_identity_seed(agent_secret: &[u8], group_id: &[u8]) -> [u8; 32] {
     hasher.update(&(group_id.len() as u64).to_le_bytes());
     hasher.update(group_id);
     *hasher.finalize().as_bytes()
+}
+
+/// Derive the per-group saorsa-mls `MemberId` (16 bytes) from the identity
+/// `seed`.
+///
+/// Unlike the legacy GSS plane's [`crate::mls::agent_id_to_member_id`] (the
+/// stable first-16-bytes-of-`AgentId` label, identical across an agent's
+/// groups), this binds the `MemberId` to the per-group seed — which already
+/// folds in the agent's secret and the `group_id` (see [`derive_identity_seed`]).
+/// The result is a `MemberId` that is **unlinkable across groups** yet
+/// deterministic, so a restored identity re-derives the same label and
+/// re-attaches to its leaf. Resolves ADR-0012 review finding #2. The BLAKE3
+/// derive-key mode domain-separates this from other uses of the seed.
+fn member_id_from_seed(seed: &[u8; 32]) -> saorsa_mls::MemberId {
+    let mut hasher = blake3::Hasher::new_derive_key("x0x treekem member-id v1");
+    hasher.update(seed);
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    saorsa_mls::MemberId::from_bytes(bytes)
 }
 
 fn encode<T: Serialize>(value: &T, what: &str) -> Result<Vec<u8>> {
@@ -156,13 +177,15 @@ impl TreeKemMlsGroup {
         CipherSuite::default()
     }
 
-    /// Deterministically derive `agent`'s `MemberIdentity` from `seed`. The same
-    /// `(agent, seed)` always yields an identity with the same public keys, so it
-    /// re-attaches to its leaf after a restart (saorsa-mls matches leaves on
-    /// stable public keys, not byte-identical key packages — ML-DSA signing is
-    /// randomized upstream).
-    fn identity_from_seed(agent: &AgentId, seed: &[u8; 32]) -> Result<MemberIdentity> {
-        let member_id = agent_id_to_member_id(agent);
+    /// Deterministically derive a `MemberIdentity` from a per-group `seed`. The
+    /// same `seed` always yields an identity with the same `MemberId` and the
+    /// same public keys, so it re-attaches to its leaf after a restart
+    /// (saorsa-mls matches leaves on stable public keys, not byte-identical key
+    /// packages — ML-DSA signing is randomized upstream). Both the `MemberId`
+    /// ([`member_id_from_seed`]) and the keys are bound to the seed, giving
+    /// per-group unlinkability (ADR-0012 finding #2).
+    fn identity_from_seed(seed: &[u8; 32]) -> Result<MemberIdentity> {
+        let member_id = member_id_from_seed(seed);
         MemberIdentity::from_seed(member_id, Self::suite(), seed)
             .map_err(|e| MlsError::Identity(format!("from_seed: {e}")))
     }
@@ -176,7 +199,7 @@ impl TreeKemMlsGroup {
     /// # Errors
     /// Returns [`MlsError`] if identity derivation or group creation fails.
     pub fn create(group_id: Vec<u8>, creator: AgentId, seed: &[u8; 32]) -> Result<Self> {
-        let identity = Self::identity_from_seed(&creator, seed)?;
+        let identity = Self::identity_from_seed(seed)?;
         let inner = TreeKemGroup::create(group_id, identity)
             .map_err(|e| MlsError::SaorsaMls(format!("treekem create: {e}")))?;
 
@@ -200,7 +223,7 @@ impl TreeKemMlsGroup {
     /// # Errors
     /// Returns [`MlsError`] if identity derivation or key-package encoding fails.
     pub fn prepare_member(agent: AgentId, seed: &[u8; 32]) -> Result<PreparedMember> {
-        let identity = Self::identity_from_seed(&agent, seed)?;
+        let identity = Self::identity_from_seed(seed)?;
         let key_package_bytes = encode(&identity.key_package, "key package")?;
         Ok(PreparedMember {
             agent,
@@ -383,21 +406,24 @@ impl TreeKemMlsGroup {
             .map_err(|e| MlsError::MlsOperation(format!("treekem snapshot: {e}")))
     }
 
-    /// Restore a group from a snapshot for `member`, re-deriving their identity
+    /// Restore a group from a snapshot for `member`, re-deriving the identity
     /// from `seed`.
     ///
     /// This works for **any** member — creator or joiner — because the identity
-    /// is deterministic in `(member, seed)`: pass the same agent + the same
-    /// per-group seed used at [`Self::create`] / [`Self::prepare_member`] time and
-    /// the re-derived identity re-attaches to its leaf (saorsa-mls matches on
-    /// stable public keys). A snapshot restored with the wrong agent/seed is
-    /// rejected by the inner owner-leaf check.
+    /// is deterministic in `seed` alone: pass the same per-group seed used at
+    /// [`Self::create`] / [`Self::prepare_member`] time and the re-derived
+    /// identity re-attaches to its leaf (saorsa-mls matches on stable public
+    /// keys). A snapshot restored with the wrong `seed` is rejected by the inner
+    /// owner-leaf check. `member` only labels this instance's local
+    /// `agent_to_leaf` map; the daemon always pairs an agent with the seed
+    /// derived from *its own* secret, so a caller cannot accidentally restore
+    /// another agent's leaf without also holding that agent's seed.
     ///
     /// # Errors
     /// Returns [`MlsError`] if the snapshot is malformed, or the re-derived
-    /// identity does not own a leaf in the snapshot (wrong agent/seed).
+    /// identity does not own a leaf in the snapshot (wrong `seed`).
     pub fn restore(snapshot: &[u8], member: AgentId, seed: &[u8; 32]) -> Result<Self> {
-        let identity = Self::identity_from_seed(&member, seed)?;
+        let identity = Self::identity_from_seed(seed)?;
         let inner = TreeKemGroup::from_snapshot_bytes(snapshot, identity)
             .map_err(|e| MlsError::MlsOperation(format!("treekem restore: {e}")))?;
         let mut agent_to_leaf = HashMap::new();
@@ -416,10 +442,11 @@ mod tests {
     use super::*;
 
     fn agent(id: u8) -> AgentId {
+        // The TreeKEM identity (keys + MemberId) is derived from the per-group
+        // seed, not the AgentId, so distinct test seeds are what give distinct
+        // identities; the exact AgentId bytes only label the local leaf map.
         let mut bytes = [0u8; 32];
         bytes[0] = id;
-        // Vary more than the first byte so distinct agents map to distinct
-        // MemberIds even though the bridge only reads the first 16 bytes.
         bytes[1] = id.wrapping_mul(7).wrapping_add(1);
         AgentId(bytes)
     }
@@ -557,6 +584,61 @@ mod tests {
         assert_ne!(s1, s2, "different groups must yield different seeds");
         let s1b = derive_identity_seed(secret, b"group-A");
         assert_eq!(s1, s1b, "derivation must be deterministic");
+    }
+
+    #[test]
+    fn member_id_is_per_group_and_deterministic() {
+        // ADR-0012 finding #2: the MemberId must be unlinkable across groups.
+        // Two different per-group seeds -> different MemberIds; the same seed
+        // always yields the same MemberId (so restore re-derives it).
+        let secret = b"agent-secret-key-bytes";
+        let seed_a = derive_identity_seed(secret, b"group-A");
+        let seed_b = derive_identity_seed(secret, b"group-B");
+        assert_ne!(
+            member_id_from_seed(&seed_a),
+            member_id_from_seed(&seed_b),
+            "the same agent in two groups must get distinct MemberIds"
+        );
+        assert_eq!(
+            member_id_from_seed(&seed_a),
+            member_id_from_seed(&seed_a),
+            "MemberId derivation must be deterministic"
+        );
+    }
+
+    #[test]
+    fn same_agent_in_two_groups_is_cryptographically_unlinkable() {
+        // ADR-0012 finding #2 end-to-end: one agent, two groups -> the published
+        // KeyPackages share NO public material (keys *and* credential differ), so
+        // an observer in both groups cannot correlate the agent.
+        let agent_id = agent(1);
+        let secret = b"the-agents-long-term-secret";
+        let kp_a: KeyPackage = decode(
+            TreeKemMlsGroup::prepare_member(agent_id, &derive_identity_seed(secret, b"group-A"))
+                .expect("prepare A")
+                .key_package_bytes(),
+            "kp",
+        )
+        .expect("decode A");
+        let kp_b: KeyPackage = decode(
+            TreeKemMlsGroup::prepare_member(agent_id, &derive_identity_seed(secret, b"group-B"))
+                .expect("prepare B")
+                .key_package_bytes(),
+            "kp",
+        )
+        .expect("decode B");
+        assert_ne!(
+            kp_a.verifying_key, kp_b.verifying_key,
+            "signing keys must differ across groups"
+        );
+        assert_ne!(
+            kp_a.agreement_key, kp_b.agreement_key,
+            "KEM keys must differ across groups"
+        );
+        assert_ne!(
+            kp_a.credential, kp_b.credential,
+            "credentials (which embed the MemberId) must differ across groups"
+        );
     }
 
     #[test]

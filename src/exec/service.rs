@@ -1548,6 +1548,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sessions_snapshot_includes_pending_and_active_sessions() {
+        let service = test_service().await;
+        let request_id = ExecRequestId([21; 16]);
+        let target = AgentId([22; 32]);
+        let (tx, _rx) = mpsc::channel(1);
+        service.pending_clients.lock().await.insert(
+            request_id,
+            PendingClient {
+                target,
+                tx,
+                argv_summary: "echo pending".to_string(),
+                started_at: Instant::now() - Duration::from_millis(10),
+            },
+        );
+
+        let (cancel_tx, _cancel_rx) = watch::channel(CancelReason::ExplicitCancel);
+        service.active_servers.lock().await.insert(
+            ExecRequestId([23; 16]),
+            ActiveServerSession {
+                agent_id: AgentId([24; 32]),
+                machine_id: MachineId([25; 32]),
+                cancel_tx,
+                lease_deadline: Arc::new(Mutex::new(Instant::now() + Duration::from_secs(10))),
+                last_activity: Arc::new(Mutex::new(Instant::now())),
+                argv_summary: "echo active".to_string(),
+                started_at: Instant::now() - Duration::from_millis(20),
+            },
+        );
+
+        let snap = service.sessions_snapshot().await;
+        assert_eq!(snap.pending_clients.len(), 1);
+        assert_eq!(
+            snap.pending_clients[0].request_id,
+            hex::encode(request_id.0)
+        );
+        assert_eq!(
+            snap.pending_clients[0].target_agent_id,
+            hex::encode(target.0)
+        );
+        assert_eq!(snap.pending_clients[0].argv_summary, "echo pending");
+        assert_eq!(snap.active_servers.len(), 1);
+        assert_eq!(snap.active_servers[0].argv_summary, "echo active");
+        assert!(snap.active_servers[0].age_ms <= 1_000);
+    }
+
+    #[test]
+    fn argv_summary_returns_short_commands_unchanged() {
+        let argv = vec!["echo".to_string(), "hello".to_string()];
+        assert_eq!(argv_summary(&argv), "echo hello");
+    }
+
+    #[test]
+    fn argv_summary_truncates_long_commands_with_ellipsis() {
+        let argv = vec!["x".repeat(200)];
+        let summary = argv_summary(&argv);
+        assert_eq!(summary.chars().count(), 160);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn stream_name_and_signal_number_are_stable() {
+        assert_eq!(stream_name(StreamKind::Stdout), "stdout");
+        assert_eq!(stream_name(StreamKind::Stderr), "stderr");
+        assert_eq!(signal_number(TermSignal::Term), 15);
+        assert_eq!(signal_number(TermSignal::Kill), 9);
+    }
+
+    #[test]
+    fn status_signal_none_returns_none() {
+        assert_eq!(status_signal(None), None);
+    }
+
+    #[tokio::test]
     async fn try_acquire_slot_returns_some_when_available() {
         let service = test_service().await;
         let agent = AgentId([9; 32]);

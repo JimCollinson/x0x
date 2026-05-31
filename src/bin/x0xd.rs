@@ -431,6 +431,14 @@ struct AppState {
     mls_groups: RwLock<HashMap<String, x0x::mls::MlsGroup>>,
     #[allow(dead_code)]
     mls_groups_path: PathBuf,
+    /// Live real-TreeKEM groups (ADR-0012), keyed by group-id hex. Each is
+    /// wrapped in its own async mutex so a group's encrypt/decrypt/commit op
+    /// and the snapshot-persist that follows it are serialized per group
+    /// without blocking other groups (and without holding the map lock across
+    /// disk IO). Snapshots persist under [`Self::treekem_dir`].
+    treekem_groups: RwLock<HashMap<String, Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>>>,
+    /// Directory holding `<group_id>.snap` TreeKEM snapshots (mode 0600).
+    treekem_dir: PathBuf,
     /// Active WebSocket sessions.
     ws_sessions: RwLock<HashMap<String, WsSession>>,
     /// Shared WS topic state (single lock for channel + subscribers + forwarder per topic).
@@ -1466,6 +1474,20 @@ async fn main() -> Result<()> {
     let agent = Arc::new(agent);
     let (exec_dm_tx, exec_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
+
+    // ADR-0012 Phase 4: restore live TreeKEM groups from on-disk snapshots.
+    // Must happen before the AppState is built so secure endpoints see the
+    // groups immediately. Done with `named_groups` still owned (it is moved
+    // into the RwLock below).
+    let treekem_dir = config.data_dir.join("treekem");
+    if let Err(e) = tokio::fs::create_dir_all(&treekem_dir).await {
+        tracing::warn!(
+            "failed to create TreeKEM snapshot dir {}: {e}",
+            treekem_dir.display()
+        );
+    }
+    let treekem_groups = restore_treekem_groups(&named_groups, agent.as_ref(), &treekem_dir).await;
+
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
         subscriptions: RwLock::new(HashMap::new()),
@@ -1491,6 +1513,8 @@ async fn main() -> Result<()> {
         contacts,
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
+        treekem_groups: RwLock::new(treekem_groups),
+        treekem_dir,
         ws_sessions: RwLock::new(HashMap::new()),
         ws_topics: RwLock::new(HashMap::new()),
         api_address: actual_api_addr,
@@ -7740,8 +7764,10 @@ async fn create_named_group(
         None => x0x::groups::GroupPolicy::default(),
     };
 
-    // Create MLS group
-    match x0x::mls::MlsGroup::new(group_id_bytes, agent_id).await {
+    // Create the legacy demo MLS group object (kept for the `/mls/groups/:id`
+    // surface). `.clone()` because the real-TreeKEM routing below also needs
+    // the raw group-id bytes.
+    match x0x::mls::MlsGroup::new(group_id_bytes.clone(), agent_id).await {
         Ok(group) => {
             // Create group metadata with explicit policy.
             let mut info = x0x::groups::GroupInfo::with_policy(
@@ -7764,6 +7790,56 @@ async fn create_named_group(
             // Set creator's display name if provided
             if let Some(dn) = req.display_name {
                 info.set_display_name(&hex::encode(agent_id.as_bytes()), dn);
+            }
+
+            // ADR-0012 Phase 2: new MlsEncrypted groups are secure-by-default
+            // real TreeKEM (FS/PCS), NOT the legacy GSS shared-secret plane.
+            // Build the live TreeKEM group (creator = sole leaf 0), persist its
+            // snapshot at rest, then relabel `info` so no surface claims GSS for
+            // it (drop the GSS shared secret, bind the TreeKEM epoch into the
+            // signed state hash). If TreeKEM setup or persistence fails we fail
+            // the request rather than store a group mislabelled as secure.
+            if info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted {
+                let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+                let tk = match x0x::mls::TreeKemMlsGroup::create(
+                    group_id_bytes.clone(),
+                    agent_id,
+                    &seed,
+                ) {
+                    Ok(tk) => tk,
+                    Err(e) => {
+                        tracing::error!(group_id = %group_id_hex, "failed to create TreeKEM group: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": format!("failed to create secure group: {e}")
+                            })),
+                        );
+                    }
+                };
+                if let Err(e) =
+                    persist_treekem_snapshot(&state.treekem_dir, &group_id_hex, &tk).await
+                {
+                    tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "error": format!("failed to persist secure group: {e}")
+                        })),
+                    );
+                }
+                info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+                info.shared_secret = None;
+                info.secret_epoch = tk.epoch();
+                info.security_binding = Some(format!("treekem:epoch={}", tk.epoch()));
+                info.recompute_state_hash();
+                state
+                    .treekem_groups
+                    .write()
+                    .await
+                    .insert(group_id_hex.clone(), Arc::new(tokio::sync::Mutex::new(tk)));
             }
 
             // Store MLS group
@@ -8802,6 +8878,9 @@ async fn add_named_group_member(
                 ),
             );
         }
+        if let Some(resp) = treekem_membership_unsupported(info) {
+            return resp;
+        }
 
         let agent_hex = hex::encode(agent_id.as_bytes());
         if info.has_member(&agent_hex) {
@@ -8921,6 +9000,9 @@ async fn remove_named_group_member(
                     serde_json::json!({ "ok": false, "error": "only the creator can remove other members" }),
                 ),
             );
+        }
+        if let Some(resp) = treekem_membership_unsupported(info) {
+            return resp;
         }
         if !info.has_member(&agent_id_hex) {
             return (
@@ -9577,6 +9659,9 @@ async fn ban_group_member(
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
     }
+    if let Some(resp) = treekem_membership_unsupported(info) {
+        return resp;
+    }
     if info.caller_role(&agent_id_hex) == Some(x0x::groups::GroupRole::Owner) {
         return (
             StatusCode::FORBIDDEN,
@@ -9713,6 +9798,9 @@ async fn unban_group_member(
     };
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
+    }
+    if let Some(resp) = treekem_membership_unsupported(info) {
+        return resp;
     }
     if !info.is_banned(&agent_id_hex) {
         return (
@@ -10637,7 +10725,13 @@ struct SecureEncryptRequest {
 #[derive(Debug, Deserialize)]
 struct SecureDecryptRequest {
     ciphertext_b64: String,
+    /// GSS plane only: per-message nonce. Unused for TreeKEM, whose
+    /// `ApplicationCiphertext` carries its own nonce.
+    #[serde(default)]
     nonce_b64: String,
+    /// GSS plane only: ciphertext epoch (checked against the local epoch).
+    /// Unused for TreeKEM, whose epoch is embedded in the ciphertext.
+    #[serde(default)]
     secret_epoch: u64,
 }
 
@@ -10648,6 +10742,164 @@ struct SecureDecryptRequest {
 /// cross-daemon encrypt/decrypt with rekey-on-ban, but does NOT provide the
 /// per-message forward secrecy that full MLS TreeKEM would. Documented as
 /// Phase D.2 scope.
+/// Guard for membership-mutating named-group endpoints (add/remove/ban/unban).
+///
+/// Those handlers run the legacy GSS rekey path (`rotate_shared_secret` +
+/// per-recipient reseal). TreeKEM membership is a Commit/Welcome protocol that
+/// lands in a later change (ADR-0012 Phase 3); until then a TreeKEM group is
+/// creator-only. Running the GSS path on a TreeKEM group would silently
+/// re-introduce a shared secret and relabel the plane, so we refuse loudly with
+/// `501 Not Implemented` instead. Returns `Some(response)` to short-circuit when
+/// the group is TreeKEM, `None` (proceed) for GSS groups.
+fn treekem_membership_unsupported(
+    info: &x0x::groups::GroupInfo,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        Some((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM secure-group membership changes are not yet supported (ADR-0012 Phase 3); this group is creator-only for now"
+            })),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Encrypt `payload_b64` for a real-TreeKEM group (ADR-0012). The live group's
+/// send-ratchet advances, so the snapshot is persisted before returning to
+/// prevent send-generation (nonce) reuse across a restart. Returns the
+/// self-describing `ApplicationCiphertext` as `ciphertext_b64`.
+async fn treekem_group_encrypt(
+    state: &AppState,
+    group_id_hex: &str,
+    payload_b64: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use base64::Engine as _;
+    let plaintext = match base64::engine::general_purpose::STANDARD.decode(payload_b64) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid base64 payload" })),
+            );
+        }
+    };
+    let group = {
+        let map = state.treekem_groups.read().await;
+        match map.get(group_id_hex) {
+            Some(g) => Arc::clone(g),
+            None => {
+                return (
+                    StatusCode::FAILED_DEPENDENCY,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "TreeKEM group not loaded — restart or re-share required"
+                    })),
+                );
+            }
+        }
+    };
+    let mut guard = group.lock().await;
+    let ciphertext = match guard.encrypt_message(&plaintext) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("treekem encrypt failed: {e}") }),
+                ),
+            );
+        }
+    };
+    // Persist the advanced ratchet state before returning. Skipping a burned
+    // generation on error is harmless (no reuse); a stale on-disk snapshot is
+    // not, so a persist failure fails the request.
+    if let Err(e) = persist_treekem_snapshot(&state.treekem_dir, group_id_hex, &guard).await {
+        tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot after encrypt: {e}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({ "ok": false, "error": "failed to persist secure group state" }),
+            ),
+        );
+    }
+    let epoch = guard.epoch();
+    drop(guard);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "ciphertext_b64": base64::engine::general_purpose::STANDARD.encode(&ciphertext),
+            "secret_epoch": epoch,
+            "secure_plane": "treekem",
+        })),
+    )
+}
+
+/// Decrypt a real-TreeKEM `ApplicationCiphertext` (ADR-0012). The per-sender
+/// replay window advances, so the snapshot is persisted to keep replay
+/// protection across a restart (best-effort: a persist failure is logged but
+/// does not invalidate the already-recovered plaintext).
+async fn treekem_group_decrypt(
+    state: &AppState,
+    group_id_hex: &str,
+    ciphertext_b64: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use base64::Engine as _;
+    let ciphertext = match base64::engine::general_purpose::STANDARD.decode(ciphertext_b64) {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "invalid base64 ciphertext" })),
+            );
+        }
+    };
+    let group = {
+        let map = state.treekem_groups.read().await;
+        match map.get(group_id_hex) {
+            Some(g) => Arc::clone(g),
+            None => {
+                return (
+                    StatusCode::FAILED_DEPENDENCY,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "TreeKEM group not loaded — restart or re-share required"
+                    })),
+                );
+            }
+        }
+    };
+    let mut guard = group.lock().await;
+    let plaintext = match guard.decrypt_message(&ciphertext) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::json!({ "ok": false, "error": format!("treekem decrypt failed: {e}") }),
+                ),
+            );
+        }
+    };
+    if let Err(e) = persist_treekem_snapshot(&state.treekem_dir, group_id_hex, &guard).await {
+        tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot after decrypt: {e}");
+    }
+    let epoch = guard.epoch();
+    drop(guard);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "payload_b64": base64::engine::general_purpose::STANDARD.encode(&plaintext),
+            "secret_epoch": epoch,
+            "secure_plane": "treekem",
+        })),
+    )
+}
+
 async fn secure_group_encrypt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -10675,6 +10927,12 @@ async fn secure_group_encrypt(
                 "error": "group is not MlsEncrypted — use public send instead"
             })),
         );
+    }
+    // ADR-0012: real-TreeKEM groups encrypt via the live group's ratchet, not
+    // the GSS shared secret. Dispatch on the group's plane.
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        drop(groups);
+        return treekem_group_encrypt(state.as_ref(), &id, &req.payload_b64).await;
     }
     let Some(key) = info.secure_message_key() else {
         return (
@@ -10771,6 +11029,13 @@ async fn secure_group_decrypt(
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({ "ok": false, "error": "not a member" })),
         );
+    }
+    // ADR-0012: real-TreeKEM groups decrypt via the live group's ratchet. A
+    // removed member's leaf is gone from the live group, so decryption of a
+    // post-removal epoch fails there — that is the FS/PCS guarantee.
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        drop(groups);
+        return treekem_group_decrypt(state.as_ref(), &id, &req.ciphertext_b64).await;
     }
     let Some(local_secret) = info.shared_secret.clone() else {
         return (
@@ -13995,6 +14260,95 @@ async fn handle_ws_command(
 async fn save_mls_groups(_state: &AppState) {
     // MLS groups backed by saorsa-mls are not serializable.
     // They are recreated each session.
+}
+
+/// Derive this agent's per-group TreeKEM identity seed from its long-term
+/// ML-DSA secret key and the group's id bytes (ADR-0012). Centralised so the
+/// create path and the restore path always agree on the seed (and therefore on
+/// the re-derived identity / leaf).
+fn agent_treekem_seed(agent: &Agent, group_id_bytes: &[u8]) -> [u8; 32] {
+    let (_public, secret) = agent.identity().agent_keypair().to_bytes();
+    x0x::mls::treekem::derive_identity_seed(&secret, group_id_bytes)
+}
+
+/// Persist a TreeKEM group's snapshot to `<treekem_dir>/<group_id_hex>.snap`
+/// at mode 0600 (ADR-0012 §6 / Phase 4). MUST be called after every
+/// state-advancing op (create, encrypt, decrypt, commit): the snapshot carries
+/// the send-generation counter and per-sender replay windows, so a stale
+/// on-disk copy could resume into nonce reuse or replay acceptance after a
+/// restart.
+async fn persist_treekem_snapshot(
+    treekem_dir: &FsPath,
+    group_id_hex: &str,
+    group: &x0x::mls::TreeKemMlsGroup,
+) -> anyhow::Result<()> {
+    let bytes = group
+        .to_snapshot_bytes()
+        .map_err(|e| anyhow::anyhow!("treekem snapshot encode: {e}"))?;
+    let path = treekem_dir.join(format!("{group_id_hex}.snap"));
+    x0x::storage::write_private_bytes(&path, bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("treekem snapshot write: {e}"))?;
+    Ok(())
+}
+
+/// Rebuild the live TreeKEM group map from on-disk snapshots at startup
+/// (ADR-0012 Phase 4). For every named group tagged
+/// [`x0x::mls::SecureGroupPlane::TreeKem`], restore its snapshot using the
+/// agent's per-group identity seed. A missing or unreadable snapshot is logged
+/// and skipped — the group stays unusable for secure content until re-shared,
+/// never a crash.
+async fn restore_treekem_groups(
+    named_groups: &HashMap<String, x0x::groups::GroupInfo>,
+    agent: &Agent,
+    treekem_dir: &FsPath,
+) -> HashMap<String, Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>> {
+    let mut restored = HashMap::new();
+    let agent_id = agent.agent_id();
+    for (group_id_hex, info) in named_groups {
+        if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+            continue;
+        }
+        let path = treekem_dir.join(format!("{group_id_hex}.snap"));
+        let snapshot = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    group_id = %group_id_hex,
+                    "TreeKEM group tagged but no snapshot on disk; secure content unavailable until re-shared"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(group_id = %group_id_hex, "failed to read TreeKEM snapshot: {e}");
+                continue;
+            }
+        };
+        let group_id_bytes = match hex::decode(&info.mls_group_id) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %group_id_hex,
+                    "invalid mls_group_id hex, cannot restore TreeKEM group: {e}"
+                );
+                continue;
+            }
+        };
+        let seed = agent_treekem_seed(agent, &group_id_bytes);
+        match x0x::mls::TreeKemMlsGroup::restore(&snapshot, agent_id, &seed) {
+            Ok(g) => {
+                tracing::info!(group_id = %group_id_hex, "restored TreeKEM group from snapshot");
+                restored.insert(group_id_hex.clone(), Arc::new(tokio::sync::Mutex::new(g)));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %group_id_hex,
+                    "failed to restore TreeKEM group (wrong identity or corrupt snapshot?): {e}"
+                );
+            }
+        }
+    }
+    restored
 }
 
 async fn load_named_groups(

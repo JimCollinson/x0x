@@ -11,19 +11,9 @@
 //! grandfathered groups (see ADR-0010 / ADR-0012).
 
 use crate::identity::{AgentCertificate, AgentId, UserId};
-use crate::mls::{MlsError, Result};
+use crate::mls::{agent_id_to_member_id, MlsError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-/// Deterministic bridge from x0x `AgentId` (32 bytes) to saorsa-mls `MemberId`
-/// (UUID, 16 bytes). Uses the first 16 bytes of the AgentId.
-fn agent_id_to_member_id(agent_id: &AgentId) -> saorsa_mls::MemberId {
-    // SAFETY: AgentId is always 32 bytes, so slicing [..16] is guaranteed.
-    let bytes: [u8; 16] = agent_id.as_bytes()[..16]
-        .try_into()
-        .expect("AgentId is always 32 bytes");
-    saorsa_mls::MemberId::from_bytes(bytes)
-}
 
 /// MLS group context containing cryptographic state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

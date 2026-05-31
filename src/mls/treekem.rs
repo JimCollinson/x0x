@@ -21,9 +21,18 @@
 //! 0.3.7+). The daemon builds that seed with [`derive_identity_seed`], binding
 //! the agent's long-term secret key material to the `group_id` — so the TreeKEM
 //! leaf is tied to the agent's real identity, the same identity is **re-derivable
-//! after a restart** (enabling [`TreeKemMlsGroup::restore`]), and an agent gets a
-//! distinct, unlinkable identity per group. The `MemberId` is additionally
-//! bridged from the [`AgentId`] (first 16 bytes) as a stable label.
+//! after a restart** (enabling [`TreeKemMlsGroup::restore`]), and an agent's
+//! per-group **keys** (`verifying_key` / `agreement_key`) are distinct and
+//! unlinkable across groups.
+//!
+//! Unlinkability caveat: the keys are per-group, but the `MemberId` is **not** —
+//! it is bridged from the [`AgentId`] (first 16 bytes) via
+//! [`crate::mls::agent_id_to_member_id`] and is therefore the **same label in
+//! every group the agent joins**, and it is embedded in the signed credential
+//! inside each `KeyPackage`. A member who shares two groups with the agent can
+//! correlate them by `MemberId`. If full cross-group unlinkability is required,
+//! derive the `MemberId` per group too (tracked for the Phase 2 wiring decision,
+//! ADR-0012).
 //!
 //! Determinism contract: the same `(agent, seed)` yields the same *public keys*
 //! (so a restored identity re-attaches to its leaf), but **not** a byte-identical
@@ -32,35 +41,13 @@
 //! join.
 
 use crate::identity::AgentId;
-use crate::mls::{MlsError, Result};
+use crate::mls::{agent_id_to_member_id, MlsError, Result};
 use saorsa_mls::{
     treekem_group::{ApplicationCiphertext, TreeKemCommit, TreeKemGroup, TreeKemWelcome},
-    CipherSuite, KeyPackage, MemberId, MemberIdentity,
+    CipherSuite, KeyPackage, MemberIdentity,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-/// Which secure-group plane a group runs on. Persisted in group metadata so the
-/// daemon can dispatch secure-content and membership operations to the right
-/// implementation while GSS and TreeKEM groups coexist (ADR-0012).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TreeKemPlane {
-    /// Legacy Group-Shared-Secret plane ([`crate::mls::group`]). No FS/PCS.
-    Gss,
-    /// Real RFC-9420 TreeKEM plane (this module). FS + PCS.
-    #[default]
-    TreeKem,
-}
-
-/// Deterministic bridge from an x0x [`AgentId`] (32 bytes) to a saorsa-mls
-/// `MemberId` (16 bytes). Uses the first 16 bytes of the AgentId — identical to
-/// the legacy wrapper's bridge so a given agent maps to a stable `MemberId`.
-fn agent_id_to_member_id(agent_id: &AgentId) -> MemberId {
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&agent_id.as_bytes()[..16]);
-    MemberId::from_bytes(bytes)
-}
 
 /// Derive the 32-byte TreeKEM identity seed for an agent in a specific group.
 ///

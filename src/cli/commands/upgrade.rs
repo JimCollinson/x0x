@@ -441,6 +441,33 @@ mod tests {
     use super::*;
     use crate::upgrade::UpgradeError;
 
+    async fn start_download_server(
+        status: u16,
+        body: &'static [u8],
+    ) -> (String, tokio::sync::oneshot::Sender<()>) {
+        let app = axum::Router::new().fallback(move |_req: axum::extract::Request| async move {
+            axum::response::Response::builder()
+                .status(status)
+                .body(axum::body::Body::from(body))
+                .expect("response should build")
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("read listener addr");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service())
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+                .ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (format!("http://{}", addr), tx)
+    }
+
     #[test]
     fn print_signature_recovery_hint_prints_for_signature_error() {
         // Should not panic
@@ -474,5 +501,39 @@ mod tests {
             result.is_none(),
             "should return None without a configured token"
         );
+    }
+
+    #[tokio::test]
+    async fn download_to_file_writes_successful_response() {
+        let (url, _shutdown) = start_download_server(200, b"archive-bytes").await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let destination = dir.path().join("archive");
+
+        download_to_file(&url, &destination)
+            .await
+            .expect("download should succeed");
+
+        let bytes = std::fs::read(destination).expect("read downloaded file");
+        assert_eq!(bytes, b"archive-bytes");
+    }
+
+    #[tokio::test]
+    async fn download_to_file_reports_http_error_status() {
+        let (url, _shutdown) = start_download_server(503, b"unavailable").await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let destination = dir.path().join("archive");
+
+        let result = download_to_file(&url, &destination).await;
+
+        assert!(result.is_err());
+        assert!(result
+            .expect_err("download should fail")
+            .to_string()
+            .contains("download returned error status"));
+    }
+
+    #[tokio::test]
+    async fn stop_daemon_if_running_returns_false_without_port_file() {
+        assert!(!stop_daemon_if_running().await);
     }
 }

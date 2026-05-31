@@ -1,4 +1,8 @@
-# ADR 0010: Priority-Aware PubSub Receive-Pump Shedding
+# ADR 0013: Priority-Aware PubSub Receive-Pump Shedding
+
+> Renumbered from 0010 → 0013 on 2026-05-30 to resolve a numbering collision with
+> ADR-0010 (GSS Before MLS TreeKEM). Content unchanged; references to ADR 0009
+> below are to that separate ADR, not self-references.
 
 ## Status
 

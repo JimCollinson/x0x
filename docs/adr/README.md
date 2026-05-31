@@ -12,7 +12,13 @@ This directory contains architecture decision records for x0x.
 - [ADR 0007: Three-Layer Identity Model](./0007-three-layer-identity-model.md) — machine transport identity, portable agent identity, and optional consent-gated user identity
 - [ADR 0008: Trust Evaluation System](./0008-trust-evaluation-system.md) — unified `(AgentId, MachineId)` pair evaluation with orthogonal trust levels and identity types
 - [ADR 0009: Receive-Pump Overload Policy](./0009-recv-pump-overload-policy.md) — observable PubSub load-shedding plus receive-pump diagnostics
-- [ADR 0010: GSS Before MLS TreeKEM for v1 Secure Groups](./0010-gss-before-mls-treekem-for-v1-secure-groups.md) — `MlsEncrypted` named groups use Group Shared Secret rekey-on-ban in v1, not full MLS TreeKEM
+- [ADR 0010: GSS Before MLS TreeKEM for v1 Secure Groups](./0010-gss-before-mls-treekem-for-v1-secure-groups.md) — `MlsEncrypted` named groups use Group Shared Secret rekey-on-ban in v1, not full MLS TreeKEM. **Superseded (forward path) by ADR 0012** now that saorsa-mls 0.3.6 ships real TreeKEM; still describes the legacy plane grandfathered groups run on
+- [ADR 0011: Bootstrap Dual-Listen UDP/443](./0011-bootstrap-dual-listen-udp-443.md) — second root x0xd on :443 per bootstrap host for WARP/full-tunnel-VPN reachability
+- [ADR 0013: Priority-Aware PubSub Receive-Pump Shedding](./0013-priority-aware-pubsub-shed.md) — refines ADR 0009 to shed low-priority PubSub control frames first (renumbered from 0010 to resolve a collision)
+
+## Proposed
+
+- [ADR 0012: Real TreeKEM as the Default Secure Group Plane](./0012-treekem-default-secure-groups.md) — new `MlsEncrypted` groups use real `saorsa_mls::TreeKemGroup` (FS + PCS) by default; legacy GSS groups grandfathered with owner opt-in upgrade; supersedes ADR 0010's forward path
 
 ## Accepted (Phase 1 Functionally Complete)
 

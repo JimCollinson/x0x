@@ -2,6 +2,10 @@
 
 - Status: Accepted
 - Date: 2026-05-11
+- Superseded (forward path) by: [ADR 0012](./0012-treekem-default-secure-groups.md)
+  on 2026-05-30, now that `saorsa-mls 0.3.6` ships real TreeKEM. This ADR still
+  accurately describes the **legacy GSS plane** that grandfathered groups run on
+  until their owner opts into a TreeKEM upgrade.
 
 ## Context
 

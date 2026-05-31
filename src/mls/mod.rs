@@ -1,7 +1,13 @@
 //! MLS (Messaging Layer Security) group encryption for secure agent communication.
 //!
-//! This module provides end-to-end encryption for group communications using
-//! MLS-inspired protocols with ChaCha20-Poly1305 AEAD encryption.
+//! Two planes live here:
+//! - [`group`] wraps `saorsa_mls::MlsGroup` — the **legacy GSS** plane
+//!   (per-epoch shared secret; no forward secrecy / no post-compromise
+//!   security). Retained for grandfathered groups.
+//! - [`treekem`] wraps `saorsa_mls::TreeKemGroup` — **real RFC-9420 TreeKEM**
+//!   (FS + PCS), the default for new `MlsEncrypted` groups.
+//!
+//! See ADR-0010 (GSS) and ADR-0012 (TreeKEM default) for the migration plan.
 
 pub mod cipher;
 pub mod error;

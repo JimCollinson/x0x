@@ -41,12 +41,13 @@ pub enum SecureGroupPlane {
     TreeKem,
 }
 
-/// Deterministic bridge from an x0x [`AgentId`] (32 bytes) to a saorsa-mls
-/// `MemberId` (16 bytes): the first 16 bytes of the AgentId. Shared by both the
-/// legacy GSS plane ([`group`]) and the TreeKEM plane ([`treekem`]) so a given
-/// agent maps to the **same** `MemberId` on both — important for the GSS→TreeKEM
-/// upgrade path (ADR-0012). `AgentId` is always 32 bytes, so the slice is
-/// infallible.
+/// Deterministic legacy-GSS bridge from an x0x [`AgentId`] (32 bytes) to a
+/// saorsa-mls `MemberId` (16 bytes): the first 16 bytes of the AgentId.
+///
+/// Real TreeKEM groups deliberately do **not** use this stable cross-group label;
+/// they derive a per-group `MemberId` in [`treekem`] so one agent is unlinkable
+/// across groups. Keep this helper scoped to the legacy GSS plane and migration
+/// code that explicitly accepts that stable label.
 ///
 /// Note: this truncates a 32-byte SHA-256-derived id to 16 bytes, so `MemberId`
 /// is a stable *label*, not a collision-free unique key; do not rely on it for

@@ -6718,6 +6718,15 @@ async fn apply_named_group_metadata_event(
     };
     let creator_hex = hex::encode(info.creator.as_bytes());
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
+        && treekem_metadata_event_requires_phase3(&event)
+    {
+        tracing::warn!(
+            group_id = %resolved_group_key,
+            "ignoring TreeKEM metadata membership event without Phase 3 Commit/Welcome transport"
+        );
+        return false;
+    }
 
     match event {
         NamedGroupMetadataEvent::MemberAdded {
@@ -8528,6 +8537,9 @@ async fn create_group_invite(
             )
                 .into_response();
         }
+        if let Some(resp) = treekem_membership_unsupported(info) {
+            return resp.into_response();
+        }
         let mut invite = x0x::groups::invite::SignedInvite::new(
             info.mls_group_id.clone(),
             info.name.clone(),
@@ -8539,6 +8551,7 @@ async fn create_group_invite(
         invite.group_description = Some(info.description.clone());
         invite.policy = Some(info.policy.clone());
         invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
+        invite.secure_plane = Some(info.secure_plane);
 
         // Track this one-time secret on the inviter so a future
         // MemberJoined request carrying it can be authenticated, role-capped,
@@ -8593,6 +8606,15 @@ async fn join_group_via_invite(
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "ok": false, "error": "invite has expired" })),
+        );
+    }
+    if invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem) {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM invite joins require KeyPackage/Welcome transport (ADR-0012 Phase 3)"
+            })),
         );
     }
 
@@ -9273,6 +9295,9 @@ async fn leave_group(
             commit: Some(commit),
         }
     } else {
+        if let Some(resp) = treekem_membership_unsupported(info) {
+            return resp;
+        }
         info.roster_revision = info.roster_revision.saturating_add(1);
         let revision = info.roster_revision;
         info.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
@@ -9304,6 +9329,17 @@ async fn leave_group(
     prune_expired_group_cards(&mut cache, now_millis_u64());
     cache.remove(&id);
     state.mls_groups.write().await.remove(&id);
+    // ADR-0012: drop the live TreeKEM group and wipe its at-rest snapshot
+    // (which contains private key material) so a deleted secure group leaves
+    // nothing behind. No-op for GSS groups: no in-memory entry, and the
+    // snapshot file does not exist (NotFound is ignored).
+    state.treekem_groups.write().await.remove(&id);
+    let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
+    if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(group_id = %id, "failed to remove TreeKEM snapshot on delete: {e}");
+        }
+    }
     save_named_groups(&state).await;
     save_mls_groups(&state).await;
     stop_named_group_metadata_listener(&state, &id).await;
@@ -9607,6 +9643,9 @@ async fn update_member_role(
         );
     }
 
+    // Role changes are metadata-only: they do not add/remove TreeKEM leaves or
+    // require Commit/Welcome transport, so TreeKEM groups may apply them before
+    // Phase 3 membership transport lands.
     info.set_member_role(&agent_id_hex, new_role);
     info.roster_revision = info.roster_revision.saturating_add(1);
     let revision = info.roster_revision;
@@ -9896,6 +9935,9 @@ async fn create_join_request(
                 ),
             );
         }
+        if let Some(resp) = treekem_membership_unsupported(info) {
+            return resp;
+        }
         if info.is_banned(&caller_hex) {
             return (
                 StatusCode::FORBIDDEN,
@@ -9995,6 +10037,9 @@ async fn approve_join_request(
         };
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
             return e;
+        }
+        if let Some(resp) = treekem_membership_unsupported(info) {
+            return resp;
         }
         let Some(req) = info.join_requests.get_mut(&request_id) else {
             return (
@@ -10767,6 +10812,20 @@ fn treekem_membership_unsupported(
     }
 }
 
+fn treekem_metadata_event_requires_phase3(event: &NamedGroupMetadataEvent) -> bool {
+    matches!(
+        event,
+        NamedGroupMetadataEvent::MemberAdded { .. }
+            | NamedGroupMetadataEvent::MemberRemoved { .. }
+            | NamedGroupMetadataEvent::MemberBanned { .. }
+            | NamedGroupMetadataEvent::MemberUnbanned { .. }
+            | NamedGroupMetadataEvent::GroupDeleted { .. }
+            | NamedGroupMetadataEvent::JoinRequestCreated { .. }
+            | NamedGroupMetadataEvent::JoinRequestApproved { .. }
+            | NamedGroupMetadataEvent::MemberJoined { .. }
+    )
+}
+
 /// Encrypt `payload_b64` for a real-TreeKEM group (ADR-0012). The live group's
 /// send-ratchet advances, so the snapshot is persisted before returning to
 /// prevent send-generation (nonce) reuse across a restart. Returns the
@@ -10884,6 +10943,12 @@ async fn treekem_group_decrypt(
             );
         }
     };
+    // Persisting the receive replay window is best-effort. A failure here may
+    // permit the same ciphertext to be accepted again after restart, but the
+    // plaintext has already been validly recovered and retrying in-process would
+    // hit the replay guard. Unlike send-side snapshot failure, this is not a
+    // nonce-reuse risk, so return the plaintext and surface the persistence
+    // problem in logs.
     if let Err(e) = persist_treekem_snapshot(&state.treekem_dir, group_id_hex, &guard).await {
         tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot after decrypt: {e}");
     }
@@ -15678,6 +15743,72 @@ mod tests {
         }
         assert_eq!(names, vec![std::ffi::OsString::from("named_groups.json")]);
         Ok(())
+    }
+
+    #[test]
+    fn treekem_metadata_event_phase3_classifier_catches_roster_mutations() {
+        let event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: "aa".repeat(16),
+            revision: 1,
+            actor: "11".repeat(32),
+            agent_id: "22".repeat(32),
+            commit: None,
+        };
+        assert!(treekem_metadata_event_requires_phase3(&event));
+
+        let event = NamedGroupMetadataEvent::GroupDeleted {
+            group_id: "aa".repeat(16),
+            revision: 1,
+            actor: "11".repeat(32),
+            commit: None,
+        };
+        assert!(treekem_metadata_event_requires_phase3(&event));
+
+        let event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: "aa".repeat(16),
+            revision: 1,
+            actor: "11".repeat(32),
+            agent_id: "22".repeat(32),
+            role: x0x::groups::GroupRole::Admin,
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&event));
+
+        let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: "aa".repeat(16),
+            revision: 1,
+            actor: "11".repeat(32),
+            name: Some("name".to_string()),
+            description: Some(String::new()),
+            commit: None,
+        };
+        assert!(!treekem_metadata_event_requires_phase3(&event));
+    }
+
+    #[test]
+    fn treekem_membership_guard_returns_501_without_mutating() {
+        let creator = AgentId([7; 32]);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            creator,
+            "aa".repeat(16),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        let before_revision = info.roster_revision;
+        let before_members = info.members_v2.clone();
+
+        let response = treekem_membership_unsupported(&info);
+        assert!(
+            response.is_some(),
+            "TreeKEM groups must fail loud before Phase 3 membership transport"
+        );
+        let status = response.map(|(status, _body)| status);
+
+        assert_eq!(status, Some(StatusCode::NOT_IMPLEMENTED));
+        assert_eq!(info.roster_revision, before_revision);
+        assert_eq!(info.members_v2, before_members);
     }
 
     #[test]

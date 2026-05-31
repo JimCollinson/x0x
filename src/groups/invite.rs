@@ -9,6 +9,7 @@
 
 use crate::groups::policy::GroupPolicy;
 use crate::identity::AgentId;
+use crate::mls::SecureGroupPlane;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,6 +43,10 @@ pub struct SignedInvite {
     /// `GroupGenesis` payload, not just the same stable group id.
     #[serde(default)]
     pub genesis_creation_nonce: Option<String>,
+    /// Secure-group crypto plane at invite creation time. Missing means legacy
+    /// pre-ADR-0012 invite; treat as GSS-compatible for backwards compatibility.
+    #[serde(default)]
+    pub secure_plane: Option<SecureGroupPlane>,
     /// Agent ID of the inviter (hex-encoded).
     pub inviter: String,
     /// One-time invite secret (32 bytes, hex-encoded).
@@ -92,6 +97,7 @@ impl SignedInvite {
             group_description: None,
             policy: None,
             genesis_creation_nonce: None,
+            secure_plane: None,
             inviter: hex::encode(inviter.as_bytes()),
             invite_secret: hex::encode(secret_bytes),
             created_at: now,
@@ -119,6 +125,10 @@ impl SignedInvite {
                 .unwrap_or("")
                 .as_bytes(),
         );
+        if let Some(secure_plane) = self.secure_plane {
+            let secure_plane_json = serde_json::to_vec(&secure_plane).unwrap_or_default();
+            data.extend_from_slice(&secure_plane_json);
+        }
         data.extend_from_slice(self.inviter.as_bytes());
         data.extend_from_slice(self.invite_secret.as_bytes());
         data.extend_from_slice(&self.created_at.to_le_bytes());
@@ -286,6 +296,7 @@ mod tests {
         invite.group_description = Some("desc".to_string());
         invite.policy = Some(GroupPolicy::default());
         invite.genesis_creation_nonce = Some("cc".repeat(32));
+        invite.secure_plane = Some(SecureGroupPlane::TreeKem);
 
         let json = serde_json::to_string(&invite).expect("serialize metadata invite");
         let restored: SignedInvite =
@@ -298,5 +309,23 @@ mod tests {
             invite.genesis_creation_nonce,
             restored.genesis_creation_nonce
         );
+        assert_eq!(invite.secure_plane, restored.secure_plane);
+    }
+
+    #[test]
+    fn test_legacy_invite_missing_secure_plane_defaults_none() {
+        let json = serde_json::json!({
+            "group_id": "aabb".repeat(8),
+            "group_name": "Legacy",
+            "inviter": hex::encode(agent(1).as_bytes()),
+            "invite_secret": "11".repeat(32),
+            "created_at": 1,
+            "expires_at": 0,
+            "signature": ""
+        });
+        let restored: SignedInvite =
+            serde_json::from_value(json).expect("deserialize legacy invite");
+        assert_eq!(restored.secure_plane, None);
+        assert_ne!(restored.secure_plane, Some(SecureGroupPlane::TreeKem));
     }
 }

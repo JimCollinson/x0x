@@ -9311,6 +9311,129 @@ async fn remove_named_group_member(
     )
 }
 
+async fn leave_treekem_group(
+    state: Arc<AppState>,
+    id: String,
+    local_agent: AgentId,
+    local_agent_hex: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use base64::Engine as _;
+
+    let signing_kp = state.agent.identity().agent_keypair();
+    let now_ms = now_millis_u64();
+    let (mut next, metadata_topic, event_group_id, name) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "ok": false, "error": "group not found" })),
+            );
+        };
+        if local_agent == info.creator {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": "creator must delete the group" })),
+            );
+        }
+        if !info.has_active_member(&local_agent_hex) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "ok": false, "error": "not a member" })),
+            );
+        }
+        (
+            info.clone(),
+            info.metadata_topic.clone(),
+            info.stable_group_id().to_string(),
+            info.name.clone(),
+        )
+    };
+
+    let group = {
+        let map = state.treekem_groups.read().await;
+        map.get(&id).cloned()
+    };
+    let Some(group) = group else {
+        return (
+            StatusCode::FAILED_DEPENDENCY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM group not loaded — restart or re-share required"
+            })),
+        );
+    };
+    let mut guard = group.lock().await;
+    let treekem_epoch = guard.epoch().saturating_add(1);
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
+    next.secret_epoch = treekem_epoch;
+    next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+    let commit = match next.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
+            );
+        }
+    };
+    let treekem_commit = match guard.remove_member(local_agent) {
+        Ok(commit) => commit,
+        Err(e) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("TreeKEM self removal failed: {e}")
+                })),
+            );
+        }
+    };
+    if guard.epoch() != treekem_epoch {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TreeKEM epoch did not advance as expected"
+            })),
+        );
+    }
+    drop(guard);
+
+    {
+        let mut groups = state.named_groups.write().await;
+        groups.remove(&id);
+    }
+    state.group_card_cache.write().await.remove(&id);
+    state.mls_groups.write().await.remove(&id);
+    state.treekem_groups.write().await.remove(&id);
+    let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
+    if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(group_id = %id, "failed to remove TreeKEM snapshot after leave: {e}");
+        }
+    }
+    save_named_groups(&state).await;
+    save_mls_groups(&state).await;
+
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: event_group_id,
+        revision,
+        actor: local_agent_hex.clone(),
+        agent_id: local_agent_hex,
+        treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
+        treekem_epoch: Some(treekem_epoch),
+        commit: Some(commit),
+    };
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "ok": true, "left": name })),
+    )
+}
+
 async fn remove_treekem_named_group_member(
     state: Arc<AppState>,
     id: String,
@@ -9673,6 +9796,10 @@ async fn leave_group(
     };
 
     let is_creator = local_agent == info.creator;
+    if !is_creator && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        drop(groups);
+        return leave_treekem_group(state, id, local_agent, local_agent_hex).await;
+    }
     let name = info.name.clone();
     let metadata_topic = info.metadata_topic.clone();
     let event_group_id = info.stable_group_id().to_string();

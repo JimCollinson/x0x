@@ -11405,15 +11405,15 @@ struct SecureDecryptRequest {
 /// cross-daemon encrypt/decrypt with rekey-on-ban, but does NOT provide the
 /// per-message forward secrecy that full MLS TreeKEM would. Documented as
 /// Phase D.2 scope.
-/// Guard for membership-mutating named-group endpoints (add/remove/ban/unban).
+/// Guard for membership-mutating named-group endpoints that still require a
+/// TreeKEM-specific transport shape (direct invites/adds and ban/unban).
 ///
-/// Those handlers run the legacy GSS rekey path (`rotate_shared_secret` +
-/// per-recipient reseal). TreeKEM membership is a Commit/Welcome protocol that
-/// lands in a later change (ADR-0012 Phase 3); until then a TreeKEM group is
-/// creator-only. Running the GSS path on a TreeKEM group would silently
-/// re-introduce a shared secret and relabel the plane, so we refuse loudly with
-/// `501 Not Implemented` instead. Returns `Some(response)` to short-circuit when
-/// the group is TreeKEM, `None` (proceed) for GSS groups.
+/// Request-access joins and creator removals use real TreeKEM Commit/Welcome or
+/// Commit transport. The remaining guarded handlers still run the legacy GSS
+/// rekey path (`rotate_shared_secret` + per-recipient reseal), which would
+/// silently re-introduce a shared secret and relabel the plane. Refuse those
+/// endpoints loudly until they provide KeyPackage/Welcome or removal Commit
+/// inputs.
 fn treekem_membership_unsupported(
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
@@ -11422,7 +11422,7 @@ fn treekem_membership_unsupported(
             StatusCode::NOT_IMPLEMENTED,
             Json(serde_json::json!({
                 "ok": false,
-                "error": "TreeKEM secure-group membership changes are not yet supported (ADR-0012 Phase 3); this group is creator-only for now"
+                "error": "TreeKEM secure-group membership flow is not supported by this endpoint; use request-access approval/removal transport"
             })),
         ))
     } else {
@@ -11434,7 +11434,6 @@ fn treekem_metadata_event_requires_phase3(event: &NamedGroupMetadataEvent) -> bo
     matches!(
         event,
         NamedGroupMetadataEvent::MemberAdded { .. }
-            | NamedGroupMetadataEvent::MemberRemoved { .. }
             | NamedGroupMetadataEvent::MemberBanned { .. }
             | NamedGroupMetadataEvent::MemberUnbanned { .. }
             | NamedGroupMetadataEvent::MemberJoined { .. }
@@ -16371,7 +16370,7 @@ mod tests {
             treekem_epoch: None,
             commit: None,
         };
-        assert!(treekem_metadata_event_requires_phase3(&event));
+        assert!(!treekem_metadata_event_requires_phase3(&event));
 
         let event = NamedGroupMetadataEvent::JoinRequestCreated {
             group_id: "aa".repeat(16),
@@ -16487,7 +16486,7 @@ mod tests {
         let response = treekem_membership_unsupported(&info);
         assert!(
             response.is_some(),
-            "TreeKEM groups must fail loud before Phase 3 membership transport"
+            "legacy-only TreeKEM endpoints must fail loud instead of running GSS rekey logic"
         );
         let status = response.map(|(status, _body)| status);
 

@@ -1381,21 +1381,15 @@ mod tests {
         }
     }
 
-    async fn test_service() -> Arc<ExecService> {
-        let dir = tempfile::tempdir().expect("tmpdir");
+    async fn build_test_service(policy: ExecPolicy, dir: &Path) -> Arc<ExecService> {
         let agent = Agent::builder()
-            .with_machine_key(dir.path().join("machine.key"))
-            .with_agent_key_path(dir.path().join("agent.key"))
-            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_machine_key(dir.join("machine.key"))
+            .with_agent_key_path(dir.join("agent.key"))
+            .with_contact_store_path(dir.join("contacts.json"))
             .with_peer_cache_disabled()
             .build()
             .await
             .expect("agent");
-        let policy = ExecPolicy::Disabled {
-            path: dir.path().join("exec-acl.toml"),
-            reason: "test".to_string(),
-            loaded_at_unix_ms: 1,
-        };
         let diagnostics = Arc::new(ExecDiagnostics::new(policy.summary()));
         Arc::new(ExecService {
             agent: Arc::new(agent),
@@ -1406,6 +1400,22 @@ mod tests {
             active_servers: Mutex::new(HashMap::new()),
             active_counts: Mutex::new(ActiveCounts::default()),
         })
+    }
+
+    async fn test_service() -> Arc<ExecService> {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let policy = ExecPolicy::Disabled {
+            path: dir.path().join("exec-acl.toml"),
+            reason: "test".to_string(),
+            loaded_at_unix_ms: 1,
+        };
+        build_test_service(policy, dir.path()).await
+    }
+
+    async fn enabled_test_service(acl: ExecAcl) -> (Arc<ExecService>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let service = build_test_service(ExecPolicy::Enabled(acl), dir.path()).await;
+        (service, dir)
     }
 
     #[tokio::test]
@@ -1975,6 +1985,14 @@ mod tests {
         }
     }
 
+    async fn assert_single_denial(service: &Arc<ExecService>, reason: DenialReason) {
+        let snap = service.diagnostics_snapshot().await;
+        assert_eq!(snap.totals.requests_received, 1);
+        assert_eq!(snap.totals.requests_denied, 1);
+        assert_eq!(snap.totals.denial_breakdown.get(reason.as_str()), Some(&1));
+        assert!(service.active_servers.lock().await.is_empty());
+    }
+
     #[tokio::test]
     async fn handle_request_denies_unverified_sender_before_policy() {
         let service = test_service().await;
@@ -1989,15 +2007,7 @@ mod tests {
             )
             .await;
 
-        let snap = service.diagnostics_snapshot().await;
-        assert_eq!(snap.totals.requests_received, 1);
-        assert_eq!(snap.totals.requests_denied, 1);
-        assert_eq!(
-            snap.totals
-                .denial_breakdown
-                .get(DenialReason::UnverifiedSender.as_str()),
-            Some(&1)
-        );
+        assert_single_denial(&service, DenialReason::UnverifiedSender).await;
     }
 
     #[tokio::test]
@@ -2014,15 +2024,7 @@ mod tests {
             )
             .await;
 
-        let snap = service.diagnostics_snapshot().await;
-        assert_eq!(snap.totals.requests_received, 1);
-        assert_eq!(snap.totals.requests_denied, 1);
-        assert_eq!(
-            snap.totals
-                .denial_breakdown
-                .get(DenialReason::TrustRejected.as_str()),
-            Some(&1)
-        );
+        assert_single_denial(&service, DenialReason::TrustRejected).await;
     }
 
     #[tokio::test]
@@ -2039,15 +2041,80 @@ mod tests {
             )
             .await;
 
-        let snap = service.diagnostics_snapshot().await;
-        assert_eq!(snap.totals.requests_received, 1);
-        assert_eq!(snap.totals.requests_denied, 1);
-        assert_eq!(
-            snap.totals
-                .denial_breakdown
-                .get(DenialReason::ExecDisabled.as_str()),
-            Some(&1)
-        );
+        assert_single_denial(&service, DenialReason::ExecDisabled).await;
+    }
+
+    #[tokio::test]
+    async fn handle_request_enabled_policy_denies_unmatched_argv() {
+        let inbound = inbound_payload(true, Some(TrustDecision::Accept));
+        let acl = test_acl(inbound.sender, inbound.machine_id);
+        let (service, _dir) = enabled_test_service(acl).await;
+        Arc::clone(&service)
+            .handle_request(
+                inbound,
+                ExecRequestId([58; 16]),
+                vec!["echo".to_string(), "nope".to_string()],
+                None,
+                1_000,
+                None,
+            )
+            .await;
+        assert_single_denial(&service, DenialReason::ArgvNotAllowed).await;
+    }
+
+    #[tokio::test]
+    async fn handle_request_enabled_policy_denies_stdin_too_large() {
+        let inbound = inbound_payload(true, Some(TrustDecision::Accept));
+        let acl = test_acl(inbound.sender, inbound.machine_id);
+        let (service, _dir) = enabled_test_service(acl).await;
+        Arc::clone(&service)
+            .handle_request(
+                inbound,
+                ExecRequestId([59; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                Some(b"too long".to_vec()),
+                1_000,
+                None,
+            )
+            .await;
+        assert_single_denial(&service, DenialReason::StdinTooLarge).await;
+    }
+
+    #[tokio::test]
+    async fn handle_request_enabled_policy_denies_timeout_too_large() {
+        let inbound = inbound_payload(true, Some(TrustDecision::Accept));
+        let acl = test_acl(inbound.sender, inbound.machine_id);
+        let (service, _dir) = enabled_test_service(acl).await;
+        Arc::clone(&service)
+            .handle_request(
+                inbound,
+                ExecRequestId([60; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                4_000,
+                None,
+            )
+            .await;
+        assert_single_denial(&service, DenialReason::TimeoutTooLarge).await;
+    }
+
+    #[tokio::test]
+    async fn handle_request_enabled_policy_denies_concurrency_limit() {
+        let inbound = inbound_payload(true, Some(TrustDecision::Accept));
+        let mut acl = test_acl(inbound.sender, inbound.machine_id);
+        acl.caps.max_concurrent_total = 0;
+        let (service, _dir) = enabled_test_service(acl).await;
+        Arc::clone(&service)
+            .handle_request(
+                inbound,
+                ExecRequestId([61; 16]),
+                vec!["echo".to_string(), "ok".to_string()],
+                None,
+                1_000,
+                None,
+            )
+            .await;
+        assert_single_denial(&service, DenialReason::ConcurrencyLimitReached).await;
     }
 
     #[tokio::test]

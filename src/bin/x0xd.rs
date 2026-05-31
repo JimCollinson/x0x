@@ -6849,15 +6849,17 @@ async fn apply_named_group_metadata_event(
             if removed_self {
                 groups.remove(&resolved_group_key);
             }
-            let mut mls_groups = state.mls_groups.write().await;
-            if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
-                if let Ok(member_id) = parse_agent_id_hex(&agent_id) {
-                    if group.is_member(&member_id) {
-                        let _ = group.remove_member(member_id).await;
+            if treekem_payload.is_none() {
+                let mut mls_groups = state.mls_groups.write().await;
+                if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
+                    if let Ok(member_id) = parse_agent_id_hex(&agent_id) {
+                        if group.is_member(&member_id) {
+                            let _ = group.remove_member(member_id).await;
+                        }
                     }
                 }
+                drop(mls_groups);
             }
-            drop(mls_groups);
             drop(groups);
             if removed_self {
                 state
@@ -6898,6 +6900,10 @@ async fn apply_named_group_metadata_event(
                 let mut guard = group.lock().await;
                 if let Err(e) = guard.process_commit(&commit_bytes) {
                     tracing::warn!(group_id = %resolved_group_key, "failed to process TreeKEM remove commit: {e}");
+                    return false;
+                }
+                if guard.epoch() != _epoch {
+                    tracing::warn!(group_id = %resolved_group_key, expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM remove commit advanced to unexpected epoch");
                     return false;
                 }
                 if let Err(e) =
@@ -7336,6 +7342,10 @@ async fn apply_named_group_metadata_event(
                             return false;
                         }
                     };
+                    if tk.epoch() != _epoch {
+                        tracing::warn!(group_id = %resolved_group_key, expected_epoch = _epoch, actual_epoch = tk.epoch(), "TreeKEM Welcome joined at unexpected epoch");
+                        return false;
+                    }
                     if let Err(e) =
                         persist_treekem_snapshot(&state.treekem_dir, &resolved_group_key, &tk).await
                     {
@@ -7358,6 +7368,10 @@ async fn apply_named_group_metadata_event(
                         let mut guard = group.lock().await;
                         if let Err(e) = guard.process_commit(&commit_bytes) {
                             tracing::warn!(group_id = %resolved_group_key, "failed to process TreeKEM add commit: {e}");
+                            return false;
+                        }
+                        if guard.epoch() != _epoch {
+                            tracing::warn!(group_id = %resolved_group_key, expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM add commit advanced to unexpected epoch");
                             return false;
                         }
                         if let Err(e) = persist_treekem_snapshot(

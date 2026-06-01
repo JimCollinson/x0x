@@ -1802,7 +1802,7 @@ async fn main() -> Result<()> {
     // Background named-group metadata listener on the direct channel — applies
     // authority-authored review commits (approve / reject) that are
     // direct-delivered to a requester before they are grafted into the
-    // metadata topic's gossip mesh (see `deliver_named_group_event_to_agent`).
+    // metadata topic's gossip mesh (see `spawn_named_group_event_delivery`).
     // This mirrors the per-group metadata topic-subscription apply loop; the
     // shared apply handler re-validates the signed commit, enforces the same
     // authorization checks, and is idempotent, so applying via both the direct
@@ -6593,9 +6593,9 @@ async fn publish_named_group_metadata_event(
     }
 }
 
-/// Deliver a named-group metadata event directly to a single recipient over
-/// the authenticated direct-message channel, in addition to the metadata-topic
-/// gossip publish.
+/// Schedule best-effort delivery of a named-group metadata event directly to a
+/// single recipient over the authenticated direct-message channel, in addition
+/// to the metadata-topic gossip publish.
 ///
 /// Review decisions (approve / reject) target a requester who has only just
 /// imported the group card and is not yet grafted into the authority's
@@ -6607,7 +6607,11 @@ async fn publish_named_group_metadata_event(
 /// gossip, which re-validates the signed commit, enforces the same
 /// authorization, and is idempotent — so this is an additive delivery channel
 /// that neither weakens authorization nor risks a double apply.
-async fn deliver_named_group_event_to_agent(
+///
+/// Direct delivery is intentionally spawned in the background: failures are
+/// logged by the task and must not block metadata application, follow-up
+/// side-effects, or HTTP responses.
+fn spawn_named_group_event_delivery(
     state: &AppState,
     recipient_hex: &str,
     event: &NamedGroupMetadataEvent,
@@ -6629,16 +6633,19 @@ async fn deliver_named_group_event_to_agent(
             return;
         }
     };
-    if let Err(e) = state
-        .agent
-        .send_direct_with_config(&recipient, payload, direct_message_send_config())
-        .await
-    {
-        tracing::warn!(
-            requester = %recipient_hex,
-            "failed to direct-deliver named-group review event: {e}"
-        );
-    }
+    let agent = Arc::clone(&state.agent);
+    let requester = recipient_hex.to_string();
+    tokio::spawn(async move {
+        if let Err(e) = agent
+            .send_direct_with_config(&recipient, payload, direct_message_send_config())
+            .await
+        {
+            tracing::warn!(
+                requester = %requester,
+                "failed to direct-deliver named-group review event: {e}"
+            );
+        }
+    });
 }
 
 async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
@@ -8163,7 +8170,7 @@ async fn apply_named_group_metadata_event(
                 commit: Some(commit),
             };
             publish_named_group_metadata_event(state, &metadata_topic, &event).await;
-            deliver_named_group_event_to_agent(state, &member_agent_id, &event).await;
+            spawn_named_group_event_delivery(state, &member_agent_id, &event);
             maybe_publish_group_card_after_state_change(state, &resolved_group_key).await;
             tracing::info!(
                 group_id = %resolved_group_key,
@@ -9682,7 +9689,7 @@ async fn add_treekem_named_group_member(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    deliver_named_group_event_to_agent(&state, &agent_hex, &event).await;
+    spawn_named_group_event_delivery(&state, &agent_hex, &event);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     let members = named_group_member_values(&next);
@@ -11427,7 +11434,7 @@ async fn approve_join_request(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    deliver_named_group_event_to_agent(&state, &requester_hex, &event).await;
+    spawn_named_group_event_delivery(&state, &requester_hex, &event);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -11616,7 +11623,7 @@ async fn approve_treekem_join_request(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    deliver_named_group_event_to_agent(&state, &requester_hex, &event).await;
+    spawn_named_group_event_delivery(&state, &requester_hex, &event);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -11688,7 +11695,7 @@ async fn reject_join_request(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    deliver_named_group_event_to_agent(&state, &requester_hex, &event).await;
+    spawn_named_group_event_delivery(&state, &requester_hex, &event);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (StatusCode::OK, Json(serde_json::json!({ "ok": true })))

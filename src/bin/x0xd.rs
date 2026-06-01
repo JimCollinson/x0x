@@ -1438,6 +1438,16 @@ async fn main() -> Result<()> {
 
     // Load named groups from disk (if any)
     let named_groups_path = config.data_dir.join("named_groups.json");
+    let treekem_dir = config.data_dir.join("treekem");
+    if let Err(e) = tokio::fs::create_dir_all(&treekem_dir).await {
+        tracing::warn!(
+            "failed to create TreeKEM snapshot dir {}: {e}",
+            treekem_dir.display()
+        );
+    }
+    recover_treekem_named_journals(&named_groups_path, &treekem_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to recover TreeKEM persistence journal: {e}"))?;
     let named_groups = load_named_groups(&named_groups_path).await?;
 
     // Load or generate API bearer token for local authentication.
@@ -1479,13 +1489,6 @@ async fn main() -> Result<()> {
     // Must happen before the AppState is built so secure endpoints see the
     // groups immediately. Done with `named_groups` still owned (it is moved
     // into the RwLock below).
-    let treekem_dir = config.data_dir.join("treekem");
-    if let Err(e) = tokio::fs::create_dir_all(&treekem_dir).await {
-        tracing::warn!(
-            "failed to create TreeKEM snapshot dir {}: {e}",
-            treekem_dir.display()
-        );
-    }
     let treekem_groups = restore_treekem_groups(&named_groups, agent.as_ref(), &treekem_dir).await;
 
     let state = Arc::new(AppState {
@@ -6872,8 +6875,13 @@ async fn apply_named_group_metadata_event(
                     if tk.epoch() != epoch {
                         return false;
                     }
-                    if let Err(e) =
-                        persist_treekem_snapshot(&state.treekem_dir, &resolved_group_key, &tk).await
+                    if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                        state,
+                        &resolved_group_key,
+                        next.clone(),
+                        &tk,
+                    )
+                    .await
                     {
                         tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after MemberAdded Welcome: {e}");
                         return false;
@@ -6898,9 +6906,13 @@ async fn apply_named_group_metadata_event(
                     if guard.epoch() != epoch {
                         return false;
                     }
-                    if let Err(e) =
-                        persist_treekem_snapshot(&state.treekem_dir, &resolved_group_key, &guard)
-                            .await
+                    if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                        state,
+                        &resolved_group_key,
+                        next.clone(),
+                        &guard,
+                    )
+                    .await
                     {
                         tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after MemberAdded commit: {e}");
                         return false;
@@ -7034,8 +7046,13 @@ async fn apply_named_group_metadata_event(
                     tracing::warn!(group_id = %resolved_group_key, expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM remove commit advanced to unexpected epoch");
                     return false;
                 }
-                if let Err(e) =
-                    persist_treekem_snapshot(&state.treekem_dir, &resolved_group_key, &guard).await
+                if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                    state,
+                    &resolved_group_key,
+                    next.clone(),
+                    &guard,
+                )
+                .await
                 {
                     tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after remove commit: {e}");
                     return false;
@@ -7279,8 +7296,13 @@ async fn apply_named_group_metadata_event(
                 if guard.epoch() != epoch {
                     return false;
                 }
-                if let Err(e) =
-                    persist_treekem_snapshot(&state.treekem_dir, &resolved_group_key, &guard).await
+                if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                    state,
+                    &resolved_group_key,
+                    next.clone(),
+                    &guard,
+                )
+                .await
                 {
                     tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after ban commit: {e}");
                     return false;
@@ -7546,8 +7568,13 @@ async fn apply_named_group_metadata_event(
                         tracing::warn!(group_id = %resolved_group_key, expected_epoch = _epoch, actual_epoch = tk.epoch(), "TreeKEM Welcome joined at unexpected epoch");
                         return false;
                     }
-                    if let Err(e) =
-                        persist_treekem_snapshot(&state.treekem_dir, &resolved_group_key, &tk).await
+                    if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                        state,
+                        &resolved_group_key,
+                        next.clone(),
+                        &tk,
+                    )
+                    .await
                     {
                         tracing::error!(group_id = %resolved_group_key, "failed to persist joined TreeKEM snapshot: {e}");
                         return false;
@@ -7574,9 +7601,10 @@ async fn apply_named_group_metadata_event(
                             tracing::warn!(group_id = %resolved_group_key, expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM add commit advanced to unexpected epoch");
                             return false;
                         }
-                        if let Err(e) = persist_treekem_snapshot(
-                            &state.treekem_dir,
+                        if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                            state,
                             &resolved_group_key,
+                            next.clone(),
                             &guard,
                         )
                         .await
@@ -8068,8 +8096,13 @@ async fn apply_named_group_metadata_event(
                 if guard.epoch() != expected_epoch {
                     return false;
                 }
-                if let Err(e) =
-                    persist_treekem_snapshot(&state.treekem_dir, &resolved_group_key, &guard).await
+                if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                    state,
+                    &resolved_group_key,
+                    next.clone(),
+                    &guard,
+                )
+                .await
                 {
                     tracing::error!(group_id = %resolved_group_key, "failed to persist TreeKEM snapshot after invite add: {e}");
                     return false;
@@ -8310,18 +8343,6 @@ async fn create_named_group(
                         );
                     }
                 };
-                if let Err(e) =
-                    persist_treekem_snapshot(&state.treekem_dir, &group_id_hex, &tk).await
-                {
-                    tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot: {e}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({
-                            "ok": false,
-                            "error": format!("failed to persist secure group: {e}")
-                        })),
-                    );
-                }
                 info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
                 info.shared_secret = None;
                 info.secret_epoch = tk.epoch();
@@ -8350,7 +8371,29 @@ async fn create_named_group(
                 .write()
                 .await
                 .insert(group_id_hex.clone(), info.clone());
-            save_named_groups(&state).await;
+            if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                let group = {
+                    let map = state.treekem_groups.read().await;
+                    map.get(&group_id_hex).cloned()
+                };
+                if let Some(group) = group {
+                    let guard = group.lock().await;
+                    if let Err(e) =
+                        persist_treekem_and_named_groups_atomic(&state, &group_id_hex, &guard).await
+                    {
+                        tracing::error!(group_id = %group_id_hex, "failed to atomically persist TreeKEM group create: {e}");
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "error": format!("failed to persist secure group: {e}")
+                            })),
+                        );
+                    }
+                }
+            } else {
+                save_named_groups(&state).await;
+            }
             ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
 
             // P0-1: If the group is discoverable, publish its card to the global
@@ -9608,7 +9651,9 @@ async fn add_treekem_named_group_member(
             ),
         );
     }
-    if let Err(e) = persist_treekem_snapshot(&state.treekem_dir, &id, &guard).await {
+    if let Err(e) =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
+    {
         tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after direct add: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -10038,7 +10083,9 @@ async fn remove_treekem_named_group_member(
             })),
         );
     }
-    if let Err(e) = persist_treekem_snapshot(&state.treekem_dir, &id, &guard).await {
+    if let Err(e) =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
+    {
         tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after removal: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -10936,7 +10983,9 @@ async fn ban_treekem_group_member(
             ),
         );
     }
-    if let Err(e) = persist_treekem_snapshot(&state.treekem_dir, &id, &guard).await {
+    if let Err(e) =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
+    {
         tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after ban: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -11531,7 +11580,9 @@ async fn approve_treekem_join_request(
             })),
         );
     }
-    if let Err(e) = persist_treekem_snapshot(&state.treekem_dir, &id, &guard).await {
+    if let Err(e) =
+        persist_treekem_and_named_groups_atomic_with_info(&state, &id, next.clone(), &guard).await
+    {
         tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after approval: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -12250,7 +12301,7 @@ async fn treekem_group_encrypt(
     // Persist the advanced ratchet state before returning. Skipping a burned
     // generation on error is harmless (no reuse); a stale on-disk snapshot is
     // not, so a persist failure fails the request.
-    if let Err(e) = persist_treekem_snapshot(&state.treekem_dir, group_id_hex, &guard).await {
+    if let Err(e) = persist_treekem_snapshot_bound(state, group_id_hex, &guard).await {
         tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot after encrypt: {e}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -12324,7 +12375,7 @@ async fn treekem_group_decrypt(
     // hit the replay guard. Unlike send-side snapshot failure, this is not a
     // nonce-reuse risk, so return the plaintext and surface the persistence
     // problem in logs.
-    if let Err(e) = persist_treekem_snapshot(&state.treekem_dir, group_id_hex, &guard).await {
+    if let Err(e) = persist_treekem_snapshot_bound(state, group_id_hex, &guard).await {
         tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot after decrypt: {e}");
     }
     let epoch = guard.epoch();
@@ -15711,24 +15762,209 @@ fn agent_treekem_seed(agent: &Agent, group_id_bytes: &[u8]) -> [u8; 32] {
     x0x::mls::treekem::derive_identity_seed(&secret, group_id_bytes)
 }
 
-/// Persist a TreeKEM group's snapshot to `<treekem_dir>/<group_id_hex>.snap`
-/// at mode 0600 (ADR-0012 §6 / Phase 4). MUST be called after every
-/// state-advancing op (create, encrypt, decrypt, commit): the snapshot carries
-/// the send-generation counter and per-sender replay windows, so a stale
-/// on-disk copy could resume into nonce reuse or replay acceptance after a
-/// restart.
-async fn persist_treekem_snapshot(
-    treekem_dir: &FsPath,
-    group_id_hex: &str,
+const TREEKEM_DAEMON_SNAPSHOT_MAGIC: &[u8; 4] = b"XTD1";
+const TREEKEM_DAEMON_SNAPSHOT_VERSION: u8 = 1;
+const TREEKEM_NAMED_JOURNAL_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TreeKemSnapshotEnvelope {
+    version: u8,
+    state_revision: u64,
+    state_hash: String,
+    security_binding: Option<String>,
+    snapshot: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TreeKemNamedPersistJournal {
+    version: u8,
+    group_id_hex: String,
+    named_groups_json: String,
+    snapshot_envelope: Vec<u8>,
+}
+
+fn treekem_snapshot_path(treekem_dir: &FsPath, group_id_hex: &str) -> PathBuf {
+    treekem_dir.join(format!("{group_id_hex}.snap"))
+}
+
+fn treekem_journal_path(treekem_dir: &FsPath, group_id_hex: &str) -> PathBuf {
+    treekem_dir.join(format!("{group_id_hex}.journal"))
+}
+
+fn encode_treekem_snapshot_envelope(
+    info: &x0x::groups::GroupInfo,
     group: &x0x::mls::TreeKemMlsGroup,
-) -> anyhow::Result<()> {
-    let bytes = group
+) -> anyhow::Result<Vec<u8>> {
+    let snapshot = group
         .to_snapshot_bytes()
         .map_err(|e| anyhow::anyhow!("treekem snapshot encode: {e}"))?;
-    let path = treekem_dir.join(format!("{group_id_hex}.snap"));
+    let mut bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
+    let envelope = TreeKemSnapshotEnvelope {
+        version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
+        state_revision: info.state_revision,
+        state_hash: info.state_hash.clone(),
+        security_binding: info.security_binding.clone(),
+        snapshot,
+    };
+    bytes.extend(
+        postcard::to_stdvec(&envelope)
+            .map_err(|e| anyhow::anyhow!("treekem snapshot envelope encode: {e}"))?,
+    );
+    Ok(bytes)
+}
+
+fn decode_treekem_snapshot_envelope(
+    bytes: &[u8],
+) -> anyhow::Result<Option<TreeKemSnapshotEnvelope>> {
+    let Some(payload) = bytes.strip_prefix(TREEKEM_DAEMON_SNAPSHOT_MAGIC) else {
+        return Ok(None);
+    };
+    let envelope: TreeKemSnapshotEnvelope = postcard::from_bytes(payload)
+        .map_err(|e| anyhow::anyhow!("treekem snapshot envelope decode: {e}"))?;
+    if envelope.version != TREEKEM_DAEMON_SNAPSHOT_VERSION {
+        anyhow::bail!(
+            "unsupported TreeKEM snapshot envelope version {}",
+            envelope.version
+        );
+    }
+    Ok(Some(envelope))
+}
+
+fn treekem_snapshot_envelope_matches_info(
+    envelope: &TreeKemSnapshotEnvelope,
+    info: &x0x::groups::GroupInfo,
+) -> bool {
+    envelope.state_revision == info.state_revision
+        && envelope.state_hash == info.state_hash
+        && envelope.security_binding == info.security_binding
+}
+
+async fn persist_treekem_snapshot_bytes(
+    treekem_dir: &FsPath,
+    group_id_hex: &str,
+    bytes: Vec<u8>,
+) -> anyhow::Result<()> {
+    let path = treekem_snapshot_path(treekem_dir, group_id_hex);
     x0x::storage::write_private_bytes(&path, bytes)
         .await
         .map_err(|e| anyhow::anyhow!("treekem snapshot write: {e}"))?;
+    Ok(())
+}
+
+/// Persist a TreeKEM snapshot bound to the currently durable named-group state.
+async fn persist_treekem_snapshot_bound(
+    state: &AppState,
+    group_id_hex: &str,
+    group: &x0x::mls::TreeKemMlsGroup,
+) -> anyhow::Result<()> {
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_id_hex)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("named group missing for TreeKEM snapshot"))?
+    };
+    let bytes = encode_treekem_snapshot_envelope(&info, group)?;
+    persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, bytes).await
+}
+
+/// Persist a supplied named-group state and matching TreeKEM snapshot with a
+/// replay journal. The in-memory map is updated only after this returns.
+async fn persist_treekem_and_named_groups_atomic_with_info(
+    state: &AppState,
+    group_id_hex: &str,
+    info: x0x::groups::GroupInfo,
+    group: &x0x::mls::TreeKemMlsGroup,
+) -> anyhow::Result<()> {
+    let named_groups_json = {
+        let groups = state.named_groups.read().await;
+        let mut next_groups = groups.clone();
+        next_groups.insert(group_id_hex.to_string(), info.clone());
+        serde_json::to_string_pretty(&next_groups)
+            .map_err(|e| anyhow::anyhow!("named groups encode: {e}"))?
+    };
+    let snapshot_envelope = encode_treekem_snapshot_envelope(&info, group)?;
+    let journal = TreeKemNamedPersistJournal {
+        version: TREEKEM_NAMED_JOURNAL_VERSION,
+        group_id_hex: group_id_hex.to_string(),
+        named_groups_json: named_groups_json.clone(),
+        snapshot_envelope: snapshot_envelope.clone(),
+    };
+    let journal_bytes = postcard::to_stdvec(&journal)
+        .map_err(|e| anyhow::anyhow!("TreeKEM journal encode: {e}"))?;
+    let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
+    x0x::storage::write_private_bytes(&journal_path, journal_bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("TreeKEM journal write: {e}"))?;
+    persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, snapshot_envelope).await?;
+    write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
+        .await
+        .map_err(|e| anyhow::anyhow!("named groups write: {e}"))?;
+    if let Err(e) = tokio::fs::remove_file(&journal_path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(anyhow::anyhow!("TreeKEM journal cleanup: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// Persist current named-group JSON and a matching bound TreeKEM snapshot.
+async fn persist_treekem_and_named_groups_atomic(
+    state: &AppState,
+    group_id_hex: &str,
+    group: &x0x::mls::TreeKemMlsGroup,
+) -> anyhow::Result<()> {
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_id_hex)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("named group missing for TreeKEM atomic persist"))?
+    };
+    persist_treekem_and_named_groups_atomic_with_info(state, group_id_hex, info, group).await
+}
+
+async fn recover_treekem_named_journals(
+    named_groups_path: &FsPath,
+    treekem_dir: &FsPath,
+) -> anyhow::Result<()> {
+    let mut entries = match tokio::fs::read_dir(treekem_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(anyhow::anyhow!("read TreeKEM journal dir: {e}")),
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| anyhow::anyhow!("read TreeKEM journal entry: {e}"))?
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("journal") {
+            continue;
+        }
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("read TreeKEM journal {}: {e}", path.display()))?;
+        let journal: TreeKemNamedPersistJournal = postcard::from_bytes(&bytes)
+            .map_err(|e| anyhow::anyhow!("decode TreeKEM journal {}: {e}", path.display()))?;
+        if journal.version != TREEKEM_NAMED_JOURNAL_VERSION {
+            tracing::warn!(path = %path.display(), version = journal.version, "ignoring unsupported TreeKEM journal version");
+            continue;
+        }
+        persist_treekem_snapshot_bytes(
+            treekem_dir,
+            &journal.group_id_hex,
+            journal.snapshot_envelope,
+        )
+        .await?;
+        write_named_groups_json_atomic(named_groups_path, &journal.named_groups_json)
+            .await
+            .map_err(|e| anyhow::anyhow!("replay named groups journal: {e}"))?;
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|e| anyhow::anyhow!("remove replayed TreeKEM journal: {e}"))?;
+        tracing::warn!(group_id = %journal.group_id_hex, "replayed TreeKEM/named-group persistence journal after prior crash");
+    }
     Ok(())
 }
 
@@ -15749,8 +15985,8 @@ async fn restore_treekem_groups(
         if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
             continue;
         }
-        let path = treekem_dir.join(format!("{group_id_hex}.snap"));
-        let snapshot = match tokio::fs::read(&path).await {
+        let path = treekem_snapshot_path(treekem_dir, group_id_hex);
+        let snapshot_bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 tracing::warn!(
@@ -15761,6 +15997,28 @@ async fn restore_treekem_groups(
             }
             Err(e) => {
                 tracing::warn!(group_id = %group_id_hex, "failed to read TreeKEM snapshot: {e}");
+                continue;
+            }
+        };
+        let snapshot = match decode_treekem_snapshot_envelope(&snapshot_bytes) {
+            Ok(Some(envelope)) => {
+                if !treekem_snapshot_envelope_matches_info(&envelope, info) {
+                    tracing::warn!(
+                        group_id = %group_id_hex,
+                        snapshot_revision = envelope.state_revision,
+                        named_revision = info.state_revision,
+                        "TreeKEM snapshot/named-group binding mismatch; secure content unavailable until repaired"
+                    );
+                    continue;
+                }
+                envelope.snapshot
+            }
+            Ok(None) => {
+                tracing::warn!(group_id = %group_id_hex, "restoring legacy unbound TreeKEM snapshot; future writes will bind it to named-group state");
+                snapshot_bytes
+            }
+            Err(e) => {
+                tracing::warn!(group_id = %group_id_hex, "failed to decode TreeKEM snapshot envelope: {e}");
                 continue;
             }
         };
@@ -17117,6 +17375,72 @@ mod tests {
             names.push(entry.file_name());
         }
         assert_eq!(names, vec![std::ffi::OsString::from("named_groups.json")]);
+        Ok(())
+    }
+
+    #[test]
+    fn treekem_snapshot_envelope_binding_detects_mismatch() {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            AgentId([9; 32]),
+            "aa".repeat(16),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.state_revision = 7;
+        info.state_hash = "hash-a".to_string();
+        info.security_binding = Some("treekem:epoch=3".to_string());
+        let envelope = TreeKemSnapshotEnvelope {
+            version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
+            state_revision: info.state_revision,
+            state_hash: info.state_hash.clone(),
+            security_binding: info.security_binding.clone(),
+            snapshot: b"snapshot".to_vec(),
+        };
+        assert!(treekem_snapshot_envelope_matches_info(&envelope, &info));
+
+        info.state_hash = "hash-b".to_string();
+        assert!(!treekem_snapshot_envelope_matches_info(&envelope, &info));
+    }
+
+    #[tokio::test]
+    async fn treekem_journal_replay_writes_snapshot_and_named_groups() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let treekem_dir = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem_dir).await?;
+        let named_path = dir.path().join("named_groups.json");
+        let snapshot_envelope = {
+            let mut bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
+            bytes.extend(postcard::to_stdvec(&TreeKemSnapshotEnvelope {
+                version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
+                state_revision: 1,
+                state_hash: "state".to_string(),
+                security_binding: Some("treekem:epoch=1".to_string()),
+                snapshot: b"snapshot".to_vec(),
+            })?);
+            bytes
+        };
+        let journal = TreeKemNamedPersistJournal {
+            version: TREEKEM_NAMED_JOURNAL_VERSION,
+            group_id_hex: "ab".repeat(16),
+            named_groups_json: "{\"group\":true}".to_string(),
+            snapshot_envelope: snapshot_envelope.clone(),
+        };
+        let journal_path = treekem_journal_path(&treekem_dir, &journal.group_id_hex);
+        x0x::storage::write_private_bytes(&journal_path, postcard::to_stdvec(&journal)?).await?;
+
+        recover_treekem_named_journals(&named_path, &treekem_dir).await?;
+
+        assert_eq!(
+            tokio::fs::read_to_string(&named_path).await?,
+            "{\"group\":true}"
+        );
+        assert_eq!(
+            tokio::fs::read(treekem_snapshot_path(&treekem_dir, &journal.group_id_hex)).await?,
+            snapshot_envelope
+        );
+        assert!(!journal_path.exists());
         Ok(())
     }
 

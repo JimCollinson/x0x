@@ -6522,7 +6522,7 @@ async fn spawn_listed_to_contacts_listener(state: Arc<AppState>) {
 ///
 /// Bumping this string is a protocol break — receivers verify against the
 /// exact byte sequence below.
-const MEMBER_JOINED_DOMAIN: &[u8] = b"x0x.named_group.member_joined.v1";
+const MEMBER_JOINED_DOMAIN: &[u8] = b"x0x.named_group.member_joined.v2";
 
 /// Build the canonical bytes signed by the joiner for a `MemberJoined`
 /// metadata event.
@@ -7320,7 +7320,15 @@ async fn apply_named_group_metadata_event(
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = revision.max(next.roster_revision);
-                    next.unban_member(&agent_id);
+                    if next.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+                        if let Some(member) = next.members_v2.get_mut(&agent_id) {
+                            member.state = x0x::groups::GroupMemberState::Removed;
+                            member.updated_at = commit.committed_at;
+                            member.removed_by = None;
+                        }
+                    } else {
+                        next.unban_member(&agent_id);
+                    }
                 },
             ) else {
                 return false;
@@ -8006,6 +8014,8 @@ async fn apply_named_group_metadata_event(
                     None
                 };
             let mut treekem_epoch = None;
+            let mut treekem_commit = None;
+            let mut treekem_welcome = None;
             next.roster_revision = next.roster_revision.saturating_add(1);
             next.add_member_with_kem(
                 member_agent_id.clone(),
@@ -8020,9 +8030,8 @@ async fn apply_named_group_metadata_event(
             if let Some(kp_b64) = treekem_key_package_b64.clone() {
                 next.set_member_treekem_key_package(&member_agent_id, kp_b64);
             }
-            let mut treekem_commit = None;
-            let mut treekem_welcome = None;
-            if let Some(kp_bytes) = treekem_key_package_bytes.as_ref() {
+            let revision = next.roster_revision;
+            let commit = if let Some(kp_bytes) = treekem_key_package_bytes.as_ref() {
                 let member_id = match parse_agent_id_hex(&member_agent_id) {
                     Ok(id) => id,
                     Err(_) => return false,
@@ -8038,6 +8047,17 @@ async fn apply_named_group_metadata_event(
                 let expected_epoch = guard.epoch().saturating_add(1);
                 next.secret_epoch = expected_epoch;
                 next.security_binding = Some(format!("treekem:epoch={expected_epoch}"));
+                let commit = match next.seal_commit(signing_kp, now_ms) {
+                    Ok(commit) => commit,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %resolved_group_key,
+                            member = %member_agent_id,
+                            "MemberJoined: failed to seal authoritative add: {e}"
+                        );
+                        return false;
+                    }
+                };
                 let out = match guard.add_member(member_id, kp_bytes) {
                     Ok(out) => out,
                     Err(e) => {
@@ -8057,17 +8077,18 @@ async fn apply_named_group_metadata_event(
                 treekem_epoch = Some(expected_epoch);
                 treekem_commit = Some(out.commit);
                 treekem_welcome = Some(out.welcome);
-            }
-            let revision = next.roster_revision;
-            let commit = match next.seal_commit(signing_kp, now_ms) {
-                Ok(commit) => commit,
-                Err(e) => {
-                    tracing::warn!(
-                        group_id = %resolved_group_key,
-                        member = %member_agent_id,
-                        "MemberJoined: failed to seal authoritative add: {e}"
-                    );
-                    return false;
+                commit
+            } else {
+                match next.seal_commit(signing_kp, now_ms) {
+                    Ok(commit) => commit,
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %resolved_group_key,
+                            member = %member_agent_id,
+                            "MemberJoined: failed to seal authoritative add: {e}"
+                        );
+                        return false;
+                    }
                 }
             };
             let metadata_topic = next.metadata_topic.clone();
@@ -10974,7 +10995,15 @@ async fn unban_group_member(
             Json(serde_json::json!({ "ok": false, "error": "member is not banned" })),
         );
     }
-    info.unban_member(&agent_id_hex);
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        if let Some(member) = info.members_v2.get_mut(&agent_id_hex) {
+            member.state = x0x::groups::GroupMemberState::Removed;
+            member.updated_at = now_ms;
+            member.removed_by = None;
+        }
+    } else {
+        info.unban_member(&agent_id_hex);
+    }
     info.roster_revision = info.roster_revision.saturating_add(1);
     let revision = info.roster_revision;
     let commit = match info.seal_commit(signing_kp, now_ms) {

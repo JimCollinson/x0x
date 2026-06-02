@@ -65,17 +65,6 @@ async fn create_group_with_body(d: &AgentInstance, body: Value) -> String {
     r["group_id"].as_str().unwrap_or_default().to_string()
 }
 
-async fn create_group(d: &AgentInstance, name: &str, description: &str) -> String {
-    create_group_with_body(
-        d,
-        serde_json::json!({
-            "name": name,
-            "description": description,
-        }),
-    )
-    .await
-}
-
 async fn create_group_preset(
     d: &AgentInstance,
     name: &str,

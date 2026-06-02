@@ -47,6 +47,12 @@ pub struct SignedInvite {
     /// pre-ADR-0012 invite; treat as GSS-compatible for backwards compatibility.
     #[serde(default)]
     pub secure_plane: Option<SecureGroupPlane>,
+    /// Authority's base secret epoch at invite creation time.
+    #[serde(default)]
+    pub base_secret_epoch: Option<u64>,
+    /// Authority's base security binding at invite creation time.
+    #[serde(default)]
+    pub base_security_binding: Option<String>,
     /// Agent ID of the inviter (hex-encoded).
     pub inviter: String,
     /// One-time invite secret (32 bytes, hex-encoded).
@@ -98,6 +104,8 @@ impl SignedInvite {
             policy: None,
             genesis_creation_nonce: None,
             secure_plane: None,
+            base_secret_epoch: None,
+            base_security_binding: None,
             inviter: hex::encode(inviter.as_bytes()),
             invite_secret: hex::encode(secret_bytes),
             created_at: now,
@@ -129,6 +137,13 @@ impl SignedInvite {
             let secure_plane_json = serde_json::to_vec(&secure_plane).unwrap_or_default();
             data.extend_from_slice(&secure_plane_json);
         }
+        data.extend_from_slice(&self.base_secret_epoch.unwrap_or_default().to_le_bytes());
+        data.extend_from_slice(
+            self.base_security_binding
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes(),
+        );
         data.extend_from_slice(self.inviter.as_bytes());
         data.extend_from_slice(self.invite_secret.as_bytes());
         data.extend_from_slice(&self.created_at.to_le_bytes());

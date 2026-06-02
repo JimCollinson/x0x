@@ -210,13 +210,18 @@ fn canonical_member_joined_bytes_for_test(
     inviter_agent_id: &str,
     invite_secret: &str,
     ts_ms: u64,
+    treekem_key_package_b64: Option<&str>,
 ) -> Vec<u8> {
     fn push_lp(buf: &mut Vec<u8>, bytes: &[u8]) {
         buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
         buf.extend_from_slice(bytes);
     }
+    // Must mirror production `canonical_member_joined_bytes` in src/bin/x0xd.rs
+    // exactly (domain tag + field layout) or the forged event's signature will
+    // fail verification before reaching the role/secret policy checks this test
+    // exercises.
     let mut buf = Vec::new();
-    buf.extend_from_slice(b"x0x.named_group.member_joined.v1");
+    buf.extend_from_slice(b"x0x.named_group.member_joined.v2");
     push_lp(&mut buf, group_id.as_bytes());
     push_lp(&mut buf, stable_group_id.unwrap_or("").as_bytes());
     push_lp(&mut buf, member_agent_id.as_bytes());
@@ -226,6 +231,7 @@ fn canonical_member_joined_bytes_for_test(
     push_lp(&mut buf, inviter_agent_id.as_bytes());
     push_lp(&mut buf, invite_secret.as_bytes());
     buf.extend_from_slice(&ts_ms.to_be_bytes());
+    push_lp(&mut buf, treekem_key_package_b64.unwrap_or("").as_bytes());
     buf
 }
 
@@ -261,6 +267,7 @@ async fn signed_member_joined_event(
         inviter_agent_id,
         invite_secret,
         ts_ms,
+        None,
     );
     let sig =
         ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(keypair.secret_key(), &canonical)

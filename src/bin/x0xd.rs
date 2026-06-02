@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use tokio::signal;
-use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 #[cfg(feature = "profile-heap")]
 #[global_allocator]
@@ -392,6 +392,8 @@ struct SseEvent {
     data: serde_json::Value,
 }
 
+type WelcomeFetchWaiter = oneshot::Sender<std::result::Result<Vec<u8>, String>>;
+
 /// Shared state accessible from all route handlers.
 struct AppState {
     agent: Arc<Agent>,
@@ -432,6 +434,16 @@ struct AppState {
     mls_groups: RwLock<HashMap<String, x0x::mls::MlsGroup>>,
     #[allow(dead_code)]
     mls_groups_path: PathBuf,
+    /// Authority-signed MemberAdded results staged by an anchor for joiner polling.
+    pending_join_results: RwLock<HashMap<String, PendingJoinResult>>,
+    /// TreeKEM Welcome blobs staged by an anchor for pull-based delivery.
+    pending_welcomes: RwLock<HashMap<String, PendingWelcome>>,
+    /// In-progress pulled TreeKEM Welcome blob receives, keyed by blake3 id.
+    pending_welcome_receives: RwLock<HashMap<String, PendingWelcomeReceive>>,
+    /// Waiters blocked on a Welcome blob receive completing.
+    pending_welcome_waiters: RwLock<HashMap<String, Vec<WelcomeFetchWaiter>>>,
+    /// Per-active Welcome blob transfer ack slots.
+    pending_welcome_acks: RwLock<HashMap<String, Arc<FileChunkAckSlot>>>,
     /// Live real-TreeKEM groups (ADR-0012), keyed by group-id hex. Each is
     /// wrapped in its own async mutex so a group's encrypt/decrypt/commit op
     /// and the snapshot-persist that follows it are serialized per group
@@ -1517,6 +1529,11 @@ async fn main() -> Result<()> {
         contacts,
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
+        pending_join_results: RwLock::new(HashMap::new()),
+        pending_welcomes: RwLock::new(HashMap::new()),
+        pending_welcome_receives: RwLock::new(HashMap::new()),
+        pending_welcome_waiters: RwLock::new(HashMap::new()),
+        pending_welcome_acks: RwLock::new(HashMap::new()),
         treekem_groups: RwLock::new(treekem_groups),
         treekem_dir,
         ws_sessions: RwLock::new(HashMap::new()),
@@ -1796,6 +1813,39 @@ async fn main() -> Result<()> {
                     continue; // not a file message
                 };
                 handle_file_message(&file_state, &msg.sender, file_msg).await;
+            }
+        });
+    }
+
+    // Background join-result listener — joiner-initiated recovery path for
+    // fresh TreeKEM members that miss the anchor's opportunistic MemberAdded push.
+    {
+        let join_result_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut rx = join_result_state.agent.subscribe_direct();
+            loop {
+                let Some(msg) = rx.recv().await else { break };
+                let Ok(join_msg) = serde_json::from_slice::<JoinResultMessage>(&msg.payload) else {
+                    continue;
+                };
+                handle_join_result_message(&join_result_state, &msg.sender, join_msg).await;
+            }
+        });
+    }
+
+    // Background TreeKEM Welcome blob listener — pull-based bulk delivery for
+    // oversized Welcome payloads referenced by named-group metadata events.
+    {
+        let welcome_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut rx = welcome_state.agent.subscribe_direct();
+            loop {
+                let Some(msg) = rx.recv().await else { break };
+                let Ok(welcome_msg) = serde_json::from_slice::<WelcomeBlobMessage>(&msg.payload)
+                else {
+                    continue;
+                };
+                handle_welcome_blob_message(&welcome_state, &msg.sender, welcome_msg).await;
             }
         });
     }
@@ -5462,6 +5512,77 @@ struct AddNamedGroupMemberRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct WelcomeRef {
+    welcome_id: String,
+    byte_len: u64,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct PendingJoinResult {
+    event: NamedGroupMetadataEvent,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PendingWelcome {
+    group_id: String,
+    joiner_agent: String,
+    bytes: Vec<u8>,
+    created_at: Instant,
+}
+
+struct PendingWelcomeReceive {
+    group_id: String,
+    source: String,
+    byte_len: u64,
+    total_chunks: u64,
+    chunks: BTreeMap<u64, Vec<u8>>,
+    received_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum JoinResultMessage {
+    FetchRequest {
+        group_id: String,
+        member_agent_id: String,
+    },
+    Result {
+        event: Box<NamedGroupMetadataEvent>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WelcomeBlobMessage {
+    FetchRequest {
+        group_id: String,
+        welcome_id: String,
+    },
+    Offer {
+        group_id: String,
+        welcome_id: String,
+        byte_len: u64,
+        chunk_size: usize,
+        total_chunks: u64,
+        blake3_hex: String,
+    },
+    Chunk {
+        welcome_id: String,
+        sequence: u64,
+        data: String,
+    },
+    ChunkAck {
+        welcome_id: String,
+        sequence: u64,
+    },
+    Complete {
+        welcome_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 // Phase D.3 enlarged GroupCard with a ~6 KB authority signature and a
 // long ML-KEM envelope. Boxing any one variant would force serde-boxed
@@ -5479,8 +5600,12 @@ enum NamedGroupMetadataEvent {
         #[serde(default)]
         treekem_commit_b64: Option<String>,
         /// Base64 postcard-encoded TreeKEM Welcome for the added member.
+        /// Legacy fallback; new events carry `welcome_ref` instead.
         #[serde(default)]
         treekem_welcome_b64: Option<String>,
+        /// Content-addressed pull reference for the added member's TreeKEM Welcome.
+        #[serde(default)]
+        welcome_ref: Option<WelcomeRef>,
         /// TreeKEM epoch after applying `treekem_commit_b64`.
         #[serde(default)]
         treekem_epoch: Option<u64>,
@@ -5583,8 +5708,12 @@ enum NamedGroupMetadataEvent {
         #[serde(default)]
         treekem_commit_b64: Option<String>,
         /// Base64 postcard-encoded TreeKEM Welcome for the requester.
+        /// Legacy fallback; new events carry `welcome_ref` instead.
         #[serde(default)]
         treekem_welcome_b64: Option<String>,
+        /// Content-addressed pull reference for the requester's TreeKEM Welcome.
+        #[serde(default)]
+        welcome_ref: Option<WelcomeRef>,
         /// TreeKEM epoch after applying `treekem_commit_b64`.
         #[serde(default)]
         treekem_epoch: Option<u64>,
@@ -6721,6 +6850,19 @@ async fn refresh_group_card_cache_from_info(
     }
 }
 
+async fn store_named_group_info(
+    state: &AppState,
+    group_id: &str,
+    info: x0x::groups::GroupInfo,
+) -> bool {
+    let mut groups = state.named_groups.write().await;
+    let Some(slot) = groups.get_mut(group_id) else {
+        return false;
+    };
+    *slot = info;
+    true
+}
+
 async fn maybe_publish_group_card_after_state_change(state: &AppState, group_id: &str) {
     let info = {
         let groups = state.named_groups.read().await;
@@ -6774,19 +6916,22 @@ async fn apply_named_group_metadata_event(
     };
 
     let sender_hex = hex::encode(sender.as_bytes());
-    let mut groups = state.named_groups.write().await;
-    let resolved_group_key = if groups.contains_key(&group_id) {
-        group_id.clone()
-    } else if let Some((key, _)) = groups
-        .iter()
-        .find(|(_, info)| info.stable_group_id() == group_id)
-    {
-        key.clone()
-    } else {
-        return false;
-    };
-    let Some(info) = groups.get_mut(&resolved_group_key) else {
-        return false;
+    let (resolved_group_key, info) = {
+        let groups = state.named_groups.read().await;
+        let resolved_group_key = if groups.contains_key(&group_id) {
+            group_id.clone()
+        } else if let Some((key, _)) = groups
+            .iter()
+            .find(|(_, info)| info.stable_group_id() == group_id)
+        {
+            key.clone()
+        } else {
+            return false;
+        };
+        let Some(info) = groups.get(&resolved_group_key).cloned() else {
+            return false;
+        };
+        (resolved_group_key, info)
     };
     let creator_hex = hex::encode(info.creator.as_bytes());
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -6808,6 +6953,7 @@ async fn apply_named_group_metadata_event(
             display_name,
             treekem_commit_b64,
             treekem_welcome_b64,
+            welcome_ref,
             treekem_epoch,
             commit,
             ..
@@ -6822,13 +6968,13 @@ async fn apply_named_group_metadata_event(
                 let Some(commit_b64) = treekem_commit_b64 else {
                     return false;
                 };
-                let Some(welcome_b64) = treekem_welcome_b64 else {
+                if treekem_welcome_b64.is_none() && welcome_ref.is_none() {
                     return false;
-                };
+                }
                 let Some(epoch) = treekem_epoch else {
                     return false;
                 };
-                Some((commit_b64, welcome_b64, epoch))
+                Some((commit_b64, treekem_welcome_b64, welcome_ref, epoch))
             } else {
                 None
             };
@@ -6848,7 +6994,7 @@ async fn apply_named_group_metadata_event(
                     if let Some(name) = display_name.clone() {
                         next.set_display_name(&agent_id, name);
                     }
-                    if let Some((_, _, epoch)) = treekem_payload.as_ref() {
+                    if let Some((_, _, _, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
                         next.security_binding = Some(format!("treekem:epoch={epoch}"));
                     }
@@ -6856,8 +7002,7 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            drop(groups);
-            if let Some((commit_b64, welcome_b64, epoch)) = treekem_payload {
+            if let Some((commit_b64, welcome_b64, welcome_ref, epoch)) = treekem_payload {
                 use base64::Engine as _;
                 let commit_bytes =
                     match base64::engine::general_purpose::STANDARD.decode(commit_b64) {
@@ -6865,11 +7010,22 @@ async fn apply_named_group_metadata_event(
                         Err(_) => return false,
                     };
                 if agent_id == local_agent_hex {
-                    let welcome_bytes =
+                    let welcome_bytes = if let Some(welcome_b64) = welcome_b64 {
                         match base64::engine::general_purpose::STANDARD.decode(welcome_b64) {
                             Ok(bytes) => bytes,
                             Err(_) => return false,
-                        };
+                        }
+                    } else if let Some(welcome_ref) = welcome_ref {
+                        match fetch_treekem_welcome(state, &group_id, &welcome_ref).await {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(group_id = %resolved_group_key, welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob: {e}");
+                                return false;
+                            }
+                        }
+                    } else {
+                        return false;
+                    };
                     let group_id_bytes = match hex::decode(&next.mls_group_id) {
                         Ok(bytes) => bytes,
                         Err(_) => return false,
@@ -6952,12 +7108,8 @@ async fn apply_named_group_metadata_event(
                 }
                 drop(mls_groups);
             }
-            {
-                let mut groups = state.named_groups.write().await;
-                let Some(info) = groups.get_mut(&resolved_group_key) else {
-                    return false;
-                };
-                *info = next.clone();
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
@@ -7010,7 +7162,7 @@ async fn apply_named_group_metadata_event(
             };
             let removed_self = agent_id == local_agent_hex;
             if removed_self {
-                groups.remove(&resolved_group_key);
+                state.named_groups.write().await.remove(&resolved_group_key);
             }
             if treekem_payload.is_none() {
                 let mut mls_groups = state.mls_groups.write().await;
@@ -7023,7 +7175,6 @@ async fn apply_named_group_metadata_event(
                 }
                 drop(mls_groups);
             }
-            drop(groups);
             if removed_self {
                 state
                     .group_card_cache
@@ -7081,12 +7232,8 @@ async fn apply_named_group_metadata_event(
                     return false;
                 }
             }
-            {
-                let mut groups = state.named_groups.write().await;
-                let Some(info) = groups.get_mut(&resolved_group_key) else {
-                    return false;
-                };
-                *info = next.clone();
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
@@ -7119,8 +7266,7 @@ async fn apply_named_group_metadata_event(
             {
                 return false;
             }
-            groups.remove(&resolved_group_key);
-            drop(groups);
+            state.named_groups.write().await.remove(&resolved_group_key);
             state
                 .group_card_cache
                 .write()
@@ -7166,8 +7312,9 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            *info = next.clone();
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
@@ -7221,8 +7368,9 @@ async fn apply_named_group_metadata_event(
             }) else {
                 return false;
             };
-            *info = next.clone();
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
@@ -7284,7 +7432,6 @@ async fn apply_named_group_metadata_event(
                 return false;
             };
             let banned_self = agent_id == local_agent_hex;
-            drop(groups);
             if banned_self {
                 state
                     .treekem_groups
@@ -7331,12 +7478,8 @@ async fn apply_named_group_metadata_event(
                     return false;
                 }
             }
-            {
-                let mut groups = state.named_groups.write().await;
-                let Some(info) = groups.get_mut(&resolved_group_key) else {
-                    return false;
-                };
-                *info = next.clone();
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
@@ -7378,8 +7521,9 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            *info = next.clone();
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
@@ -7466,8 +7610,9 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            *info = next;
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             save_named_groups(state).await;
             false
         }
@@ -7478,6 +7623,7 @@ async fn apply_named_group_metadata_event(
             requester_agent_id,
             treekem_commit_b64,
             treekem_welcome_b64,
+            welcome_ref,
             treekem_epoch,
             commit,
             ..
@@ -7507,13 +7653,13 @@ async fn apply_named_group_metadata_event(
                 let Some(commit_b64) = treekem_commit_b64 else {
                     return false;
                 };
-                let Some(welcome_b64) = treekem_welcome_b64 else {
+                if treekem_welcome_b64.is_none() && welcome_ref.is_none() {
                     return false;
-                };
+                }
                 let Some(epoch) = treekem_epoch else {
                     return false;
                 };
-                Some((commit_b64, welcome_b64, epoch))
+                Some((commit_b64, treekem_welcome_b64, welcome_ref, epoch))
             } else {
                 None
             };
@@ -7540,7 +7686,7 @@ async fn apply_named_group_metadata_event(
                     if let Some(kp_b64) = request_key_package_b64.clone() {
                         next.set_member_treekem_key_package(&requester_agent_id, kp_b64);
                     }
-                    if let Some((_, _, epoch)) = treekem_payload.as_ref() {
+                    if let Some((_, _, _, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
                         next.security_binding = Some(format!("treekem:epoch={epoch}"));
                     }
@@ -7548,8 +7694,7 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            drop(groups);
-            if let Some((commit_b64, welcome_b64, _epoch)) = treekem_payload {
+            if let Some((commit_b64, welcome_b64, welcome_ref, _epoch)) = treekem_payload {
                 use base64::Engine as _;
                 let commit_bytes =
                     match base64::engine::general_purpose::STANDARD.decode(commit_b64) {
@@ -7557,11 +7702,22 @@ async fn apply_named_group_metadata_event(
                         Err(_) => return false,
                     };
                 if requester_agent_id == local_agent_hex {
-                    let welcome_bytes =
+                    let welcome_bytes = if let Some(welcome_b64) = welcome_b64 {
                         match base64::engine::general_purpose::STANDARD.decode(welcome_b64) {
                             Ok(bytes) => bytes,
                             Err(_) => return false,
-                        };
+                        }
+                    } else if let Some(welcome_ref) = welcome_ref {
+                        match fetch_treekem_welcome(state, &group_id, &welcome_ref).await {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                tracing::warn!(group_id = %resolved_group_key, welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob: {e}");
+                                return false;
+                            }
+                        }
+                    } else {
+                        return false;
+                    };
                     let group_id_bytes = match hex::decode(&next.mls_group_id) {
                         Ok(bytes) => bytes,
                         Err(_) => return false,
@@ -7638,12 +7794,8 @@ async fn apply_named_group_metadata_event(
                     }
                 }
             }
-            {
-                let mut groups = state.named_groups.write().await;
-                let Some(info) = groups.get_mut(&resolved_group_key) else {
-                    return false;
-                };
-                *info = next.clone();
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
@@ -7685,8 +7837,9 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            *info = next;
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             save_named_groups(state).await;
             false
         }
@@ -7721,8 +7874,9 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            *info = next;
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             save_named_groups(state).await;
             false
         }
@@ -7780,8 +7934,9 @@ async fn apply_named_group_metadata_event(
             ) else {
                 return false;
             };
-            *info = next.clone();
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             false
@@ -7859,10 +8014,13 @@ async fn apply_named_group_metadata_event(
                     return false;
                 }
             };
-            info.shared_secret = Some(secret.to_vec());
-            info.secret_epoch = secret_epoch;
-            info.security_binding = Some(format!("gss:epoch={secret_epoch}"));
-            drop(groups);
+            let mut next = info.clone();
+            next.shared_secret = Some(secret.to_vec());
+            next.secret_epoch = secret_epoch;
+            next.security_binding = Some(format!("gss:epoch={secret_epoch}"));
+            if !store_named_group_info(state, &resolved_group_key, next).await {
+                return false;
+            }
             save_named_groups(state).await;
             tracing::info!(
                 group_id = %ev_group_id,
@@ -8149,8 +8307,9 @@ async fn apply_named_group_metadata_event(
             };
             let metadata_topic = next.metadata_topic.clone();
             let event_group_id = next.stable_group_id().to_string();
-            *info = next;
-            drop(groups);
+            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return false;
+            }
 
             // Persist and expose the committed roster before any slower MLS or
             // discovery-card side effects. Tests and operators poll
@@ -8172,19 +8331,25 @@ async fn apply_named_group_metadata_event(
                 }
                 save_mls_groups(state).await;
             }
+            let welcome_ref = if let Some(welcome) = treekem_welcome.take() {
+                Some(stage_treekem_welcome(state, &event_group_id, &member_agent_id, welcome).await)
+            } else {
+                None
+            };
             let event = NamedGroupMetadataEvent::MemberAdded {
-                group_id: event_group_id,
+                group_id: event_group_id.clone(),
                 revision,
                 actor: inviter_agent_id.clone(),
                 agent_id: member_agent_id.clone(),
                 display_name: display_name.clone(),
                 treekem_commit_b64: treekem_commit
                     .map(|c| base64::engine::general_purpose::STANDARD.encode(c)),
-                treekem_welcome_b64: treekem_welcome
-                    .map(|w| base64::engine::general_purpose::STANDARD.encode(w)),
+                treekem_welcome_b64: None,
+                welcome_ref,
                 treekem_epoch,
                 commit: Some(commit),
             };
+            stage_join_result(state, &event_group_id, &member_agent_id, event.clone()).await;
             publish_named_group_metadata_event(state, &metadata_topic, &event).await;
             spawn_named_group_event_delivery(state, &member_agent_id, &event);
             maybe_publish_group_card_after_state_change(state, &resolved_group_key).await;
@@ -9098,6 +9263,8 @@ async fn create_group_invite(
         invite.policy = Some(info.policy.clone());
         invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
         invite.secure_plane = Some(info.secure_plane);
+        invite.base_secret_epoch = Some(info.secret_epoch);
+        invite.base_security_binding = info.security_binding.clone();
 
         // Track this one-time secret on the inviter so a future
         // MemberJoined request carrying it can be authenticated, role-capped,
@@ -9239,27 +9406,31 @@ async fn join_group_via_invite(
                     }),
                 ));
             }
+            let joiner_hex = hex::encode(agent_id.as_bytes());
             if invite_is_treekem {
                 info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
                 info.shared_secret = None;
-                info.security_binding = Some("treekem:pending".to_string());
+                info.secret_epoch = invite.base_secret_epoch.unwrap_or_default();
+                info.security_binding = invite
+                    .base_security_binding
+                    .clone()
+                    .or_else(|| Some(format!("treekem:epoch={}", info.secret_epoch)));
+            } else {
+                info.add_member(
+                    joiner_hex.clone(),
+                    x0x::groups::GroupRole::Member,
+                    Some(invite.inviter.clone()),
+                    req.display_name.clone(),
+                );
+                // Set joiner's display name if provided
+                if let Some(ref dn) = req.display_name {
+                    info.set_display_name(&joiner_hex, dn.clone());
+                }
+                if let Some(kp_b64) = treekem_key_package_b64.clone() {
+                    info.set_member_treekem_key_package(&joiner_hex, kp_b64);
+                }
             }
             info.recompute_state_hash();
-
-            let joiner_hex = hex::encode(agent_id.as_bytes());
-            info.add_member(
-                joiner_hex.clone(),
-                x0x::groups::GroupRole::Member,
-                Some(invite.inviter.clone()),
-                req.display_name.clone(),
-            );
-            // Set joiner's display name if provided
-            if let Some(ref dn) = req.display_name {
-                info.set_display_name(&joiner_hex, dn.clone());
-            }
-            if let Some(kp_b64) = treekem_key_package_b64.clone() {
-                info.set_member_treekem_key_package(&joiner_hex, kp_b64);
-            }
 
             let chat_topic = info.general_chat_topic();
 
@@ -9356,6 +9527,22 @@ async fn join_group_via_invite(
                         "MemberJoined: failed to sign join announcement: {e:?}"
                     );
                 }
+            }
+            if invite_is_treekem {
+                let state_for_poll = Arc::clone(&state);
+                let group_id_for_poll = group_id_hex.clone();
+                let event_group_id_for_poll = info.stable_group_id().to_string();
+                let member_for_poll = joiner_hex.clone();
+                tokio::spawn(async move {
+                    poll_join_result_until_treekem_ready(
+                        state_for_poll,
+                        group_id_for_poll,
+                        event_group_id_for_poll,
+                        creator,
+                        member_for_poll,
+                    )
+                    .await;
+                });
             }
 
             // Announce join on the chat topic so the creator sees us —
@@ -9534,6 +9721,7 @@ async fn add_named_group_member(
             display_name: req.display_name,
             treekem_commit_b64: None,
             treekem_welcome_b64: None,
+            welcome_ref: None,
             treekem_epoch: None,
             commit: Some(commit),
         };
@@ -9692,6 +9880,7 @@ async fn add_treekem_named_group_member(
     drop(groups);
     save_named_groups(&state).await;
 
+    let welcome_ref = stage_treekem_welcome(&state, &event_group_id, &agent_hex, out.welcome).await;
     let event = NamedGroupMetadataEvent::MemberAdded {
         group_id: event_group_id,
         revision,
@@ -9699,7 +9888,8 @@ async fn add_treekem_named_group_member(
         agent_id: agent_hex.clone(),
         display_name: req.display_name,
         treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(out.commit)),
-        treekem_welcome_b64: Some(base64::engine::general_purpose::STANDARD.encode(out.welcome)),
+        treekem_welcome_b64: None,
+        welcome_ref: Some(welcome_ref),
         treekem_epoch: Some(treekem_epoch),
         commit: Some(commit),
     };
@@ -11443,6 +11633,7 @@ async fn approve_join_request(
         requester_agent_id: requester_hex.clone(),
         treekem_commit_b64: None,
         treekem_welcome_b64: None,
+        welcome_ref: None,
         treekem_epoch: None,
         commit: Some(commit),
     };
@@ -11621,6 +11812,8 @@ async fn approve_treekem_join_request(
     drop(groups);
     save_named_groups(&state).await;
 
+    let welcome_ref =
+        stage_treekem_welcome(&state, &event_group_id, &requester_hex, treekem_welcome).await;
     let event = NamedGroupMetadataEvent::JoinRequestApproved {
         group_id: event_group_id,
         request_id,
@@ -11628,9 +11821,8 @@ async fn approve_treekem_join_request(
         actor: caller_hex,
         requester_agent_id: requester_hex.clone(),
         treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
-        treekem_welcome_b64: Some(
-            base64::engine::general_purpose::STANDARD.encode(treekem_welcome),
-        ),
+        treekem_welcome_b64: None,
+        welcome_ref: Some(welcome_ref),
         treekem_epoch: Some(treekem_epoch),
         commit: Some(commit),
     };
@@ -16317,6 +16509,574 @@ fn init_logging(level: &str, format: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// TreeKEM join-result and Welcome blob pull handling
+// ---------------------------------------------------------------------------
+
+const PENDING_JOIN_RESULT_TTL: Duration = Duration::from_secs(10 * 60);
+const JOIN_RESULT_POLL_TIMEOUT: Duration = Duration::from_secs(120);
+const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
+const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn welcome_id_for_bytes(bytes: &[u8]) -> String {
+    hex::encode(blake3::hash(bytes).as_bytes())
+}
+
+fn join_result_key(group_id: &str, member_agent_id: &str) -> String {
+    format!("{group_id}:{member_agent_id}")
+}
+
+async fn stage_join_result(
+    state: &AppState,
+    group_id: &str,
+    member_agent_id: &str,
+    event: NamedGroupMetadataEvent,
+) {
+    let key = join_result_key(group_id, member_agent_id);
+    let mut results = state.pending_join_results.write().await;
+    results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+    results.insert(
+        key,
+        PendingJoinResult {
+            event,
+            created_at: Instant::now(),
+        },
+    );
+}
+
+async fn handle_join_result_message(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    msg: JoinResultMessage,
+) {
+    match msg {
+        JoinResultMessage::FetchRequest {
+            group_id,
+            member_agent_id,
+        } => {
+            let sender_hex = hex::encode(sender.as_bytes());
+            if sender_hex != member_agent_id {
+                tracing::warn!(group_id = %group_id, sender = %sender_hex, member = %member_agent_id, "ignoring unauthorized join-result fetch");
+                return;
+            }
+            let key = join_result_key(&group_id, &member_agent_id);
+            let event = {
+                let mut results = state.pending_join_results.write().await;
+                results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
+                results.get(&key).map(|pending| pending.event.clone())
+            };
+            let Some(event) = event else {
+                tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch before result was staged");
+                return;
+            };
+            let response = JoinResultMessage::Result {
+                event: Box::new(event),
+            };
+            let payload = match serde_json::to_vec(&response) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    tracing::warn!(group_id = %group_id, "failed to serialize join-result event: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = state
+                .agent
+                .send_direct_with_config(sender, payload, direct_message_send_config())
+                .await
+            {
+                tracing::warn!(group_id = %group_id, member = %member_agent_id, "failed to send join-result response: {e}");
+            }
+        }
+        JoinResultMessage::Result { event } => {
+            let event = *event;
+            let (group_id, member_agent_id) = match &event {
+                NamedGroupMetadataEvent::MemberAdded {
+                    group_id, agent_id, ..
+                } => (group_id.clone(), agent_id.clone()),
+                _ => {
+                    tracing::warn!("ignoring non-MemberAdded join-result response");
+                    return;
+                }
+            };
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            if member_agent_id != local_agent_hex {
+                tracing::warn!(group_id = %group_id, member = %member_agent_id, local = %local_agent_hex, "ignoring join-result for different member");
+                return;
+            }
+            let sender_hex = hex::encode(sender.as_bytes());
+            let creator_hex = {
+                let groups = state.named_groups.read().await;
+                groups
+                    .get(&group_id)
+                    .or_else(|| {
+                        groups
+                            .values()
+                            .find(|info| info.stable_group_id() == group_id)
+                    })
+                    .map(|info| hex::encode(info.creator.as_bytes()))
+            };
+            let Some(creator_hex) = creator_hex else {
+                tracing::warn!(group_id = %group_id, "ignoring join-result for unknown local group");
+                return;
+            };
+            if sender_hex != creator_hex {
+                tracing::warn!(group_id = %group_id, sender = %sender_hex, creator = %creator_hex, "ignoring join-result from non-creator");
+                return;
+            }
+            apply_named_group_metadata_event(state, event, *sender, true).await;
+        }
+    }
+}
+
+async fn poll_join_result_until_treekem_ready(
+    state: Arc<AppState>,
+    group_id: String,
+    event_group_id: String,
+    inviter: AgentId,
+    member_agent_id: String,
+) {
+    let deadline = tokio::time::Instant::now() + JOIN_RESULT_POLL_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if state.treekem_groups.read().await.contains_key(&group_id) {
+            return;
+        }
+        let request = JoinResultMessage::FetchRequest {
+            group_id: event_group_id.clone(),
+            member_agent_id: member_agent_id.clone(),
+        };
+        let payload = match serde_json::to_vec(&request) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(group_id = %group_id, "failed to serialize join-result fetch request: {e}");
+                return;
+            }
+        };
+        if let Err(e) = state
+            .agent
+            .send_direct_with_config(&inviter, payload, direct_message_send_config())
+            .await
+        {
+            tracing::debug!(group_id = %group_id, member = %member_agent_id, "join-result fetch attempt failed: {e}");
+        }
+        tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
+    }
+    tracing::warn!(group_id = %group_id, member = %member_agent_id, "timed out polling anchor for TreeKEM join result");
+}
+
+async fn stage_treekem_welcome(
+    state: &AppState,
+    group_id: &str,
+    joiner_agent: &str,
+    bytes: Vec<u8>,
+) -> WelcomeRef {
+    let welcome_id = welcome_id_for_bytes(&bytes);
+    let byte_len = bytes.len() as u64;
+    let source = hex::encode(state.agent.agent_id().as_bytes());
+    let pending = PendingWelcome {
+        group_id: group_id.to_string(),
+        joiner_agent: joiner_agent.to_string(),
+        bytes,
+        created_at: Instant::now(),
+    };
+    let mut welcomes = state.pending_welcomes.write().await;
+    welcomes.retain(|_, pending| pending.created_at.elapsed() < PENDING_WELCOME_TTL);
+    welcomes.insert(welcome_id.clone(), pending);
+    WelcomeRef {
+        welcome_id,
+        byte_len,
+        source,
+    }
+}
+
+async fn send_welcome_blob_message(
+    state: &Arc<AppState>,
+    agent_id: &AgentId,
+    msg: &WelcomeBlobMessage,
+) -> std::result::Result<x0x::dm::DmReceipt, String> {
+    let payload = serde_json::to_vec(msg).map_err(|e| format!("serialization failed: {e}"))?;
+    if payload.len() > x0x::dm::MAX_PAYLOAD_BYTES {
+        return Err(format!(
+            "welcome blob message exceeds MAX_PAYLOAD_BYTES ({} > {})",
+            payload.len(),
+            x0x::dm::MAX_PAYLOAD_BYTES
+        ));
+    }
+    state
+        .agent
+        .send_direct_with_config(agent_id, payload, file_transfer_send_config())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn notify_welcome_waiters(
+    state: &Arc<AppState>,
+    welcome_id: &str,
+    result: std::result::Result<Vec<u8>, String>,
+) {
+    let waiters = state
+        .pending_welcome_waiters
+        .write()
+        .await
+        .remove(welcome_id);
+    if let Some(waiters) = waiters {
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+}
+
+async fn cleanup_welcome_fetch_state(state: &Arc<AppState>, welcome_id: &str) {
+    state
+        .pending_welcome_waiters
+        .write()
+        .await
+        .remove(welcome_id);
+    state
+        .pending_welcome_receives
+        .write()
+        .await
+        .remove(welcome_id);
+}
+
+async fn fetch_treekem_welcome(
+    state: &Arc<AppState>,
+    group_id: &str,
+    welcome_ref: &WelcomeRef,
+) -> std::result::Result<Vec<u8>, String> {
+    if welcome_ref.byte_len > x0x::files::MAX_TRANSFER_SIZE {
+        return Err("TreeKEM Welcome blob exceeds maximum transfer size".to_string());
+    }
+    let source = parse_agent_id_hex(&welcome_ref.source)?;
+    let total_chunks =
+        x0x::files::total_chunks_for_size(welcome_ref.byte_len, x0x::files::DEFAULT_CHUNK_SIZE);
+    state.pending_welcome_receives.write().await.insert(
+        welcome_ref.welcome_id.clone(),
+        PendingWelcomeReceive {
+            group_id: group_id.to_string(),
+            source: welcome_ref.source.clone(),
+            byte_len: welcome_ref.byte_len,
+            total_chunks,
+            chunks: BTreeMap::new(),
+            received_bytes: 0,
+        },
+    );
+    let (tx, rx) = oneshot::channel();
+    state
+        .pending_welcome_waiters
+        .write()
+        .await
+        .entry(welcome_ref.welcome_id.clone())
+        .or_default()
+        .push(tx);
+
+    let request = WelcomeBlobMessage::FetchRequest {
+        group_id: group_id.to_string(),
+        welcome_id: welcome_ref.welcome_id.clone(),
+    };
+    if let Err(e) = send_welcome_blob_message(state, &source, &request).await {
+        cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+        return Err(e);
+    }
+
+    let received = match tokio::time::timeout(WELCOME_FETCH_TIMEOUT, rx).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(_)) => return Err("TreeKEM Welcome waiter dropped".to_string()),
+        Err(_) => {
+            cleanup_welcome_fetch_state(state, &welcome_ref.welcome_id).await;
+            return Err("timed out waiting for TreeKEM Welcome blob".to_string());
+        }
+    };
+    if received.len() as u64 != welcome_ref.byte_len {
+        return Err(format!(
+            "TreeKEM Welcome length mismatch: got {}, expected {}",
+            received.len(),
+            welcome_ref.byte_len
+        ));
+    }
+    let actual = welcome_id_for_bytes(&received);
+    if actual != welcome_ref.welcome_id {
+        return Err("TreeKEM Welcome blake3 mismatch".to_string());
+    }
+    Ok(received)
+}
+
+async fn handle_welcome_blob_message(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    msg: WelcomeBlobMessage,
+) {
+    match msg {
+        WelcomeBlobMessage::FetchRequest {
+            group_id,
+            welcome_id,
+        } => handle_welcome_fetch_request(state, sender, group_id, welcome_id).await,
+        WelcomeBlobMessage::Offer {
+            group_id,
+            welcome_id,
+            byte_len,
+            chunk_size,
+            total_chunks,
+            blake3_hex,
+        } => {
+            let source = hex::encode(sender.as_bytes());
+            let mismatch = {
+                let receives = state.pending_welcome_receives.read().await;
+                let Some(receive) = receives.get(&welcome_id) else {
+                    tracing::debug!(welcome_id, "ignoring unsolicited Welcome blob offer");
+                    return;
+                };
+                if receive.source != source {
+                    tracing::debug!(welcome_id, sender = %source, "ignoring Welcome blob offer from unexpected source");
+                    return;
+                }
+                receive.group_id != group_id
+                    || receive.byte_len != byte_len
+                    || receive.total_chunks != total_chunks
+                    || chunk_size != x0x::files::DEFAULT_CHUNK_SIZE
+                    || blake3_hex != welcome_id
+            };
+            if mismatch {
+                state
+                    .pending_welcome_receives
+                    .write()
+                    .await
+                    .remove(&welcome_id);
+                notify_welcome_waiters(
+                    state,
+                    &welcome_id,
+                    Err("welcome offer did not match requested reference".to_string()),
+                )
+                .await;
+            }
+        }
+        WelcomeBlobMessage::Chunk {
+            welcome_id,
+            sequence,
+            data,
+        } => handle_welcome_blob_chunk(state, sender, welcome_id, sequence, data).await,
+        WelcomeBlobMessage::ChunkAck {
+            welcome_id,
+            sequence,
+        } => {
+            if let Some(slot) = state.pending_welcome_acks.read().await.get(&welcome_id) {
+                slot.record_ack(sequence);
+            }
+        }
+        WelcomeBlobMessage::Complete { welcome_id } => {
+            handle_welcome_blob_complete(state, sender, &welcome_id).await;
+        }
+    }
+}
+
+async fn handle_welcome_fetch_request(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    group_id: String,
+    welcome_id: String,
+) {
+    let sender_hex = hex::encode(sender.as_bytes());
+    let pending = {
+        let welcomes = state.pending_welcomes.read().await;
+        welcomes.get(&welcome_id).cloned()
+    };
+    let Some(pending) = pending else {
+        tracing::warn!(welcome_id, "Welcome fetch for unknown blob");
+        return;
+    };
+    if pending.created_at.elapsed() >= PENDING_WELCOME_TTL {
+        state.pending_welcomes.write().await.remove(&welcome_id);
+        return;
+    }
+    if pending.group_id != group_id || pending.joiner_agent != sender_hex {
+        tracing::warn!(welcome_id, sender = %sender_hex, "unauthorized Welcome fetch request");
+        return;
+    }
+    let state = Arc::clone(state);
+    let recipient = *sender;
+    tokio::spawn(async move {
+        stream_welcome_blob(&state, &recipient, &welcome_id, pending).await;
+    });
+}
+
+async fn stream_welcome_blob(
+    state: &Arc<AppState>,
+    recipient: &AgentId,
+    welcome_id: &str,
+    pending: PendingWelcome,
+) {
+    let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
+    let total_chunks = x0x::files::total_chunks_for_size(pending.bytes.len() as u64, chunk_size);
+    let offer = WelcomeBlobMessage::Offer {
+        group_id: pending.group_id.clone(),
+        welcome_id: welcome_id.to_string(),
+        byte_len: pending.bytes.len() as u64,
+        chunk_size,
+        total_chunks,
+        blake3_hex: welcome_id.to_string(),
+    };
+    if let Err(e) = send_welcome_blob_message(state, recipient, &offer).await {
+        tracing::warn!(welcome_id, "failed to send Welcome blob offer: {e}");
+        return;
+    }
+
+    let ack_slot = Arc::new(FileChunkAckSlot::new());
+    state
+        .pending_welcome_acks
+        .write()
+        .await
+        .insert(welcome_id.to_string(), Arc::clone(&ack_slot));
+
+    for (sequence, chunk) in pending.bytes.chunks(chunk_size).enumerate() {
+        let sequence = sequence as u64;
+        if let Err(e) = wait_for_chunk_window(&ack_slot, sequence).await {
+            tracing::warn!(welcome_id, "Welcome blob chunk window failed: {e}");
+            state.pending_welcome_acks.write().await.remove(welcome_id);
+            return;
+        }
+        let msg = WelcomeBlobMessage::Chunk {
+            welcome_id: welcome_id.to_string(),
+            sequence,
+            data: base64::engine::general_purpose::STANDARD.encode(chunk),
+        };
+        if let Err(e) = send_welcome_blob_message(state, recipient, &msg).await {
+            tracing::warn!(
+                welcome_id,
+                sequence,
+                "failed to send Welcome blob chunk: {e}"
+            );
+            state.pending_welcome_acks.write().await.remove(welcome_id);
+            return;
+        }
+    }
+
+    if total_chunks > 0 {
+        let last_seq = total_chunks - 1;
+        if let Err(e) = wait_for_final_acks(&ack_slot, last_seq).await {
+            tracing::warn!(welcome_id, "Welcome blob final ack wait failed: {e}");
+            state.pending_welcome_acks.write().await.remove(welcome_id);
+            return;
+        }
+    }
+    let complete = WelcomeBlobMessage::Complete {
+        welcome_id: welcome_id.to_string(),
+    };
+    if let Err(e) = send_welcome_blob_message(state, recipient, &complete).await {
+        tracing::warn!(welcome_id, "failed to send Welcome blob complete: {e}");
+    }
+    state.pending_welcome_acks.write().await.remove(welcome_id);
+}
+
+async fn handle_welcome_blob_chunk(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    welcome_id: String,
+    sequence: u64,
+    data: String,
+) {
+    let sender_hex = hex::encode(sender.as_bytes());
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(data) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            notify_welcome_waiters(
+                state,
+                &welcome_id,
+                Err(format!("Welcome chunk decode failed: {e}")),
+            )
+            .await;
+            return;
+        }
+    };
+    let mut receives = state.pending_welcome_receives.write().await;
+    let Some(receive) = receives.get_mut(&welcome_id) else {
+        return;
+    };
+    if receive.source != sender_hex {
+        return;
+    }
+    if sequence >= receive.total_chunks {
+        return;
+    }
+    if !receive.chunks.contains_key(&sequence) {
+        receive.received_bytes = receive.received_bytes.saturating_add(decoded.len() as u64);
+        receive.chunks.insert(sequence, decoded);
+    }
+    drop(receives);
+
+    let ack = WelcomeBlobMessage::ChunkAck {
+        welcome_id,
+        sequence,
+    };
+    if let Err(e) = send_welcome_blob_message(state, sender, &ack).await {
+        tracing::warn!(sequence, "failed to ack Welcome blob chunk: {e}");
+    }
+}
+
+async fn handle_welcome_blob_complete(state: &Arc<AppState>, sender: &AgentId, welcome_id: &str) {
+    let sender_hex = hex::encode(sender.as_bytes());
+    {
+        let receives = state.pending_welcome_receives.read().await;
+        let Some(receive) = receives.get(welcome_id) else {
+            return;
+        };
+        if receive.source != sender_hex {
+            return;
+        }
+    }
+    let receive = state
+        .pending_welcome_receives
+        .write()
+        .await
+        .remove(welcome_id);
+    let Some(receive) = receive else {
+        return;
+    };
+    if receive.received_bytes != receive.byte_len
+        || receive.chunks.len() as u64 != receive.total_chunks
+    {
+        notify_welcome_waiters(
+            state,
+            welcome_id,
+            Err("incomplete Welcome blob transfer".to_string()),
+        )
+        .await;
+        return;
+    }
+    let mut bytes = Vec::with_capacity(receive.byte_len as usize);
+    for sequence in 0..receive.total_chunks {
+        let Some(chunk) = receive.chunks.get(&sequence) else {
+            notify_welcome_waiters(
+                state,
+                welcome_id,
+                Err("missing Welcome blob chunk".to_string()),
+            )
+            .await;
+            return;
+        };
+        bytes.extend_from_slice(chunk);
+    }
+    if receive.group_id.is_empty() {
+        notify_welcome_waiters(
+            state,
+            welcome_id,
+            Err("Welcome blob missing group id".to_string()),
+        )
+        .await;
+        return;
+    }
+    let actual = welcome_id_for_bytes(&bytes);
+    if actual != welcome_id {
+        notify_welcome_waiters(
+            state,
+            welcome_id,
+            Err("Welcome blob blake3 mismatch".to_string()),
+        )
+        .await;
+        return;
+    }
+    notify_welcome_waiters(state, welcome_id, Ok(bytes)).await;
+}
+
+// ---------------------------------------------------------------------------
 // File transfer message handling
 // ---------------------------------------------------------------------------
 
@@ -17492,6 +18252,7 @@ mod tests {
             requester_agent_id: "22".repeat(32),
             treekem_commit_b64: Some("Y29tbWl0".to_string()),
             treekem_welcome_b64: Some("d2VsY29tZQ==".to_string()),
+            welcome_ref: None,
             treekem_epoch: Some(1),
             commit: None,
         };
@@ -17524,6 +18285,140 @@ mod tests {
             commit: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&event));
+    }
+
+    #[test]
+    fn treekem_invite_stub_matches_authority_base_hash() {
+        let creator = AgentId([7; 32]);
+        let group_id = "ab".repeat(32);
+        let policy = x0x::groups::GroupPolicy::default();
+        let mut authority = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            "desc".to_string(),
+            creator,
+            group_id.clone(),
+            policy.clone(),
+        );
+        authority.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        authority.shared_secret = None;
+        authority.secret_epoch = 1;
+        authority.security_binding = Some("treekem:epoch=1".to_string());
+        authority.recompute_state_hash();
+
+        let mut invite = x0x::groups::invite::SignedInvite::new(
+            authority.mls_group_id.clone(),
+            authority.name.clone(),
+            &creator,
+            0,
+        );
+        invite.stable_group_id = Some(authority.stable_group_id().to_string());
+        invite.group_created_at = Some(authority.created_at);
+        invite.group_description = Some(authority.description.clone());
+        invite.policy = Some(authority.policy.clone());
+        invite.genesis_creation_nonce =
+            authority.genesis.as_ref().map(|g| g.creation_nonce.clone());
+        invite.secure_plane = Some(authority.secure_plane);
+        invite.base_secret_epoch = Some(authority.secret_epoch);
+        invite.base_security_binding = authority.security_binding.clone();
+
+        let mut stub = x0x::groups::GroupInfo::with_policy(
+            invite.group_name.clone(),
+            invite.group_description.clone().unwrap_or_default(),
+            creator,
+            invite.group_id.clone(),
+            invite.policy.clone().unwrap_or_default(),
+        );
+        if let Some(group_created_at) = invite.group_created_at {
+            stub.created_at = group_created_at;
+        }
+        if let Some(stable_group_id) = invite.stable_group_id.clone() {
+            stub.genesis = Some(x0x::groups::GroupGenesis::with_existing_id(
+                stable_group_id,
+                invite.inviter.clone(),
+                stub.created_at,
+                invite.genesis_creation_nonce.clone().unwrap_or_default(),
+            ));
+        }
+        stub.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        stub.shared_secret = None;
+        stub.secret_epoch = invite.base_secret_epoch.unwrap_or_default();
+        stub.security_binding = invite.base_security_binding.clone();
+        stub.recompute_state_hash();
+
+        assert_eq!(stub.state_hash, authority.state_hash);
+    }
+
+    #[test]
+    fn join_result_fetch_request_is_small_and_stable() {
+        let request = JoinResultMessage::FetchRequest {
+            group_id: "aa".repeat(32),
+            member_agent_id: "bb".repeat(32),
+        };
+        let payload = serde_json::to_vec(&request);
+        assert!(payload.is_ok(), "join-result fetch request serializes");
+        let Ok(payload) = payload else {
+            return;
+        };
+        assert!(payload.len() < x0x::dm::MAX_PAYLOAD_BYTES);
+        assert_eq!(
+            join_result_key(&"aa".repeat(32), &"bb".repeat(32)),
+            format!("{}:{}", "aa".repeat(32), "bb".repeat(32))
+        );
+
+        let result = JoinResultMessage::Result {
+            event: Box::new(NamedGroupMetadataEvent::MemberAdded {
+                group_id: "aa".repeat(32),
+                revision: 1,
+                actor: "11".repeat(32),
+                agent_id: "bb".repeat(32),
+                display_name: None,
+                treekem_commit_b64: Some("Yw==".to_string()),
+                treekem_welcome_b64: None,
+                welcome_ref: None,
+                treekem_epoch: Some(1),
+                commit: None,
+            }),
+        };
+        let result_payload = serde_json::to_vec(&result);
+        assert!(result_payload.is_ok(), "join-result response serializes");
+        let Ok(result_payload) = result_payload else {
+            return;
+        };
+        assert!(result_payload.len() < x0x::dm::MAX_PAYLOAD_BYTES);
+        let parsed = serde_json::from_slice::<JoinResultMessage>(&result_payload);
+        assert!(parsed.is_ok(), "join-result response deserializes");
+        assert!(matches!(parsed, Ok(JoinResultMessage::Result { .. })));
+    }
+
+    #[test]
+    fn treekem_welcome_ref_is_content_addressed_and_serialized() {
+        let bytes = b"large treekem welcome blob";
+        let welcome_id = welcome_id_for_bytes(bytes);
+        assert_eq!(welcome_id, hex::encode(blake3::hash(bytes).as_bytes()));
+
+        let event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: "aa".to_string(),
+            revision: 1,
+            actor: "11".to_string(),
+            agent_id: "22".to_string(),
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: None,
+            welcome_ref: Some(WelcomeRef {
+                welcome_id: welcome_id.clone(),
+                byte_len: bytes.len() as u64,
+                source: "11".repeat(32),
+            }),
+            treekem_epoch: Some(1),
+            commit: None,
+        };
+        let json = serde_json::to_value(event);
+        assert!(json.is_ok(), "welcome ref event serializes");
+        let Ok(json) = json else {
+            return;
+        };
+        assert_eq!(json["welcome_ref"]["welcome_id"], welcome_id);
+        assert_eq!(json["treekem_welcome_b64"], serde_json::Value::Null);
     }
 
     #[test]
@@ -17700,6 +18595,7 @@ mod tests {
             display_name: None,
             treekem_commit_b64: Some("Yw==".to_string()),
             treekem_welcome_b64: Some("dw==".to_string()),
+            welcome_ref: None,
             treekem_epoch: Some(1),
             commit: None,
         };

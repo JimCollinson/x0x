@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.20.1] - 2026-06-02
+
+### Changed
+
+- **SKILL.md install guidance hardened**: the install section no longer pipes a remote script straight into a shell (`curl … | sh`) or recommends one-line variants that immediately start/persist the daemon. Option B is now download → review → run (`curl -sfLO …/install.sh`, `less install.sh`, `sh install.sh`); starting the daemon is a separate explicit `x0x start`, and `--start` / `--autostart` remain as opt-in flags on the already-downloaded, reviewed script. Clears the ClawScan "suspicious" verdict (SkillSpector + VirusTotal flagged the previous remote-installer docs; static scan was already clean).
+
+### Fixed
+
+- **Release pipeline no longer false-fails on the ClawHub scan clock**: the "Publish SKILL.md to ClawHub" job previously hard-failed after a fixed 5-minute wait for ClawHub's asynchronous security scan, reddening otherwise-successful releases (crate, binaries, and GitHub release all publish independently). The verification step is now status-aware — it keys off the `SecuritySnapshot.status` enum (`clean` → success, `malicious` → fail, `suspicious` → warn-and-succeed, `pending`/`error` → tolerate and finalize asynchronously) — so a slow scan never blocks a release while a genuine malicious verdict still does.
+- **Documentation build (rustdoc `-D warnings`)**: fixed broken/private intra-doc links in the `mls` module docs introduced with the TreeKEM plane (`[group]`, `[treekem]`, and links to the private `member_id_from_seed` / `agent_id_to_member_id` items) — now plain code spans, so `cargo doc` is clean again.
+- **`named_group_add_remove_member_local` integration test**: updated to create a `public_open` (GSS) group. The default `private_secure` preset is now secure-by-default TreeKEM (ADR-0012), where a direct roster add correctly requires the target's KeyPackage; this local-roster-semantics test now exercises the non-secure plane where add-by-`agent_id` is the valid operation.
+
 ## [v0.20.0] - 2026-06-02
 
 ### Added

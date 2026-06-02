@@ -1,6 +1,6 @@
 //! Real RFC-9420 TreeKEM group encryption, wrapping `saorsa_mls::TreeKemGroup`.
 //!
-//! Unlike the legacy GSS plane in [`crate::mls::group`] (a per-epoch shared
+//! Unlike the legacy GSS plane in `crate::mls::group` (a per-epoch shared
 //! secret with no forward secrecy / no post-compromise security), this plane
 //! provides genuine **forward secrecy** and **post-compromise security** via a
 //! KEM-keypair-per-node ratchet tree, UpdatePath/Commit distribution, and
@@ -27,12 +27,12 @@
 //!
 //! Unlinkability: both the per-group **keys** (`verifying_key` /
 //! `agreement_key`) and the saorsa-mls `MemberId` are derived from the per-group
-//! seed (see [`member_id_from_seed`]), so the `MemberId` label embedded in each
+//! seed (see `member_id_from_seed`), so the `MemberId` label embedded in each
 //! `KeyPackage` credential is **distinct and unlinkable across the groups an
 //! agent joins** — a member who shares two groups with the agent cannot
 //! correlate them by `MemberId`. This is the per-group decision recorded in
-//! ADR-0012 (review finding #2). The legacy GSS plane ([`crate::mls::group`])
-//! keeps the stable per-agent [`crate::mls::agent_id_to_member_id`] label; the
+//! ADR-0012 (review finding #2). The legacy GSS plane (`crate::mls::group`)
+//! keeps the stable per-agent `crate::mls::agent_id_to_member_id` label; the
 //! two planes deliberately use different `MemberId`s.
 //!
 //! Determinism contract: the same `(agent, seed)` yields the same *public keys*
@@ -72,7 +72,7 @@ pub fn derive_identity_seed(agent_secret: &[u8], group_id: &[u8]) -> [u8; 32] {
 /// Derive the per-group saorsa-mls `MemberId` (16 bytes) from the identity
 /// `seed`.
 ///
-/// Unlike the legacy GSS plane's [`crate::mls::agent_id_to_member_id`] (the
+/// Unlike the legacy GSS plane's `crate::mls::agent_id_to_member_id` (the
 /// stable first-16-bytes-of-`AgentId` label, identical across an agent's
 /// groups), this binds the `MemberId` to the per-group seed — which already
 /// folds in the agent's secret and the `group_id` (see [`derive_identity_seed`]).
@@ -192,7 +192,7 @@ impl TreeKemMlsGroup {
     /// same public keys, so it re-attaches to its leaf after a restart
     /// (saorsa-mls matches leaves on stable public keys, not byte-identical key
     /// packages — ML-DSA signing is randomized upstream). Both the `MemberId`
-    /// ([`member_id_from_seed`]) and the keys are bound to the seed, giving
+    /// (`member_id_from_seed`) and the keys are bound to the seed, giving
     /// per-group unlinkability (ADR-0012 finding #2).
     fn identity_from_seed(seed: &[u8; 32]) -> Result<MemberIdentity> {
         let member_id = member_id_from_seed(seed);

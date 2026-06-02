@@ -246,7 +246,33 @@ async fn named_group_members_endpoint() {
 #[ignore]
 async fn named_group_add_remove_member_local() {
     let d = daemon().await;
-    let (group_id, _) = create_group(&d, "Roster Group", "", Some("Owner")).await;
+    // Direct roster add-by-agent_id is a non-secure-plane operation. Since
+    // ADR-0012 made `private_secure` (the default preset) secure-by-default
+    // TreeKEM — where a direct add correctly requires the target's KeyPackage —
+    // this local-roster-semantics test uses a `public_open` (GSS) group, where
+    // adding a member by agent_id alone is the valid operation under test.
+    let create_r: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Roster Group",
+            "description": "",
+            "display_name": "Owner",
+            "preset": "public_open"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let group_id = create_r["group_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !group_id.is_empty(),
+        "create public_open group: {create_r:?}"
+    );
     let fake_member = fake_agent_id(0x42);
 
     let add_r: Value = authed_client(&d)

@@ -6,7 +6,7 @@
 //! a per-epoch shared secret (ML-KEM-768-sealed in the Welcome) and derives
 //! per-member keys from it, so it provides **neither forward secrecy nor
 //! post-compromise security**. Real RFC-9420 TreeKEM (FS + PCS) lives in
-//! [`crate::mls::treekem`], wrapping `saorsa_mls::TreeKemGroup`. New
+//! `crate::mls::treekem`, wrapping `saorsa_mls::TreeKemGroup`. New
 //! `MlsEncrypted` groups use the TreeKEM plane; this wrapper remains for
 //! grandfathered groups (see ADR-0010 / ADR-0012).
 

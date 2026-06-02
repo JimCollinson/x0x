@@ -283,7 +283,18 @@ async fn d4_stateful_events_converge_via_signed_commits_once() {
     let alice = &pair.alice;
     let bob = &pair.bob;
 
-    let group_id = create_group(alice, "D4 Apply", "commit wired metadata").await;
+    // GSS-MlsEncrypted group: this test does direct roster add-by-agent_id
+    // (no KeyPackage), which the secure-by-default TreeKEM plane (private_secure)
+    // rejects. `public_request_secure` is MlsEncrypted + PublicDirectory, so per
+    // ADR-0012 it stays on the GSS plane where direct roster adds + signed-commit
+    // metadata convergence are the operations under test.
+    let group_id = create_group_preset(
+        alice,
+        "D4 Apply",
+        "commit wired metadata",
+        "public_request_secure",
+    )
+    .await;
     let invite = create_invite(alice, &group_id).await;
     let join = join_via_invite(bob, &invite, "bob-d4").await;
     assert_eq!(join["ok"], true, "join response: {join:?}");
@@ -591,7 +602,18 @@ async fn d4_mls_ban_commit_advances_binding_and_converges() {
     let alice = &pair.alice;
     let bob = &pair.bob;
 
-    let group_id = create_group(alice, "D4 Ban", "mls encrypted ban path").await;
+    // GSS-MlsEncrypted group: this test asserts the legacy GSS ban path
+    // (`security_binding == "gss:epoch=1"`) and does direct roster adds without
+    // KeyPackages. `public_request_secure` is MlsEncrypted + PublicDirectory, so
+    // per ADR-0012 it stays on the GSS plane (private_secure is secure-by-default
+    // TreeKEM, where these GSS-specific operations/assertions do not apply).
+    let group_id = create_group_preset(
+        alice,
+        "D4 Ban",
+        "mls encrypted ban path",
+        "public_request_secure",
+    )
+    .await;
     let invite = create_invite(alice, &group_id).await;
     let join = join_via_invite(bob, &invite, "bob-ban").await;
     assert_eq!(join["ok"], true, "join response: {join:?}");

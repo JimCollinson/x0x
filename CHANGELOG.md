@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Scope secure-by-default TreeKEM to private groups (ADR-0012)**: group creation now flips to the real TreeKEM plane only for **private** (`Hidden` discoverability) MlsEncrypted groups, not every MlsEncrypted preset. Gating on `confidentiality == MlsEncrypted` alone was too broad — it swept in the *public* `public_request_secure` preset, whose cross-daemon join-request review converges via the D4 signed-commit (GSS) path that the single-committer TreeKEM transport does not provide, breaking request-to-join convergence. `public_request_secure` (and any public encrypted policy) now stays on the GSS plane; `private_secure` remains secure-by-default TreeKEM. Matches ADR-0012's stated scope ("all new private groups secure-by-default TreeKEM").
+
 ## [v0.20.1] - 2026-06-02
 
 ### Changed

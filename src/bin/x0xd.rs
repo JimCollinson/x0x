@@ -8505,14 +8505,24 @@ async fn create_named_group(
                 info.set_display_name(&hex::encode(agent_id.as_bytes()), dn);
             }
 
-            // ADR-0012 Phase 2: new MlsEncrypted groups are secure-by-default
-            // real TreeKEM (FS/PCS), NOT the legacy GSS shared-secret plane.
+            // ADR-0012 Phase 2: new PRIVATE (Hidden) MlsEncrypted groups are
+            // secure-by-default real TreeKEM (FS/PCS), NOT the legacy GSS
+            // shared-secret plane. Public encrypted presets (e.g.
+            // `public_request_secure`, PublicDirectory) deliberately stay on the
+            // GSS plane — their cross-daemon join-request review converges via
+            // the D4 signed-commit path, which the single-committer TreeKEM
+            // transport does not provide. This matches ADR-0012's scope ("all
+            // new private groups secure-by-default TreeKEM"); gating on
+            // MlsEncrypted alone was too broad and swept in public request-secure
+            // groups, breaking their join-request convergence.
             // Build the live TreeKEM group (creator = sole leaf 0), persist its
             // snapshot at rest, then relabel `info` so no surface claims GSS for
             // it (drop the GSS shared secret, bind the TreeKEM epoch into the
             // signed state hash). If TreeKEM setup or persistence fails we fail
             // the request rather than store a group mislabelled as secure.
-            if info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted {
+            if info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
+                && info.policy.discoverability == x0x::groups::GroupDiscoverability::Hidden
+            {
                 let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
                 let tk = match x0x::mls::TreeKemMlsGroup::create(
                     group_id_bytes.clone(),

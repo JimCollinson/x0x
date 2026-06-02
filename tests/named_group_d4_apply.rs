@@ -533,8 +533,7 @@ async fn d4_mls_ban_commit_advances_binding_and_converges() {
     // TreeKEM plane. Convergence is observed by polling roster membership +
     // the owner's epoch-bound `security_binding` (per-leaf TreeKEM states differ,
     // so an exact cross-daemon state_hash match does not hold here).
-    let group_id =
-        create_group_preset(alice, "D4 Ban", "treekem ban path", "private_secure").await;
+    let group_id = create_group_preset(alice, "D4 Ban", "treekem ban path", "private_secure").await;
     let invite = create_invite(alice, &group_id).await;
     let join = join_via_invite(bob, &invite, "bob-ban").await;
     assert_eq!(join["ok"], true, "join response: {join:?}");
@@ -548,7 +547,10 @@ async fn d4_mls_ban_commit_advances_binding_and_converges() {
         member_state(&members, &bob_agent_id).as_deref() == Some("active")
     })
     .await;
-    assert!(active, "bob did not become active in alice's TreeKEM roster");
+    assert!(
+        active,
+        "bob did not become active in alice's TreeKEM roster"
+    );
 
     // The group is on the TreeKEM plane before the ban.
     let pre = get_state(alice, &group_id).await;

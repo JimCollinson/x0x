@@ -124,12 +124,25 @@ for node in "${NODE_NAMES[@]}"; do
         continue
     fi
 
-    # Install atomically and restart. Binary path /opt/x0x/x0xd is shared
-    # by both x0xd.service (prod) and x0xd-testnet.service (test); only the
-    # service that matches $X0X_SERVICE is restarted so the other network
-    # stays on whatever binary it had loaded in memory.
-    echo -n "    Restarting $X0X_SERVICE... "
-    if $SSH root@"$ip" "install -m 755 /tmp/x0xd.codex /opt/x0x/x0xd && rm -f /tmp/x0xd.codex && systemctl restart $X0X_SERVICE" 2>/dev/null; then
+    # Install atomically to the network's OWN binary path and restart. Prod and
+    # testnet use SEPARATE paths ($X0X_BINARY_PATH: /opt/x0x/x0xd for prod,
+    # /opt/x0x/x0xd-testnet for test) so prod's self-upgrade can never overwrite
+    # a freshly-deployed testnet binary (and vice versa). For the testnet we also
+    # idempotently repoint the unit's ExecStart at the testnet path (migrating
+    # hosts whose x0xd-testnet.service still references the old shared path) and
+    # daemon-reload only when the unit actually changed.
+    echo -n "    Restarting $X0X_SERVICE (bin $X0X_BINARY_PATH)... "
+    if $SSH root@"$ip" "
+        install -m 755 /tmp/x0xd.codex '$X0X_BINARY_PATH' && rm -f /tmp/x0xd.codex
+        if [ '$X0X_NETWORK' != 'prod' ]; then
+            unit=\$(systemctl show -p FragmentPath --value '$X0X_SERVICE')
+            if [ -n \"\$unit\" ] && grep -qE '^ExecStart=/opt/x0x/x0xd ' \"\$unit\"; then
+                sed -i 's#^ExecStart=/opt/x0x/x0xd #ExecStart=$X0X_BINARY_PATH #' \"\$unit\"
+                systemctl daemon-reload
+            fi
+        fi
+        systemctl restart '$X0X_SERVICE'
+    " 2>/dev/null; then
         echo -e "${GREEN}done${NC}"
     else
         echo -e "${RED}failed${NC}"

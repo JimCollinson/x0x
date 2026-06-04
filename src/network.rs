@@ -2759,6 +2759,14 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         Ok(())
     }
 
+    async fn connected_peer_ids(&self) -> Vec<GossipPeerId> {
+        self.connected_peers()
+            .await
+            .into_iter()
+            .map(|peer| ant_to_gossip_peer_id(&peer))
+            .collect()
+    }
+
     async fn receive_message(
         &self,
     ) -> anyhow::Result<(

@@ -2580,6 +2580,17 @@ impl FileChunkAckSlot {
         }
         self.notify.notify_waiters();
     }
+
+    /// Highest contiguous sequence acked, or `-1` if none acked yet (the
+    /// `u64::MAX` sentinel). For `welcome.trace` diagnostics.
+    fn highest_acked(&self) -> i64 {
+        let v = self.last_acked.load(Ordering::SeqCst);
+        if v == u64::MAX {
+            -1
+        } else {
+            v as i64
+        }
+    }
 }
 
 /// Block until `last_acked >= n.saturating_sub(FILE_CHUNK_WINDOW)`, i.e.
@@ -18018,9 +18029,14 @@ async fn handle_welcome_blob_message(
             welcome_id,
             sequence,
         } => {
-            if let Some(slot) = state.pending_welcome_acks.read().await.get(&welcome_id) {
-                slot.record_ack(sequence);
-            }
+            let matched_pending =
+                if let Some(slot) = state.pending_welcome_acks.read().await.get(&welcome_id) {
+                    slot.record_ack(sequence);
+                    true
+                } else {
+                    false
+                };
+            tracing::debug!(target: "welcome.trace", stage = "chunk_ack_recv", welcome_id = %welcome_id, seq = sequence, matched_pending);
         }
         WelcomeBlobMessage::Complete { welcome_id } => {
             handle_welcome_blob_complete(state, sender, &welcome_id).await;
@@ -18078,6 +18094,14 @@ async fn stream_welcome_blob(
         tracing::warn!(welcome_id, "failed to send Welcome blob offer: {e}");
         return;
     }
+    tracing::debug!(
+        target: "welcome.trace",
+        stage = "offer_sent",
+        welcome_id,
+        recipient = %hex::encode(recipient.as_bytes()),
+        total_chunks,
+        byte_len = pending.bytes.len() as u64,
+    );
 
     let ack_slot = Arc::new(FileChunkAckSlot::new());
     state
@@ -18107,15 +18131,18 @@ async fn stream_welcome_blob(
             state.pending_welcome_acks.write().await.remove(welcome_id);
             return;
         }
+        tracing::debug!(target: "welcome.trace", stage = "chunk_sent", welcome_id, seq = sequence);
     }
 
     if total_chunks > 0 {
         let last_seq = total_chunks - 1;
         if let Err(e) = wait_for_final_acks(&ack_slot, last_seq).await {
             tracing::warn!(welcome_id, "Welcome blob final ack wait failed: {e}");
+            tracing::debug!(target: "welcome.trace", stage = "final_ack_failed", welcome_id, total_chunks, last_acked = ack_slot.highest_acked(), "{e}");
             state.pending_welcome_acks.write().await.remove(welcome_id);
             return;
         }
+        tracing::debug!(target: "welcome.trace", stage = "final_ack_ok", welcome_id, total_chunks);
     }
     let complete = WelcomeBlobMessage::Complete {
         welcome_id: welcome_id.to_string(),
@@ -18148,9 +18175,11 @@ async fn handle_welcome_blob_chunk(
     };
     let mut receives = state.pending_welcome_receives.write().await;
     let Some(receive) = receives.get_mut(&welcome_id) else {
+        tracing::debug!(target: "welcome.trace", stage = "chunk_recv_no_pending", welcome_id = %welcome_id, seq = sequence);
         return;
     };
     if receive.source != sender_hex {
+        tracing::debug!(target: "welcome.trace", stage = "chunk_recv_wrong_source", welcome_id = %welcome_id, seq = sequence);
         return;
     }
     if sequence >= receive.total_chunks {
@@ -18161,13 +18190,19 @@ async fn handle_welcome_blob_chunk(
         receive.chunks.insert(sequence, decoded);
     }
     drop(receives);
+    tracing::debug!(target: "welcome.trace", stage = "chunk_recv", welcome_id = %welcome_id, seq = sequence);
 
     let ack = WelcomeBlobMessage::ChunkAck {
-        welcome_id,
+        welcome_id: welcome_id.clone(),
         sequence,
     };
-    if let Err(e) = send_welcome_blob_message(state, sender, &ack).await {
-        tracing::warn!(sequence, "failed to ack Welcome blob chunk: {e}");
+    match send_welcome_blob_message(state, sender, &ack).await {
+        Ok(_) => {
+            tracing::debug!(target: "welcome.trace", stage = "chunk_ack_sent", welcome_id = %welcome_id, seq = sequence);
+        }
+        Err(e) => {
+            tracing::warn!(welcome_id = %welcome_id, sequence, "failed to ack Welcome blob chunk: {e}");
+        }
     }
 }
 

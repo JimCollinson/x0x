@@ -402,10 +402,21 @@ struct SseEvent {
 
 type WelcomeFetchWaiter = oneshot::Sender<std::result::Result<Vec<u8>, String>>;
 
+/// A live REST `/subscribe` stream tracked so `DELETE /subscribe/:id` can stop it.
+struct RestSubscription {
+    /// Topic the subscription is for (retained for diagnostics/logging).
+    topic: String,
+    /// Forwarder task draining the gossip subscription into the SSE broadcast.
+    /// Aborting it drops the underlying `Subscription`, which releases the
+    /// gossip topic ref-count and ends delivery — without this, an
+    /// unsubscribed stream would keep forwarding messages to SSE forever.
+    forwarder: tokio::task::JoinHandle<()>,
+}
+
 /// Shared state accessible from all route handlers.
 struct AppState {
     agent: Arc<Agent>,
-    subscriptions: RwLock<HashMap<String, String>>,
+    subscriptions: RwLock<HashMap<String, RestSubscription>>,
     task_lists: RwLock<HashMap<String, TaskListHandle>>,
     kv_stores: RwLock<HashMap<String, KvStoreHandle>>,
     named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
@@ -4463,7 +4474,7 @@ async fn subscribe(
             let topic = req.topic.clone();
             let mut recv_sub = sub;
             let sub_id = id.clone();
-            tokio::spawn(async move {
+            let forwarder = tokio::spawn(async move {
                 while let Some(msg) = recv_sub.recv().await {
                     tracing::info!(
                         topic = %topic,
@@ -4496,11 +4507,17 @@ async fn subscribe(
                 }
             });
 
-            // Track the subscription ID and topic for unsubscribe.
-            // We don't create a second subscription — just record the
-            // topic so the DELETE handler can call unsubscribe().
+            // Track the forwarder task so the DELETE handler can abort it.
+            // Aborting drops the underlying `Subscription`, releasing the
+            // gossip topic ref-count and stopping SSE delivery.
             let mut subs = state.subscriptions.write().await;
-            subs.insert(id.clone(), req.topic.clone());
+            subs.insert(
+                id.clone(),
+                RestSubscription {
+                    topic: req.topic.clone(),
+                    forwarder,
+                },
+            );
 
             (
                 StatusCode::OK,
@@ -4520,7 +4537,15 @@ async fn unsubscribe(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let mut subs = state.subscriptions.write().await;
-    if subs.remove(&id).is_some() {
+    if let Some(sub) = subs.remove(&id) {
+        // Stop the forwarder task. Dropping its `Subscription` releases the
+        // gossip topic ref-count and ends message delivery for this stream.
+        sub.forwarder.abort();
+        tracing::info!(
+            sub_id = %id,
+            topic = %sub.topic,
+            "unsubscribed: forwarder aborted, gossip subscription released"
+        );
         (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
     } else {
         (

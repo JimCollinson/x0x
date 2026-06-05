@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`welcome.trace` diagnostics for the TreeKEM Welcome-blob transfer.** Trace-only (no behavior change): `target=welcome.trace` debug stages on both sides of the chunked Welcome pull — anchor `offer_sent` / `chunk_sent` / `chunk_ack_recv` / `final_ack_{ok,failed}`; receiver `chunk_recv` / `chunk_recv_no_pending` / `chunk_ack_sent`. Enable with `RUST_LOG=warn,welcome.trace=debug` to locate exactly where a Welcome transfer stalls under churn.
+
+### Notes
+
+- **Refined understanding of the v0.21.1 high-churn convergence "known limitation".** A controlled same-day A/B and an instrumented 110-iteration diagnostic soak found that **multi-member TreeKEM converges ~100% under normal conditions** (110/110, `welcome.trace` shows 0 Welcome-transfer failures). The earlier low numbers (47% overnight, 78% daytime) are a **degraded-network tail**, not a persistent x0x logic bug: they correlate with sustained/overnight cross-region degradation (connection eviction → `ant_quic` `Peer not found`), and — importantly — the bulk `Peer not found` events are **background gossip/transport noise** that do **not** drive Welcome-transfer failure (2207 in a 2h window with 100% convergence). Three candidate x0x-side fixes (inline-Welcome, FetchRequest retry, redial-on-`Peer not found`) were tried and all proved to target that background noise rather than the actual transfer; none improved convergence and they are **not** merged. The residual tail is treated as a connection-resilience / infra concern; the `welcome.trace` instrumentation above is left in to capture a real failure when conditions next degrade. See `handoff/` writeups and saorsa-gossip#24.
+
 ## [v0.21.1] - 2026-06-04
 
 ### Fixed

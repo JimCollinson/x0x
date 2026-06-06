@@ -331,16 +331,19 @@ async fn test_connected_loopback_presence_and_foaf_discovers_peer(
     agent_b.join_network().await?;
     agent_b.announce_identity(false, false).await?;
 
+    // Loopback identity/presence propagation converges in <500 ms locally but
+    // flakes on slow GHA runners at a 5 s window — same reason the FOAF
+    // timeouts below were bumped 3 s → 15 s. Widen to match.
     assert!(
-        wait_for_cached_agent(&agent_a, &agent_b.agent_id(), Duration::from_secs(5)).await,
+        wait_for_cached_agent(&agent_a, &agent_b.agent_id(), Duration::from_secs(15)).await,
         "agent A must cache agent B from a real loopback identity announcement"
     );
     assert!(
-        wait_for_online_event(&mut rx, agent_b.agent_id(), Duration::from_secs(5)).await,
+        wait_for_online_event(&mut rx, agent_b.agent_id(), Duration::from_secs(15)).await,
         "agent A must emit AgentOnline for agent B from a real loopback presence beacon"
     );
     assert!(
-        wait_for_self_presence_record(&agent_b, Duration::from_secs(2)).await,
+        wait_for_self_presence_record(&agent_b, Duration::from_secs(10)).await,
         "agent B must have a local self beacon available for FOAF responses"
     );
 

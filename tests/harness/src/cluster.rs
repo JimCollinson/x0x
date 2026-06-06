@@ -244,7 +244,10 @@ pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
         extra_config,
     )
     .await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Rolling start: use the same empirically-required delay as the trio so
+    // bob has a stable alice to bootstrap against. The previous 5s was too
+    // short and let propagation-dependent tests race mesh formation.
+    tokio::time::sleep(ROLLING_START_DELAY).await;
     let bob = start_instance(
         &binary,
         &format!("pair-bob-{suffix}"),
@@ -254,7 +257,13 @@ pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
         extra_config,
     )
     .await;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(MESH_SETTLE_TIME).await;
+
+    // Enforce peering before returning. Without this, propagation-dependent
+    // assertions (member convergence, delete propagation) flake when alice and
+    // bob have not yet connected — exactly the failure mode the trio path
+    // already guards against via assert_mesh_connected.
+    assert_nodes_connected(&[&alice, &bob]).await;
 
     AgentPair { alice, bob }
 }
@@ -357,7 +366,16 @@ async fn assert_mesh_connected(
     bob: &AgentInstance,
     charlie: &AgentInstance,
 ) {
-    for node in [alice, bob, charlie] {
+    assert_nodes_connected(&[alice, bob, charlie]).await;
+    eprintln!("[cluster] mesh verified — all 3 nodes connected");
+}
+
+/// Poll `/peers` on each node until it reports at least one peer. Panics if any
+/// node still has zero peers after 30s. A disconnected mesh produces flaky
+/// propagation results, so we fail loudly here rather than let the test proceed
+/// and time out on a downstream convergence assertion.
+async fn assert_nodes_connected(nodes: &[&AgentInstance]) {
+    for node in nodes {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             let resp: serde_json::Value = node.get("/peers").await.json().await.unwrap_or_default();
@@ -380,7 +398,6 @@ async fn assert_mesh_connected(
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
-    eprintln!("[cluster] mesh verified — all 3 nodes connected");
 }
 
 fn find_x0xd_binary() -> PathBuf {

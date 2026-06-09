@@ -27,8 +27,15 @@ use x0x::cli::{DaemonClient, OutputFormat};
 #[command(name = "x0x", version = x0x::VERSION, about = "x0x agent network — control a running x0xd daemon")]
 struct Cli {
     /// Named instance to target (reads port from data dir). [dev]
-    #[arg(long, global = true, hide = true)]
-    name: Option<String>,
+    //
+    // The clap field id MUST stay distinct from any subcommand's `name`
+    // argument: a shared id collides under `global = true` and the
+    // last-parsed value wins, so a positional like `group create <NAME>`
+    // would otherwise bleed into this instance selector and route the
+    // command at a non-existent daemon instance. Keep the `--name` long flag
+    // (established dev/multi-instance API) but bind it to `instance`.
+    #[arg(long = "name", global = true, hide = true)]
+    instance: Option<String>,
 
     /// Daemon API address override (default: auto-detect). [dev]
     #[arg(long, global = true, hide = true, alias = "api-url")]
@@ -737,9 +744,10 @@ enum GroupSub {
     Update {
         /// Group ID.
         group_id: String,
-        /// New name.
-        #[arg(long)]
-        name: Option<String>,
+        /// New name. (`--new-name`, not `--name`: the global `--name` instance
+        /// selector reserves that long flag.)
+        #[arg(long = "new-name")]
+        new_name: Option<String>,
         /// New description.
         #[arg(long)]
         description: Option<String>,
@@ -1035,7 +1043,13 @@ async fn main() -> ExitCode {
         OutputFormat::Text
     };
 
-    let result = run(cli.command, cli.name.as_deref(), cli.api.as_deref(), format).await;
+    let result = run(
+        cli.command,
+        cli.instance.as_deref(),
+        cli.api.as_deref(),
+        format,
+    )
+    .await;
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -1407,11 +1421,16 @@ async fn run(
             Some(GroupSub::Leave { group_id }) => commands::group::leave(&client, &group_id).await,
             Some(GroupSub::Update {
                 group_id,
-                name,
+                new_name,
                 description,
             }) => {
-                commands::group::update(&client, &group_id, name.as_deref(), description.as_deref())
-                    .await
+                commands::group::update(
+                    &client,
+                    &group_id,
+                    new_name.as_deref(),
+                    description.as_deref(),
+                )
+                .await
             }
             Some(GroupSub::Policy {
                 group_id,
@@ -1996,6 +2015,76 @@ mod tests {
         match cli.command {
             Commands::Ws { sub: None } => Ok(()),
             _ => anyhow::bail!("expected bare ws to parse without nested subcommand"),
+        }
+    }
+
+    // Regression: the global `--name` instance selector and a subcommand's
+    // positional `name` once shared the clap arg id `name`, so under
+    // `global = true` the positional value bled into the instance selector and
+    // every `* create <NAME>` (group/store/task-list) routed at a non-existent
+    // daemon instance instead of the default daemon. The global is now bound to
+    // `instance`; these tests pin that a positional name never sets it.
+    #[test]
+    fn group_create_positional_name_does_not_set_instance() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "group", "create", "demo"])?;
+        assert!(
+            cli.instance.is_none(),
+            "group name must not populate the --name instance selector"
+        );
+        match cli.command {
+            Commands::Group {
+                sub: Some(GroupSub::Create { name, .. }),
+            } => {
+                assert_eq!(name, "demo");
+                Ok(())
+            }
+            _ => anyhow::bail!("expected group create to parse with the positional name"),
+        }
+    }
+
+    #[test]
+    fn store_create_positional_name_does_not_set_instance() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "store", "create", "mystore", "mytopic"])?;
+        assert!(
+            cli.instance.is_none(),
+            "store name must not populate the --name instance selector"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_instance_flag_still_targets_named_instance() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["x0x", "--name", "alice", "group", "create", "demo"])?;
+        assert_eq!(
+            cli.instance.as_deref(),
+            Some("alice"),
+            "explicit --name must still select the daemon instance"
+        );
+        match cli.command {
+            Commands::Group {
+                sub: Some(GroupSub::Create { name, .. }),
+            } => {
+                assert_eq!(name, "demo", "group name and instance must not conflate");
+                Ok(())
+            }
+            _ => anyhow::bail!("expected group create under an explicit instance"),
+        }
+    }
+
+    #[test]
+    fn group_update_uses_new_name_flag_not_name() -> anyhow::Result<()> {
+        // `--name` would be the global instance selector; renaming a group uses
+        // `--new-name`.
+        let cli = Cli::try_parse_from(["x0x", "group", "update", "gid", "--new-name", "Renamed"])?;
+        assert!(cli.instance.is_none());
+        match cli.command {
+            Commands::Group {
+                sub: Some(GroupSub::Update { new_name, .. }),
+            } => {
+                assert_eq!(new_name.as_deref(), Some("Renamed"));
+                Ok(())
+            }
+            _ => anyhow::bail!("expected group update with --new-name"),
         }
     }
 }

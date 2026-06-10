@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.22.0] - 2026-06-10
+
+### Fixed
+
+- **Cross-NAT DM capability black hole at startup** (#101, PR #102). `start_dm_inbox` published the DM capability upgrade with `watch::Sender::send`, which drops the value when no receiver is subscribed — and x0xd starts the inbox before the capability advert service subscribes. Peers cached `gossip_inbox=false` for the process lifetime and fell back to the raw-QUIC path that fails across NAT. Now `send_replace`; a regression test locks in late-subscriber visibility (verified to fail on the pre-fix code). Thanks @josh-clsn for the precise diagnosis.
+- **KvStore first-time late join never bootstrapped pre-existing keys** (#96, PR #103). The gossip message cache replays ~60s and its lazy pruning loses older deltas on busy topics, so a first-time joiner could never receive keys written before it subscribed. New `<topic>/state-sync` side channel: empty-store joiners request state on a 1/5/15/30s schedule and holders republish their full state as a regular CRDT delta (idempotent, multi-holder safe, fully backward compatible). Proven by a cold-join daemon test that fails against the pre-fix binary. Thanks @JimCollinson for the decisive repro matrix.
+
+### Added
+
+- **`local:` topic prefix — same-daemon pub/sub IPC** (#89, PR #103). Topics starting with `local:` are delivered only to subscribers on the same x0xd instance and never reach PlumTree (no EAGER, no IHAVE); `/publish`, `/subscribe`, `/events`, WebSocket subscribe and bearer auth work unchanged. The local-IPC substrate for multi-process apps sharing one daemon. Proposed by @nkoteskey.
+- **Domain separation on `POST /agent/sign`** (#90, PR #102). Optional `domain` field signs `domain || 0x00 || payload` and echoes the domain in the response, preventing cross-protocol signature replay. NUL/empty/oversize domains rejected with 400. CLI: `x0x agent sign --domain`. Proposed by @nkoteskey.
+- **`x0x user-id inspect [PATH]`** (#93, PR #102). Daemonless validation of a user identity file: prints `user_id` and the four-word form, `--json` mode, non-zero exit naming the file on failure. The symmetric sibling of `user-id create`. Proposed by @JimCollinson.
+- **`x0x user-id create --from-seed <hex>`** (#95, PR #103). Deterministic UserKeypair derivation via FIPS 204 seeded KeyGen (the ξ input, `fips204::ml_dsa_65::KG::keygen_from_seed`) — same 32-byte seed, same keypair, any machine. Foundation for mnemonic-based identity portability; mnemonic encoding stays in consumer applications. Proposed by @JimCollinson.
+
+### Changed
+
+- **x0xd is quiet by default** (#85, PR #102). Without `RUST_LOG` or a config `log_level`, only warn/error lines are emitted (privacy by default for operators outside the fleet). `RUST_LOG=info` restores verbosity; documented in the README. Operator visibility via `/health` and `/diagnostics/*` is unaffected.
+- **Privacy Layer 2: salted-hash identifiers in warn!/error! logs** (#83, PR #104). All production warn/error sites that interpolated stable identifiers (peer/agent/machine/user ids, group ids, topics, addresses) now emit salted-BLAKE3 8-hex tokens via the new `x0x::logging` wrappers — correlatable within one daemon run, unlinkable across restarts and daemons. `info!`/`debug!` diagnostic channels (`treekem.trace`, `dm.trace`) intentionally keep real ids.
+
+### Test infrastructure
+
+- Daemon-backed regression suites for #96 and #89 wired into CI; `solo()`/`join_peer()` staggered-start harness helpers; `X0XD_TEST_BINARY` runtime override for pre-fix/post-fix proof runs; daemon health gate 30s→90s.
+
 ## [v0.21.4] - 2026-06-10
 
 ### Fixed

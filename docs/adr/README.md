@@ -17,11 +17,8 @@ This directory contains architecture decision records for x0x.
 - [ADR 0013: Priority-Aware PubSub Receive-Pump Shedding](./0013-priority-aware-pubsub-shed.md) — refines ADR 0009 to shed low-priority PubSub control frames first (renumbered from 0010 to resolve a collision)
 - [ADR 0012: Real TreeKEM as the Default Secure Group Plane](./0012-treekem-default-secure-groups.md) — private `MlsEncrypted` (`Hidden`) groups run real `saorsa_mls::TreeKemGroup` (FS + PCS) by default; **multi-member convergence implemented and shipped in x0x 0.21.0**; legacy GSS groups grandfathered with owner opt-in upgrade; supersedes ADR 0010's forward path
 - [ADR 0014: TreeKEM Self-Leave Is a Roster Removal; PCS Comes From an Owner-Driven Rekey](./0014-treekem-self-leave-owner-driven-rekey.md) — a leaver cannot self-rekey (RFC-9420 / saorsa-mls forbids self-removal), so self-leave is a signed roster removal and the **owner** issues the responsive rekey commit that delivers PCS; owner-only single-writer with lazy catch-up; amends ADR 0012
+- [ADR 0015: No App-Layer At-Rest Encryption or Secondary Passwords](./0015-no-app-layer-at-rest-encryption.md) — local state is protected by OS user isolation + full-disk encryption, never a secondary password; best-effort OS-keystore wrapping of identity keys sanctioned as a follow-up
 
 ## Accepted (Phase 1 Functionally Complete)
 
 - [ADR 0001: Bootstrap Peers Are Seed Hints Only](./0001-bootstrap-peers-are-seed-hints-only.md) — functional Phase 1 complete, nomenclature rename deferred
-
-## Proposed
-
-- [ADR 0015: No App-Layer At-Rest Encryption or Secondary Passwords](./0015-no-app-layer-at-rest-encryption.md) — local state is protected by OS user isolation + full-disk encryption, never a secondary password; best-effort OS-keystore wrapping of identity keys sanctioned as a follow-up

@@ -1,6 +1,6 @@
 # ADR 0015: No App-Layer At-Rest Encryption or Secondary Passwords
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-06-10, approved by David Irvine)
 - **Date:** 2026-06-10
 - **Decision owners:** David Irvine
 - **Reviewers:** x0x maintainers

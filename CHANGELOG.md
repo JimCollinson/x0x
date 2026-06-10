@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.22.1] - 2026-06-10
+
+### Fixed
+
+- **Transport stream reassembly delivers zero-filled gaps instead of errors** (ant-quic #195). Under loopback load, `read_to_end` on gossip uni-streams could return `Ok` with a buffer containing zero-filled gaps — exactly the byte ranges that the QUIC assembler failed to yield before signaling end-of-stream. x0x caught these because pubsub v2 frames are ML-DSA-signed (corrupted frames failed verification with `ML-DSA-65 signature verification failed`); unsigned consumers would have ingested the corruption silently. Captured frames show a single zero window of exactly 2,896 B (2×1448, packet-aligned) at offsets 1085/1057 inside otherwise-intact 10,706 B identity-announce frames. Fixed in ant-quic 0.27.26: `read_to_end` now fails with `ReadToEndError::MissingData` instead of zero-filling unreceived ranges; overlapping retransmissions are tolerated (benign). A dedicated regression test (`regression_read_to_end_zero_gap.rs`) covers adverse-network duplicate/overlap injection.
+
+### Changed
+
+- Bumped **ant-quic 0.27.25 → 0.27.26** and **saorsa-gossip 0.5.62 → 0.5.63** (pins the new ant-quic).
+
 ## [v0.22.0] - 2026-06-10
 
 ### Fixed

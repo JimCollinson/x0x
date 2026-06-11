@@ -4,9 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.23.1] - 2026-06-11
+
 ### Added
 
 - **`POST /agent/verify` + `x0x agent verify` — signature-verify counterpart to `/agent/sign`** (#106, PR #109). Stateless detached ML-DSA-65 signature verification using only caller-supplied public material: applications that persist signed records no longer need to bundle their own FIPS-204 library or re-derive the `domain || 0x00 || payload` framing when reading records back. A failed check is a result (`200` + `valid: false`), not an error; `400`/`413` mirror `/agent/sign`'s malformed-input and size rules, with explicit key-length (1952) and signature-length (3309) validation and an optional `algorithm` field rejecting unknown schemes (including present-but-null). Proposed by @JimCollinson.
+
+### Fixed
+
+- **Panic-scanner CI gate now honours the inner `#![cfg(test)]` file attribute.** A file gated entirely as test-only (`src/cli/commands/test_support.rs`) had its `unwrap()`s flagged as production panics because the scanner recognised only outer `#[cfg(test)]` / `#[test]` attributes. No production code was affected.
 
 ## [v0.23.0] - 2026-06-10
 

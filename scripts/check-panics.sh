@@ -20,9 +20,15 @@ is_in_test_code() {
     local file="$1"
     local line_num="$2"
 
-    # Check if file contains #[cfg(test)] or #[test] before the line
+    # Check if file contains #[cfg(test)] or #[test] before the line.
+    # Also honour the inner `#![cfg(test)]` attribute, which gates an entire
+    # file as test-only (e.g. src/cli/commands/test_support.rs); once seen it
+    # applies to every subsequent line in the file.
     awk -v line="$line_num" '
         NR <= line {
+            if (/^[[:space:]]*#!\[cfg\(test\)\]/) {
+                in_test = 1
+            }
             if (/^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[test\]/) {
                 in_test = 1
             }

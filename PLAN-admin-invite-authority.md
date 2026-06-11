@@ -10,9 +10,39 @@ deleted before the branch is handed over for final review.
 ## Pre-flight
 
 - [x] Check zero — fork `main` synced with upstream (`5f086cf` == upstream head; fork main was force-synced, local ref refreshed)
-- [x] Check one — multi-daemon peering probe (`named_group_creator_delete_propagates_to_peer` via `cargo nextest run --all-features --test named_group_integration --run-ignored ignored-only`)
+- [x] ~~Check one~~ — **FAILED. Multi-daemon gossip peering is structurally impossible in this sandbox** (see "Check one verdict" below). Per the work package: build falls back to a local machine.
 - [x] Read issue #107 in full (body + all comments)
 - [x] Verify implementation pointers against post-#108 checkout
+
+## Check one verdict (2026-06-11, sandbox)
+
+`named_group_creator_delete_propagates_to_peer` run as CI runs it
+(`cargo nextest run --all-features --test named_group_integration
+--run-ignored ignored-only`) fails deterministically at the harness's own
+mesh gate: `[cluster] FATAL: pair-alice has zero peers after 30s`.
+Reproduced twice via nextest and twice manually with the **release** x0xd
+(sandboxed and unsandboxed shells, 60–75 s waits) — not a flake, not the
+debug/dhat slowdown.
+
+Root cause: the sandbox container's only non-loopback interface is
+`192.0.2.2` — inside RFC 5737 TEST-NET-1 (documentation range). ant-quic
+promotes the harness's `127.0.0.1:<port>` bootstrap target to that
+interface address, the QUIC handshake completes (both daemons log
+successful NAT-traversal/address-discovery negotiation, mDNS sees the
+peer), but ant-quic's bogon filtering rejects documentation-range
+addresses at three layers (`candidate_discovery.rs` excludes
+`is_documentation()` local candidates; `connection/nat_traversal.rs:829`
+drops documentation-range peer candidates; `port_mapping.rs` same), so the
+peer never enters gossip membership: `connected_peers=0` forever, on every
+daemon. CI passes because GitHub runners have ordinary private addresses
+that pass the filters.
+
+No invocation tweak fixes this (it is the container's addressing scheme
+vs. deliberate transport policy), and patching ant-quic's filter locally
+would mean validating on a modified transport — degraded mode, forbidden.
+Everything that does not require daemon-to-daemon convergence (fmt,
+clippy, check, unit tests, doc build, single-daemon ignored tests) still
+works here; anything convergence-shaped must run on the local machine.
 
 ## Findings from code reading (what the fix actually is)
 

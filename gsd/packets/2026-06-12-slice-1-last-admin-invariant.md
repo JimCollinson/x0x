@@ -1,10 +1,10 @@
 # GSD Work Packet — Slice 1: last-admin invariant (ADR-0016 Phase 1)
 
-(Repo-filed copy. The dispatched version is prefixed with the GSD cloud bootstrap block; content otherwise identical.)
+(Repo-filed copy. The dispatched version is prefixed with the GSD cloud bootstrap block; content otherwise identical. Amended 2026-06-12: addendum 1 bound.)
 
 Date: 2026-06-12
 Prepared by: Claude (Cowork planning session), approved by Jim Collinson
-Requested agent/tool: Claude Code (cloud/web session) on `JimCollinson/x0x`
+Requested agent/tool: Claude Code session (local orchestrator dispatch or cloud) on `JimCollinson/x0x`
 Role requested: **Implementer — exactly this one slice.** Do not start any other slice.
 Review mode: N/A (the gauntlet runs after all slices, before the PR)
 
@@ -14,7 +14,7 @@ Project: x0x ADR-0016 Phase 1 — authority alignment (flat Admin/Member, retiri
 Repo: fork `JimCollinson/x0x` (origin). Upstream: `https://github.com/saorsa-labs/x0x` — **READ-ONLY: never push there, ever.**
 Work branch: `feat/adr-0016-phase-1-authority-alignment` (exists; clean at upstream main `189b89c` as of packet time).
 Planning branch (GSD home, never merged, never PR'd): `gsd/adr-0016-planning`.
-Current source of truth, in order: (1) upstream `docs/adr/0016-role-based-group-authority-flat-admin.md` (Accepted); (2) `gsd/spec/phase-1-authority-alignment.md` on the planning branch; (3) `gsd/plan/phase-1-plan.md` on the planning branch.
+Current source of truth, in order: (1) upstream `docs/adr/0016-role-based-group-authority-flat-admin.md` (Accepted); (2) `gsd/spec/phase-1-authority-alignment.md` on the planning branch; (3) `gsd/plan/phase-1-plan.md` + `gsd/plan/phase-1-plan-addendum-1.md` on the planning branch.
 
 ## Goal
 
@@ -25,8 +25,9 @@ Implement the last-admin invariant (spec R2): no commit may leave a live (non-wi
 1. `gsd/README.md` (planning branch) — the binding rules of this repo's GSD structure.
 2. `gsd/spec/phase-1-authority-alignment.md` (planning branch) — §R2 and §3 are your contract; read the whole spec for context.
 3. `gsd/plan/phase-1-plan.md` (planning branch) — the **"Universal slice preamble"** and **"Slice 1"** sections are binding: in-scope, out-of-scope, required tests, verification commands, done-when, stop-if. This packet summarizes them; the plan governs on any difference.
-4. `docs/adr/0016-role-based-group-authority-flat-admin.md` (in-tree) — the contract above the spec.
-5. Repo root `CLAUDE.md` / `AGENTS.md` — house engineering rules.
+4. `gsd/plan/phase-1-plan-addendum-1.md` (planning branch) — **binding addendum**: your checkpoint's FIRST evidence item must be the authority/apply-path map (every REST handler and gossip-apply arm that mutates group state; where each computes the proposed post-mutation roster; where each passes the choke-point; shared-helper confirmation). Produce it before or alongside implementation, not retrospectively.
+5. `docs/adr/0016-role-based-group-authority-flat-admin.md` (in-tree) — the contract above the spec.
+6. Repo root `CLAUDE.md` / `AGENTS.md` — house engineering rules.
 
 ## Stage
 
@@ -34,7 +35,7 @@ Implementation (Slice 1 of the approved plan).
 
 ## Approved slice
 
-Slice 1 exactly as defined in `gsd/plan/phase-1-plan.md` (plan approved by Jim 2026-06-12). Key points:
+Slice 1 exactly as defined in `gsd/plan/phase-1-plan.md` (plan approved by Jim 2026-06-12; addendum 1 accepted same day). Key points:
 
 - **Preamble first:** sync fork `main` with upstream; rebase the feature branch if upstream moved; **re-verify every cited code site** (line numbers are pinned to `189b89c`; record drift in your checkpoint; stop if a cited mechanism has materially changed).
 - New check at the `validate_apply` choke-point (`src/groups/state_commit.rs`, fn at ~521): reject any commit whose **post-mutation, non-withdrawn** state has zero active members of rank ≥ Admin. Legacy `Owner` counts (use `role.at_least(Admin)`). Withdrawn state exempt. Use `ApplyError::Invariant`.
@@ -64,7 +65,7 @@ cargo nextest run --all-features --workspace
 cargo nextest run --all-features -E 'test(last_admin)'
 ```
 
-The `#[ignore]`d daemon-API suite and multi-daemon convergence tests are Jim's local gate — do not run them here; note your exposure to them in the checkpoint.
+The `#[ignore]`d daemon-API suite and multi-daemon convergence tests are Jim's local gate — do not run them inside the slice; note your exposure to them in the checkpoint.
 
 ## Stop conditions (from the plan, binding)
 
@@ -72,12 +73,12 @@ Stop and report — do not improvise — if:
 
 - the check cannot be implemented without altering hashing, signing, the commit format, or pipeline ordering beyond inserting this one step;
 - any delivery path cannot be given the post-mutation roster without restructuring beyond the choke-point;
-- re-verification reveals a delivery path that applies commits without passing the choke-point (spec-level finding for Jim);
+- the apply-path map reveals a delivery path that applies commits without passing the choke-point (spec-level finding for Jim);
 - a cited code site has materially changed upstream (not just line drift);
-- anything requires judgment beyond this packet + the plan's Slice 1 section.
+- anything requires judgment beyond this packet + the plan's Slice 1 section + addendum 1.
 
 ## Required output
 
 1. Commit and push the slice to the feature branch (origin).
-2. **Checkpoint:** commit a checkpoint note to `gsd/checkpoints/2026-06-12-slice-1-last-admin-invariant.md` on the planning branch (what changed, verification evidence with command outputs, drift found vs the pinned line numbers, deviations, risks, recommended next step).
+2. **Checkpoint:** commit a checkpoint note to `gsd/checkpoints/2026-06-12-slice-1-last-admin-invariant.md` on the planning branch (FIRST evidence item: the authority/apply-path map per addendum 1; then what changed, verification evidence with command outputs, drift found vs the pinned line numbers, deviations, risks, recommended next step).
 3. Final report in-session: role performed; sources read; changes; exact test results; blockers/risks/open questions; whether the plan remains valid; recommended next checkpoint.

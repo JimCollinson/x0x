@@ -1,3 +1,10 @@
+> **GSD planning branch notice.** You are on `gsd/adr-0016-planning` — the
+> planning home for the ADR-0016 group-authority work, NOT a development
+> branch. Read `gsd/README.md` before doing anything. This branch never
+> merges and never becomes a PR. Everything below this banner is the
+> repo's own standard guidance.
+
+
 # CLAUDE.md
 
 These rules apply to every task in this project unless explicitly overridden.

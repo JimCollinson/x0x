@@ -1396,3 +1396,72 @@ async fn named_group_creator_delete_propagates_to_peer() {
         "bob never observed creator deletion of the space"
     );
 }
+
+// ===========================================================================
+// ADR-0016 R2 — last-admin invariant REST pre-check (exact §3 contract)
+// ===========================================================================
+
+/// Why: ADR-0016 fixes this REST contract verbatim — demoting the sole
+/// admin-or-higher member (here: the creator/owner demoting itself) must
+/// return 409 with exactly the §3 error string, and the roster must be
+/// left untouched.
+#[tokio::test]
+#[ignore]
+async fn last_admin_rest_self_demote_returns_409_exact_string() {
+    let d = daemon().await;
+    let (group_id, _) = create_group(&d, "last-admin-409", "sole admin demote", None).await;
+    assert!(!group_id.is_empty());
+
+    let agent: Value = authed_client(&d)
+        .get(d.url("/agent"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let self_hex = agent["agent_id"].as_str().expect("agent_id").to_string();
+
+    let resp = authed_client(&d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{self_hex}/role")))
+        .json(&serde_json::json!({ "role": "member" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin first")
+    );
+
+    // The roster must be unchanged: the creator still holds owner rank.
+    let members: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/members")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let still_owner = members["members"]
+        .as_array()
+        .map(|ms| {
+            ms.iter()
+                .any(|m| m["agent_id"] == self_hex.as_str() && m["role"] == "owner")
+        })
+        .unwrap_or(false);
+    assert!(
+        still_owner,
+        "roster mutated by a rejected demote: {members}"
+    );
+
+    // Self-normalising owner → admin keeps the admin count at 1 and passes.
+    let resp = authed_client(&d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{self_hex}/role")))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

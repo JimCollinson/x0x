@@ -11353,6 +11353,10 @@ async fn remove_named_group_member(
         if !info.has_member(&agent_id_hex) {
             return not_found("member not found");
         }
+        // ADR-0016 R2: friendly pre-check before any mutation/side effect.
+        if let Some(resp) = last_admin_precheck(info, |g| g.remove_member(&agent_id_hex, None)) {
+            return resp;
+        }
 
         info.roster_revision = info.roster_revision.saturating_add(1);
         let revision = info.roster_revision;
@@ -11589,6 +11593,10 @@ async fn remove_treekem_named_group_member(
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "ok": false, "error": "member not found" })),
             );
+        }
+        // ADR-0016 R2: friendly pre-check before any TreeKEM work begins.
+        if let Some(resp) = last_admin_precheck(info, |g| g.remove_member(&agent_id_hex, None)) {
+            return resp;
         }
         let Some(kp_b64) = info
             .members_v2
@@ -12044,6 +12052,33 @@ fn require_owner(
     }
 }
 
+/// Exact ADR-0016 §3 error string for acts that would leave a live group
+/// with zero active admins. Fixed verbatim by the Phase 1 spec — do not edit.
+const LAST_ADMIN_PRECHECK_ERROR: &str =
+    "a group must always have at least one admin; make another member an admin first";
+
+/// Friendly REST pre-check for the ADR-0016 last-admin invariant.
+///
+/// Applies the handler's intended roster mutation to a clone of the group
+/// and runs the shared invariant check over the proposed post-mutation
+/// state. Returns the 409 response to send when the act would strip the
+/// last active admin (legacy `Owner` counts as Admin). This is UX only —
+/// the authoritative enforcement is the same shared check inside
+/// `seal_commit` / `finalize_applied_commit` on every delivery path.
+fn last_admin_precheck(
+    info: &x0x::groups::GroupInfo,
+    apply: impl FnOnce(&mut x0x::groups::GroupInfo),
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let mut proposed = info.clone();
+    apply(&mut proposed);
+    if x0x::groups::enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn).is_err()
+    {
+        Some(api_error(StatusCode::CONFLICT, LAST_ADMIN_PRECHECK_ERROR))
+    } else {
+        None
+    }
+}
+
 /// PATCH /groups/:id — update name/description (admin+).
 async fn update_named_group(
     State(state): State<Arc<AppState>>,
@@ -12272,6 +12307,12 @@ async fn update_member_role(
         );
     }
 
+    // ADR-0016 R2: friendly pre-check — a demotion must not strip the last
+    // active admin (legacy Owner counts as Admin).
+    if let Some(resp) = last_admin_precheck(info, |g| g.set_member_role(&agent_id_hex, new_role)) {
+        return resp;
+    }
+
     // Role changes are metadata-only: they do not add/remove TreeKEM leaves or
     // require Commit/Welcome transport, so TreeKEM groups may apply them before
     // Phase 3 membership transport lands.
@@ -12337,6 +12378,10 @@ async fn ban_group_member(
     }
     if info.caller_role(&agent_id_hex) == Some(x0x::groups::GroupRole::Owner) {
         return forbidden("cannot ban owner");
+    }
+    // ADR-0016 R2: friendly pre-check before any mutation/rekey side effect.
+    if let Some(resp) = last_admin_precheck(info, |g| g.ban_member(&agent_id_hex, None)) {
+        return resp;
     }
     info.ban_member(&agent_id_hex, Some(caller_hex.clone()));
     info.roster_revision = info.roster_revision.saturating_add(1);
@@ -12488,6 +12533,10 @@ async fn ban_treekem_group_member(
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({ "ok": false, "error": "cannot ban owner" })),
             );
+        }
+        // ADR-0016 R2: friendly pre-check before any TreeKEM work begins.
+        if let Some(resp) = last_admin_precheck(info, |g| g.ban_member(&agent_id_hex, None)) {
+            return resp;
         }
         let Some(kp_b64) = info
             .members_v2
@@ -19399,6 +19448,71 @@ mod tests {
             config.raw_quic_receive_ack_timeout,
             Some(Duration::from_secs(8))
         );
+    }
+
+    // ── ADR-0016 R2: REST pre-check (exact §3 string + status code) ─────
+
+    fn sole_owner_group() -> (x0x::groups::GroupInfo, String) {
+        let kp = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let owner_hex = hex::encode(kp.agent_id().as_bytes());
+        let info = x0x::groups::GroupInfo::with_policy(
+            "G".to_string(),
+            "d".to_string(),
+            kp.agent_id(),
+            "aa".repeat(16),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        (info, owner_hex)
+    }
+
+    /// Why: §3 fixes this error contract verbatim — handlers must return
+    /// 409 with exactly this string when an act would strip the last admin.
+    #[test]
+    fn last_admin_precheck_returns_409_with_exact_spec_string() {
+        let (info, owner_hex) = sole_owner_group();
+        let (status, body) = last_admin_precheck(&info, |g| {
+            g.set_member_role(&owner_hex, x0x::groups::GroupRole::Member)
+        })
+        .expect("demoting the sole admin must trip the pre-check");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.0["error"].as_str(),
+            Some("a group must always have at least one admin; make another member an admin first")
+        );
+    }
+
+    /// Why: the pre-check must evaluate the proposed post-mutation roster —
+    /// acts that keep at least one active admin (including a legacy Owner
+    /// normalising to Admin) must pass untouched.
+    #[test]
+    fn last_admin_precheck_passes_when_admins_remain() {
+        let (mut info, owner_hex) = sole_owner_group();
+        // Owner self-normalising to admin keeps the admin count at 1.
+        assert!(last_admin_precheck(&info, |g| {
+            g.set_member_role(&owner_hex, x0x::groups::GroupRole::Admin)
+        })
+        .is_none());
+        // Removing or banning a plain member never trips the invariant.
+        info.add_member(
+            "bb".repeat(32),
+            x0x::groups::GroupRole::Member,
+            Some(owner_hex.clone()),
+            None,
+        );
+        assert!(last_admin_precheck(&info, |g| g.remove_member(&"bb".repeat(32), None)).is_none());
+        assert!(last_admin_precheck(&info, |g| g.ban_member(&"bb".repeat(32), None)).is_none());
+    }
+
+    /// Why: withdrawn state is the invariant's exemption (the exit valve) —
+    /// the pre-check must never block acts on an already-ended group.
+    #[test]
+    fn last_admin_precheck_exempts_withdrawn_groups() {
+        let (mut info, owner_hex) = sole_owner_group();
+        info.withdrawn = true;
+        assert!(last_admin_precheck(&info, |g| {
+            g.set_member_role(&owner_hex, x0x::groups::GroupRole::Member)
+        })
+        .is_none());
     }
 
     #[test]

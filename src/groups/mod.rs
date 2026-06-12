@@ -50,8 +50,9 @@ pub use self::public_message::{
 pub use self::request::{JoinRequest, JoinRequestStatus};
 pub use self::state_commit::{
     compute_policy_hash, compute_public_meta_hash, compute_roster_root, compute_state_hash,
-    ActionKind, ApplyContext, ApplyError, GroupGenesis, GroupPublicMeta, GroupStateCommit,
-    CARD_SIGNATURE_DOMAIN, DEFAULT_CARD_TTL_SECS, EVENT_SIGNATURE_DOMAIN, STATE_COMMIT_DOMAIN,
+    enforce_last_admin_invariant, ActionKind, ApplyContext, ApplyError, GroupGenesis,
+    GroupPublicMeta, GroupStateCommit, CARD_SIGNATURE_DOMAIN, DEFAULT_CARD_TTL_SECS,
+    EVENT_SIGNATURE_DOMAIN, STATE_COMMIT_DOMAIN,
 };
 
 fn now_millis() -> u64 {
@@ -417,6 +418,11 @@ impl GroupInfo {
         keypair: &AgentKeypair,
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
+        // ADR-0016 R2: never author a commit whose post-mutation,
+        // non-withdrawn state has zero active admins. `self` already holds
+        // the caller's domain mutations, so this evaluates the proposed
+        // post-mutation roster before any chain field is touched.
+        state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
         // Ensure the genesis record is present — callers may reach here via
         // migrated paths that didn't set it yet.
         if self.genesis.is_none() {
@@ -522,6 +528,11 @@ impl GroupInfo {
                 got: self.state_hash.clone(),
             });
         }
+        // ADR-0016 R2: reject any applied commit whose post-mutation,
+        // non-withdrawn state has zero active admins. Runs after the hash
+        // check so the roster being validated is provably the roster the
+        // signed commit's `roster_root` committed to.
+        state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
         Ok(())
     }
 

@@ -494,6 +494,38 @@ impl ActionKind {
     }
 }
 
+/// Enforce the ADR-0016 last-admin invariant over a proposed post-mutation
+/// roster: a live (non-withdrawn) group state must always contain at least
+/// one **active** member of rank ≥ Admin. Legacy `Owner` entries count as
+/// Admin (`Owner` rank 4 > `Admin` rank 3, via [`GroupRole::at_least`]).
+/// Withdrawn (group-ending) state is exempt — it is the last admin's exit
+/// valve.
+///
+/// The commit object carries only `roster_root` (a hash of the post-mutation
+/// roster), so the invariant must be evaluated over the proposed roster
+/// computed by the applier. This one helper is the shared check for every
+/// delivery path: commit authoring (`GroupInfo::seal_commit`) and apply-side
+/// validation (`GroupInfo::finalize_applied_commit`, reached from both the
+/// daemon gossip-apply pipeline and `GroupInfo::apply_commit`).
+pub fn enforce_last_admin_invariant(
+    proposed_members: &BTreeMap<String, GroupMember>,
+    withdrawn: bool,
+) -> Result<(), ApplyError> {
+    if withdrawn {
+        return Ok(());
+    }
+    let has_active_admin = proposed_members
+        .values()
+        .any(|m| m.is_active() && m.role.at_least(GroupRole::Admin));
+    if has_active_admin {
+        Ok(())
+    } else {
+        Err(ApplyError::Invariant(
+            "post-mutation state would leave a live group with zero active admins".to_string(),
+        ))
+    }
+}
+
 /// Input to [`validate_apply`].
 ///
 /// Receivers recompute the hash of the committed payload and verify:
@@ -613,6 +645,113 @@ mod tests {
         let mut m = make_member(hex_id, GroupRole::Member);
         m.state = GroupMemberState::Removed;
         m
+    }
+
+    // ── ADR-0016 R2: last-admin invariant (choke-point unit tests) ──────
+
+    /// Why: rejecting a demotion that leaves zero admins is the entire point
+    /// of the invariant — a live group must never become unadministrable.
+    #[test]
+    fn last_admin_demote_sole_admin_rejected() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        // Proposed post-mutation roster: the sole admin demoted to member.
+        admin.role = GroupRole::Member;
+        m.insert("aa".repeat(32), admin);
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: a removal that strips the last admin must be rejected; Removed
+    /// entries are not active and must not count toward the admin set.
+    #[test]
+    fn last_admin_remove_sole_admin_rejected() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        admin.state = GroupMemberState::Removed;
+        m.insert("aa".repeat(32), admin);
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: a banned admin is not an active admin — ban of the last admin
+    /// must be rejected like removal.
+    #[test]
+    fn last_admin_ban_sole_admin_rejected() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        admin.state = GroupMemberState::Banned;
+        m.insert("aa".repeat(32), admin);
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: withdrawal is the last admin's exit valve (ADR-0016) — the
+    /// group-ending commit is exempt even when the roster has no admins.
+    #[test]
+    fn last_admin_withdrawal_exempt() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        admin.state = GroupMemberState::Removed;
+        m.insert("aa".repeat(32), admin);
+        enforce_last_admin_invariant(&m, true).unwrap();
+        // Even an empty roster is fine once the state is withdrawn.
+        enforce_last_admin_invariant(&BTreeMap::new(), true).unwrap();
+    }
+
+    /// Why: a sole legacy Owner normalising itself to Admin keeps the admin
+    /// count at 1 — this ordinary normalization commit must pass.
+    #[test]
+    fn last_admin_owner_self_demote_to_admin_accepted() {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "aa".repeat(32),
+            make_member(&"aa".repeat(32), GroupRole::Admin),
+        );
+        enforce_last_admin_invariant(&m, false).unwrap();
+    }
+
+    /// Why: a sole legacy Owner demoted to plain member leaves zero
+    /// admin-or-higher actives — Owner gets no special pass.
+    #[test]
+    fn last_admin_owner_demote_to_member_rejected() {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "aa".repeat(32),
+            make_member(&"aa".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: legacy `Owner` (rank 4) must count as Admin (rank 3) via
+    /// `at_least`, so a mixed roster whose only privileged active entry is
+    /// an Owner satisfies the invariant.
+    #[test]
+    fn last_admin_legacy_owner_counts_as_admin() {
+        let mut m = BTreeMap::new();
+        m.insert("aa".repeat(32), make_owner(&"aa".repeat(32)));
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        // A banned Admin alongside must not be needed for the pass.
+        let mut banned_admin = make_member(&"cc".repeat(32), GroupRole::Admin);
+        banned_admin.state = GroupMemberState::Banned;
+        m.insert("cc".repeat(32), banned_admin);
+        enforce_last_admin_invariant(&m, false).unwrap();
     }
 
     #[test]

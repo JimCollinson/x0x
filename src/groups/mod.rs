@@ -496,7 +496,7 @@ impl GroupInfo {
             members_v2: &self.members_v2,
             group_id: self.stable_group_id(),
         };
-        state_commit::validate_apply(&ctx, commit, action_kind)?;
+        state_commit::validate_apply(&ctx, commit, action_kind, &self.members_v2)?;
         self.finalize_applied_commit(commit)
     }
 

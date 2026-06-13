@@ -29,6 +29,8 @@
 //!    ML-DSA-65 key, and the `committed_by` field binds the actor.
 //! 5. **Withdrawal terminality** — once a group is marked withdrawn by a
 //!    higher revision, later stale events are rejected.
+//! 6. **Last-admin invariant** — a non-withdrawn post-mutation roster must
+//!    retain at least one active Admin-or-higher member.
 //!
 //! Relays may republish exact signed commits and cards but **cannot mint**
 //! new revisions unless they are also authorised group-state authorities.
@@ -464,6 +466,34 @@ pub enum ApplyError {
 
 // ─────────────────────────── Apply checks ───────────────────────────────
 
+/// True when the proposed roster retains at least one active Admin-or-higher.
+///
+/// Legacy `Owner` entries count because rank comparison treats them as above
+/// `Admin` without rewriting their stored role bytes.
+#[must_use]
+pub fn has_active_admin_or_higher(members_v2: &BTreeMap<String, GroupMember>) -> bool {
+    members_v2
+        .values()
+        .any(|member| member.is_active() && member.role.at_least(GroupRole::Admin))
+}
+
+/// Enforce that a live post-mutation roster never has zero active admins.
+///
+/// Withdrawal is exempt because ending the group is the last admin's terminal
+/// exit valve and the withdrawn bit is signed into the state commitment.
+pub fn validate_last_admin_invariant(
+    withdrawn: bool,
+    proposed_members_v2: &BTreeMap<String, GroupMember>,
+) -> Result<(), ApplyError> {
+    if withdrawn || has_active_admin_or_higher(proposed_members_v2) {
+        Ok(())
+    } else {
+        Err(ApplyError::Invariant(
+            "group must retain at least one active admin".to_string(),
+        ))
+    }
+}
+
 /// Classification of a privileged action, for authorisation checks.
 ///
 /// Each variant names the minimum role required. These are checked at
@@ -511,9 +541,10 @@ pub struct ApplyContext<'a> {
     pub group_id: &'a str,
 }
 
-/// Validate a signed commit against the local view **before** mutating any
-/// state. Returns `Ok(())` if the caller should proceed to mutate; returns
-/// `Err` to reject (stale, chain break, unauthorized, bad signature, …).
+/// Validate a signed commit against the local view and proposed post-mutation
+/// roster. Returns `Ok(())` if the caller should proceed to finalize the
+/// mutation; returns `Err` to reject (stale, chain break, unauthorized, bad
+/// signature, invariant violation, …).
 ///
 /// This function is **read-only** with respect to `GroupInfo`. It enforces
 /// all the checks required by `docs/design/named-groups-full-model.md`
@@ -522,6 +553,7 @@ pub fn validate_apply(
     ctx: &ApplyContext<'_>,
     commit: &GroupStateCommit,
     action_kind: ActionKind,
+    proposed_members_v2: &BTreeMap<String, GroupMember>,
 ) -> Result<(), ApplyError> {
     // 1. group_id match
     if commit.group_id != ctx.group_id {
@@ -582,6 +614,9 @@ pub fn validate_apply(
         });
     }
 
+    // 7. last-admin invariant over the proposed post-mutation roster.
+    validate_last_admin_invariant(commit.withdrawn, proposed_members_v2)?;
+
     Ok(())
 }
 
@@ -613,6 +648,36 @@ mod tests {
         let mut m = make_member(hex_id, GroupRole::Member);
         m.state = GroupMemberState::Removed;
         m
+    }
+
+    fn ctx_for<'a>(members: &'a BTreeMap<String, GroupMember>) -> ApplyContext<'a> {
+        ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: members,
+            group_id: "g1",
+        }
+    }
+
+    fn commit_for_members(
+        keypair: &AgentKeypair,
+        proposed_members: &BTreeMap<String, GroupMember>,
+        withdrawn: bool,
+    ) -> GroupStateCommit {
+        GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            compute_roster_root(proposed_members),
+            "policy".into(),
+            "meta".into(),
+            None,
+            withdrawn,
+            0,
+            keypair,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -972,7 +1037,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly, &members).unwrap_err();
         assert!(matches!(err, ApplyError::StaleRevision { got: 1, have: 1 }));
         let _ = owner_hex; // silence unused
     }
@@ -1004,7 +1069,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly, &members).unwrap_err();
         assert!(matches!(err, ApplyError::PrevHashMismatch { .. }));
     }
 
@@ -1040,7 +1105,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly, &members).unwrap_err();
         assert!(matches!(err, ApplyError::Unauthorized { .. }));
     }
 
@@ -1076,7 +1141,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap();
+        validate_apply(&ctx, &commit, ActionKind::AdminOrHigher, &members).unwrap();
     }
 
     #[test]
@@ -1106,7 +1171,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly, &members).unwrap_err();
         assert!(matches!(err, ApplyError::Withdrawn));
     }
 
@@ -1137,7 +1202,202 @@ mod tests {
             members_v2: &members,
             group_id: "g-right",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly, &members).unwrap_err();
         assert!(matches!(err, ApplyError::GroupIdMismatch { .. }));
+    }
+
+    #[test]
+    fn last_admin_demote_last_admin_rejected() {
+        let keypair = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        let mut current = BTreeMap::new();
+        current.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Admin),
+        );
+        let mut proposed = current.clone();
+        proposed.get_mut(&signer_hex).unwrap().role = GroupRole::Member;
+        let commit = commit_for_members(&keypair, &proposed, false);
+
+        let err = validate_apply(
+            &ctx_for(&current),
+            &commit,
+            ActionKind::AdminOrHigher,
+            &proposed,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    #[test]
+    fn last_admin_remove_last_admin_rejected() {
+        let keypair = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        let mut current = BTreeMap::new();
+        current.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Admin),
+        );
+        let mut proposed = current.clone();
+        proposed.get_mut(&signer_hex).unwrap().state = GroupMemberState::Removed;
+        let commit = commit_for_members(&keypair, &proposed, false);
+
+        let err = validate_apply(
+            &ctx_for(&current),
+            &commit,
+            ActionKind::AdminOrHigher,
+            &proposed,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    #[test]
+    fn last_admin_gossip_path_rejects_crafted_zero_admin_commit_via_choke_point() {
+        let keypair = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        let mut current = BTreeMap::new();
+        current.insert(signer_hex.clone(), make_owner(&signer_hex));
+        let mut proposed = current.clone();
+        proposed.get_mut(&signer_hex).unwrap().state = GroupMemberState::Removed;
+        let commit = commit_for_members(&keypair, &proposed, false);
+
+        let err = validate_apply(
+            &ctx_for(&current),
+            &commit,
+            ActionKind::AdminOrHigher,
+            &proposed,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    #[test]
+    fn last_admin_ban_last_admin_rejected() {
+        let keypair = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        let mut current = BTreeMap::new();
+        current.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Admin),
+        );
+        let mut proposed = current.clone();
+        proposed.get_mut(&signer_hex).unwrap().state = GroupMemberState::Banned;
+        let commit = commit_for_members(&keypair, &proposed, false);
+
+        let err = validate_apply(
+            &ctx_for(&current),
+            &commit,
+            ActionKind::AdminOrHigher,
+            &proposed,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    #[test]
+    fn last_admin_withdrawal_from_sole_admin_accepted() {
+        let keypair = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        let mut current = BTreeMap::new();
+        current.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Admin),
+        );
+        let mut proposed = current.clone();
+        proposed.get_mut(&signer_hex).unwrap().state = GroupMemberState::Removed;
+        let commit = commit_for_members(&keypair, &proposed, true);
+
+        validate_apply(
+            &ctx_for(&current),
+            &commit,
+            ActionKind::AdminOrHigher,
+            &proposed,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn last_admin_sole_legacy_owner_to_admin_normalization_accepted() {
+        let keypair = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        let mut current = BTreeMap::new();
+        current.insert(signer_hex.clone(), make_owner(&signer_hex));
+        let mut proposed = current.clone();
+        proposed.get_mut(&signer_hex).unwrap().role = GroupRole::Admin;
+        let commit = commit_for_members(&keypair, &proposed, false);
+
+        validate_apply(
+            &ctx_for(&current),
+            &commit,
+            ActionKind::OwnerOnly,
+            &proposed,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn last_admin_sole_legacy_owner_to_member_rejected() {
+        let keypair = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        let mut current = BTreeMap::new();
+        current.insert(signer_hex.clone(), make_owner(&signer_hex));
+        let mut proposed = current.clone();
+        proposed.get_mut(&signer_hex).unwrap().role = GroupRole::Member;
+        let commit = commit_for_members(&keypair, &proposed, false);
+
+        let err = validate_apply(
+            &ctx_for(&current),
+            &commit,
+            ActionKind::OwnerOnly,
+            &proposed,
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    #[test]
+    fn last_admin_legacy_owner_counted_in_mixed_rosters() {
+        let keypair = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        let owner_hex = "ff".repeat(32);
+        let mut current = BTreeMap::new();
+        current.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Admin),
+        );
+        current.insert(owner_hex.clone(), make_owner(&owner_hex));
+        let mut proposed = current.clone();
+        proposed.get_mut(&signer_hex).unwrap().state = GroupMemberState::Removed;
+        let commit = commit_for_members(&keypair, &proposed, false);
+
+        validate_apply(
+            &ctx_for(&current),
+            &commit,
+            ActionKind::AdminOrHigher,
+            &proposed,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn last_admin_proposed_roster_hashes_to_roster_root() {
+        let keypair = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        let member_hex = "bb".repeat(32);
+        let mut proposed = BTreeMap::new();
+        proposed.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Admin),
+        );
+        proposed.insert(member_hex.clone(), make_removed(&member_hex));
+        let commit = commit_for_members(&keypair, &proposed, false);
+
+        assert_eq!(commit.roster_root, compute_roster_root(&proposed));
     }
 }

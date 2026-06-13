@@ -7362,6 +7362,35 @@ async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     }
 }
 
+const LAST_ADMIN_REST_ERROR: &str =
+    "a group must always have at least one admin; make another member an admin first";
+
+fn proposed_group_after<F>(current: &x0x::groups::GroupInfo, mutate: F) -> x0x::groups::GroupInfo
+where
+    F: FnOnce(&mut x0x::groups::GroupInfo),
+{
+    let mut next = current.clone();
+    mutate(&mut next);
+    next
+}
+
+fn last_admin_conflict() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({ "error": LAST_ADMIN_REST_ERROR })),
+    )
+}
+
+fn require_proposed_group_has_admin(
+    proposed: &x0x::groups::GroupInfo,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    x0x::groups::state_commit::validate_last_admin_invariant(
+        proposed.withdrawn,
+        &proposed.members_v2,
+    )
+    .map_err(|_| last_admin_conflict())
+}
+
 fn apply_stateful_event_to_group<F>(
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::GroupStateCommit,
@@ -7371,6 +7400,7 @@ fn apply_stateful_event_to_group<F>(
 where
     F: FnOnce(&mut x0x::groups::GroupInfo),
 {
+    let mut next = proposed_group_after(current, mutate);
     let ctx = x0x::groups::ApplyContext {
         current_state_hash: &current.state_hash,
         current_revision: current.state_revision,
@@ -7378,9 +7408,7 @@ where
         members_v2: &current.members_v2,
         group_id: current.stable_group_id(),
     };
-    x0x::groups::state_commit::validate_apply(&ctx, commit, action_kind)?;
-    let mut next = current.clone();
-    mutate(&mut next);
+    x0x::groups::state_commit::validate_apply(&ctx, commit, action_kind, &next.members_v2)?;
     next.finalize_applied_commit(commit)?;
     Ok(next)
 }
@@ -11344,14 +11372,20 @@ async fn remove_named_group_member(
             return not_found("group not found");
         };
 
-        if agent_id_hex == hex::encode(info.creator.as_bytes()) {
-            return bad_request("cannot remove creator via member API; delete the group instead");
-        }
         if local_agent != info.creator {
             return forbidden("only the creator can remove other members");
         }
         if !info.has_member(&agent_id_hex) {
             return not_found("member not found");
+        }
+        let proposed = proposed_group_after(info, |next| {
+            next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
+        });
+        if let Err(e) = require_proposed_group_has_admin(&proposed) {
+            return e;
+        }
+        if agent_id_hex == hex::encode(info.creator.as_bytes()) {
+            return bad_request("cannot remove creator via member API; delete the group instead");
         }
 
         info.roster_revision = info.roster_revision.saturating_add(1);
@@ -11566,15 +11600,6 @@ async fn remove_treekem_named_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if agent_id_hex == hex::encode(info.creator.as_bytes()) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "cannot remove creator via member API; delete the group instead"
-                })),
-            );
-        }
         if local_agent != info.creator {
             return (
                 StatusCode::FORBIDDEN,
@@ -11588,6 +11613,21 @@ async fn remove_treekem_named_group_member(
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "ok": false, "error": "member not found" })),
+            );
+        }
+        let proposed = proposed_group_after(info, |next| {
+            next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
+        });
+        if let Err(e) = require_proposed_group_has_admin(&proposed) {
+            return e;
+        }
+        if agent_id_hex == hex::encode(info.creator.as_bytes()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "cannot remove creator via member API; delete the group instead"
+                })),
             );
         }
         let Some(kp_b64) = info
@@ -12272,6 +12312,17 @@ async fn update_member_role(
         );
     }
 
+    if target_entry.role.at_least(x0x::groups::GroupRole::Admin)
+        && !new_role.at_least(x0x::groups::GroupRole::Admin)
+    {
+        let proposed = proposed_group_after(info, |next| {
+            next.set_member_role(&agent_id_hex, new_role);
+        });
+        if let Err(e) = require_proposed_group_has_admin(&proposed) {
+            return e;
+        }
+    }
+
     // Role changes are metadata-only: they do not add/remove TreeKEM leaves or
     // require Commit/Welcome transport, so TreeKEM groups may apply them before
     // Phase 3 membership transport lands.
@@ -12334,6 +12385,12 @@ async fn ban_group_member(
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         drop(groups);
         return ban_treekem_group_member(state, id, agent_id_hex, caller_hex).await;
+    }
+    let proposed = proposed_group_after(info, |next| {
+        next.ban_member(&agent_id_hex, Some(caller_hex.clone()));
+    });
+    if let Err(e) = require_proposed_group_has_admin(&proposed) {
+        return e;
     }
     if info.caller_role(&agent_id_hex) == Some(x0x::groups::GroupRole::Owner) {
         return forbidden("cannot ban owner");
@@ -12481,6 +12538,12 @@ async fn ban_treekem_group_member(
             );
         };
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
+            return e;
+        }
+        let proposed = proposed_group_after(info, |next| {
+            next.ban_member(&agent_id_hex, Some(caller_hex.clone()));
+        });
+        if let Err(e) = require_proposed_group_has_admin(&proposed) {
             return e;
         }
         if info.caller_role(&agent_id_hex) == Some(x0x::groups::GroupRole::Owner) {

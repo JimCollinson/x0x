@@ -8,8 +8,9 @@
 use x0x::groups::state_commit::validate_apply;
 use x0x::groups::{
     compute_policy_hash, compute_public_meta_hash, compute_roster_root, last_admin_precheck_error,
-    ActionKind, ApplyContext, ApplyError, GroupInfo, GroupPolicyPreset, GroupRole,
-    GroupStateCommit, LAST_ADMIN_PRECHECK_ERROR,
+    last_admin_self_leave_precheck_error, ActionKind, ApplyContext, ApplyError, GroupInfo,
+    GroupPolicyPreset, GroupRole, GroupStateCommit, LAST_ADMIN_PRECHECK_ERROR,
+    LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
 };
 use x0x::identity::AgentKeypair;
 use x0x::mls::SecureGroupPlane;
@@ -129,6 +130,24 @@ fn rest_remove_member_semantics(
     Ok(commit)
 }
 
+fn rest_self_leave_semantics(
+    info: &mut GroupInfo,
+    actor: &AgentKeypair,
+) -> Result<GroupStateCommit, RestError> {
+    let actor_hex = hex_id(actor);
+    if let Some(error) = last_admin_self_leave_precheck_error(info, &actor_hex) {
+        return Err(RestError::Conflict(error));
+    }
+    let mut next = info.clone();
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    next.remove_member(&actor_hex, Some(actor_hex.clone()));
+    let commit = next
+        .seal_commit(actor, 2_000)
+        .expect("non-last self-leave seals");
+    *info = next;
+    Ok(commit)
+}
+
 fn rest_ban_member_semantics(
     info: &mut GroupInfo,
     actor: &AgentKeypair,
@@ -206,6 +225,31 @@ fn gossip_apply(
     mutate(&mut next);
     next.finalize_applied_commit(commit)?;
     Ok(next)
+}
+
+fn assert_signed_role_update_applies(new_role: GroupRole) {
+    let creator = AgentKeypair::generate().unwrap();
+    let admin = AgentKeypair::generate().unwrap();
+    let member = AgentKeypair::generate().unwrap();
+    let target = AgentKeypair::generate().unwrap();
+    let mut authority = group_with_admin_member_and_target(&creator, &admin, &member, &target);
+    let replica = authority.clone();
+    let target_hex = hex_id(&target);
+
+    authority.roster_revision = authority.roster_revision.saturating_add(1);
+    authority.set_member_role(&target_hex, new_role);
+    let commit = authority
+        .seal_commit(&admin, 2_000)
+        .expect("admin authors role update");
+
+    let next = gossip_apply(&replica, &commit, ActionKind::AdminOrHigher, |next| {
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        next.set_member_role(&target_hex, new_role);
+    })
+    .expect("signed role update applies through gossip path");
+
+    assert_eq!(next.state_hash, authority.state_hash);
+    assert_eq!(next.members_v2[&target_hex].role, new_role);
 }
 
 #[test]
@@ -350,6 +394,31 @@ fn membership_authority_promoted_admin_removes_legacy_owner_not_last_admin() {
 }
 
 #[test]
+fn membership_authority_non_creator_last_admin_self_leave_returns_409_and_does_not_mutate() {
+    let creator = AgentKeypair::generate().unwrap();
+    let admin = AgentKeypair::generate().unwrap();
+    let creator_hex = hex_id(&creator);
+    let admin_hex = hex_id(&admin);
+    let mut info = group_with_promoted_admin(&creator, &admin);
+
+    rest_remove_member_semantics(&mut info, &admin, &creator_hex).unwrap();
+    assert!(info.members_v2[&creator_hex].is_removed());
+    assert_eq!(info.caller_role(&admin_hex), Some(GroupRole::Admin));
+    assert_eq!(info.active_admin_count(), 1);
+
+    let before = info.clone();
+    assert_eq!(
+        rest_self_leave_semantics(&mut info, &admin).unwrap_err(),
+        RestError::Conflict(LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
+    );
+
+    assert_eq!(info.members_v2, before.members_v2);
+    assert_eq!(info.roster_revision, before.roster_revision);
+    assert_eq!(info.state_hash, before.state_hash);
+    assert_eq!(info.caller_role(&admin_hex), Some(GroupRole::Admin));
+}
+
+#[test]
 fn membership_authority_promoted_admin_bans_legacy_owner_not_last_admin() {
     let owner = AgentKeypair::generate().unwrap();
     let admin = AgentKeypair::generate().unwrap();
@@ -360,6 +429,14 @@ fn membership_authority_promoted_admin_bans_legacy_owner_not_last_admin() {
 
     assert!(info.members_v2[&owner_hex].is_banned());
     assert_eq!(info.caller_role(&hex_id(&admin)), Some(GroupRole::Admin));
+}
+
+#[test]
+fn membership_authority_signed_role_update_apply_accepts_current_and_legacy_labels() {
+    assert_signed_role_update_applies(GroupRole::Admin);
+    assert_signed_role_update_applies(GroupRole::Member);
+    assert_signed_role_update_applies(GroupRole::Moderator);
+    assert_signed_role_update_applies(GroupRole::Guest);
 }
 
 #[test]

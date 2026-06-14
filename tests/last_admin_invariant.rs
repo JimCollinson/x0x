@@ -226,6 +226,33 @@ fn last_admin_gossip_apply_rejects_owner_demoted_to_member() {
     assert!(matches!(err, ApplyError::Invariant(_)), "got: {err}");
 }
 
+/// Why: preserving legacy Moderator/Guest replay must not weaken the
+/// last-admin invariant — a validly signed role-update commit still cannot
+/// turn the sole admin into any below-Admin role.
+#[test]
+fn last_admin_gossip_apply_rejects_owner_demoted_to_reserved_low_roles() {
+    for role in [GroupRole::Moderator, GroupRole::Guest] {
+        let owner = AgentKeypair::generate().unwrap();
+        let owner_hex = hex_id(&owner);
+
+        let authority = build_owner_group(&owner, "T");
+        let replica = replica_of(&authority, &owner, "T");
+
+        let mut scratch = replica.clone();
+        scratch.set_member_role(&owner_hex, role);
+        let commit = craft_commit(&replica, &scratch, &owner, 1_000);
+
+        let err = gossip_apply(&replica, &commit, ActionKind::AdminOrHigher, |next| {
+            next.set_member_role(&owner_hex, role);
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Invariant(_)),
+            "role {role:?} got: {err}"
+        );
+    }
+}
+
 /// Why: the exemption must hold at the choke-point too — a terminal
 /// withdrawal commit applies even when its roster has zero active admins
 /// (the exit valve is never sealed shut).

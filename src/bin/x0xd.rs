@@ -11864,10 +11864,16 @@ async fn leave_group(
         if let Some(resp) = treekem_membership_unsupported(info) {
             return resp;
         }
-        info.roster_revision = info.roster_revision.saturating_add(1);
-        let revision = info.roster_revision;
-        info.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
-        let commit = match info.seal_commit(signing_kp, now_ms) {
+        if let Some(error) =
+            x0x::groups::last_admin_self_leave_precheck_error(info, &local_agent_hex)
+        {
+            return api_error(StatusCode::CONFLICT, error);
+        }
+        let mut next = info.clone();
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        let revision = next.roster_revision;
+        next.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
+        let commit = match next.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -11876,6 +11882,7 @@ async fn leave_group(
                 );
             }
         };
+        *info = next;
         NamedGroupMetadataEvent::MemberRemoved {
             group_id: event_group_id,
             revision,

@@ -225,6 +225,11 @@ fn secure_plane_legacy_default() -> SecureGroupPlane {
 pub const LAST_ADMIN_PRECHECK_ERROR: &str =
     "a group must always have at least one admin; make another member an admin first";
 
+/// Exact ADR-0016 §3 REST error string for last-admin self-leave attempts.
+/// Fixed verbatim by the Phase 1 spec.
+pub const LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR: &str =
+    "a group must always have at least one admin; make another member an admin before leaving";
+
 /// Return the ADR-0016 last-admin REST pre-check error for a proposed
 /// post-mutation group state.
 ///
@@ -243,6 +248,25 @@ pub fn last_admin_precheck_error(
     state_commit::enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn)
         .err()
         .map(|_| LAST_ADMIN_PRECHECK_ERROR)
+}
+
+/// Return the ADR-0016 last-admin REST pre-check error for a proposed
+/// self-leave by `leaver_hex`.
+///
+/// This is the self-leave variant of [`last_admin_precheck_error`], with the
+/// separate §3 user-facing recovery hint. It deliberately evaluates the removal
+/// on a clone so rejected leaves cannot mutate live group state before the
+/// authoritative commit-time invariant rejects them.
+#[must_use]
+pub fn last_admin_self_leave_precheck_error(
+    info: &GroupInfo,
+    leaver_hex: &str,
+) -> Option<&'static str> {
+    let mut proposed = info.clone();
+    proposed.remove_member(leaver_hex, None);
+    state_commit::enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn)
+        .err()
+        .map(|_| LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
 }
 
 impl GroupInfo {

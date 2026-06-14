@@ -1,7 +1,7 @@
 # Plan addendum 2 — Slice 3R retro blocker remediation
 
 - Date: 2026-06-14
-- Status: Approved by Jim; binding before Slice 4. Amends `phase-1-plan.md` execution order after Slice 3. R2 decision updated after stop-condition audit, 2026-06-14: accept-and-document Moderator/Guest apply replay; do not reject Moderator/Guest on apply in Slice 3R.
+- Status: Approved by Jim; binding before Slice 4. Amends `phase-1-plan.md` execution order after Slice 3. R2 decision updated after stop-condition audit, 2026-06-14: accept-and-document Moderator/Guest apply replay; do not reject Moderator/Guest on apply in Slice 3R. Active-Guest adversarial blocker decision, 2026-06-14: choose smallest ban/unban fix and correct rationale wording.
 - Origin: Slice 1-3 retro adversarial + craft review (`gsd/checkpoints/2026-06-14-slice-1-3-retro-review.md`) found blockers in the Slice 1-3 foundation.
 
 ## Objective
@@ -42,11 +42,24 @@ Decision: **accept-and-document; do not reject `Moderator` / `Guest` on signed/g
 Rationale to carry in the remediation checkpoint and PR note:
 
 - `Moderator` (rank 2) and `Guest` (rank 0) grant no Admin authority under the `at_least(Admin)` authority threshold.
+- An active member of any role remains member-level; that is expected for legitimate legacy replay. Do not claim reserved roles are globally inert.
 - Authority comes from the signed commit, the `at_least(Admin)` check, and the last-admin invariant — not target-role vocabulary policing at apply time.
 - The apply path must preserve validly signed peer commits from old daemons for byte-for-byte replay and live convergence.
 - The admin/member-only assignment rule belongs at authoring, not apply.
+- Current code must not fabricate an active reserved-role member from a non-member through ban/unban.
 
 Updated R2 task: confirm/gate current-code authoring paths so new assignments expose only `admin` / `member`; add tests that current authoring rejects reserved roles, signed apply accepts legacy `Moderator` / `Guest`, and the last-admin invariant rejects sole-admin demotion to below-Admin roles. Leave existing `Owner`-on-apply rejection unchanged and carry a PR/gauntlet note that it needs its own replay/convergence assessment because `Owner` grants authority.
+
+### Active-Guest adversarial blocker decision — Jim, 2026-06-14
+
+Adversarial confirmation found a daemon path that can fabricate an active `Guest`: ban an absent target (creating a banned `Guest` tombstone), then unban it (reactivating the same `Guest` record). Jim selected the smallest fix:
+
+- make ban/unban unable to turn a never-member tombstone into an active member;
+- simplest acceptable implementation: unbanning a never-was-a-member tombstone does not activate it, or ban does not create an activatable tombstone for an absent target;
+- do not globally make `Guest` inert and do not reject legacy `Moderator` / `Guest` signed apply;
+- update wording to say reserved roles grant no admin authority, active members of any role are member-level, and ban/unban can no longer fabricate an active member from a non-member.
+
+Add normal-gate tests for the ban-absent → unban path and preserve legacy replay behavior for a member legitimately set to `Guest`.
 
 ## Out of scope
 

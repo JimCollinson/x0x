@@ -4,7 +4,7 @@
 - Slice/question: Slice 3R remediation after Slice 1-3 retro review
 - Feature branch/head: `feat/adr-0016-phase-1-authority-alignment` @ `779835028dae3324a20534f07f0402c47e6d6fe8`
 - Slice delta: `6ebac93e423e3fab60f91481adad6a86fb212445..779835028dae3324a20534f07f0402c47e6d6fe8`
-- Status: **Blocked after adversarial confirmation. Do not dispatch Slice 4 yet.**
+- Status: **Blocked after adversarial confirmation. Jim selected follow-up remediation direction; do not dispatch Slice 4 until implemented and reviewed.**
 
 ## What happened
 
@@ -21,11 +21,13 @@
 
 Jim's R2 rationale to carry forward:
 
-- `Moderator` (rank 2) and `Guest` (rank 0) grant **no authority** — the only authority threshold in the code is `at_least(Admin)`; both sit below it and appear in no privilege check. An applied Moderator/Guest is an inert label, not an escalation. (`Owner`, the one role that does grant authority, is admin-equivalent and already handled.)
+- `Moderator` (rank 2) and `Guest` (rank 0) grant no **admin** authority — the admin authority threshold is `at_least(Admin)`; both sit below it. (`Owner`, the one role that does grant admin authority, is admin-equivalent and already handled.)
+- An active member of any role remains member-level; that is expected for legitimate legacy replay. Do not claim reserved roles are globally inert.
 - Authority comes from the signed commit + the `at_least(Admin)` check + the last-admin invariant — not from policing target-role vocabulary at apply time.
 - In a gossip network the apply path must accept any validly-signed peer commit, including from daemons still on the old version. Rejecting on apply would (a) break byte-for-byte legacy replay and (b) fork live state between upgraded and un-upgraded daemons. The admin/member-only **assignment** rule belongs at **authoring**, not apply.
+- Current code must not fabricate an active reserved-role member from a non-member through ban/unban.
 
-Adversarial follow-up found the first bullet is currently over-broad because active `Guest` has member-level authority in existing code paths; see blocker below.
+Adversarial follow-up found the earlier “no authority / inert label” wording was over-broad because active `Guest` has expected member-level authority. Jim corrected the wording and selected the smallest ban/unban fix; see blocker disposition below.
 
 ## Evidence
 
@@ -124,16 +126,16 @@ The Slice 3R code fixed the original R1 corruption path and implemented Jim's R2
 
 This contradicts the R2 rationale if stated as “Guest grants no authority” unless member-level authority is explicitly excluded from “authority”. It also means current-code authoring can create an active reserved role through ban/unban.
 
-## Decision needed
+## Jim decision — active-Guest blocker
 
-Pick a remediation direction before Slice 4:
+Jim chose option 2 plus wording correction:
 
-1. **Make `Guest` truly inert:** member-level checks require `role.at_least(Member)` instead of any active role; add tests for active `Guest` no member-write/self-action authority. This may have broader semantic blast radius and needs careful review.
-2. **Prevent active `Guest` authoring:** change ban/unban semantics so an absent banned tombstone cannot become an active `Guest` (for example, unban removes absent-target tombstones or restores only prior members); add tests for ban-absent → unban.
-3. **Accept member-level `Guest` semantics:** explicitly revise the R2 rationale / PR note to say Moderator/Guest grant no admin authority but active Guest may have member-level participation if created by legacy/ban flows; then decide whether active reserved-role authoring is acceptable.
+- **Fix:** make ban/unban unable to turn a never-member into an active member. Simplest acceptable shape: unbanning a never-was-a-member tombstone does not activate it, or ban does not create an activatable tombstone for an absent target.
+- **Wording:** reserved roles grant no admin authority; an active member of any role is member-level, which is expected; ban/unban can no longer fabricate an active member from a non-member.
+- A member legitimately set to `Guest` via legacy replay remains member-level; this is not treated as a privilege escalation.
 
-Recommended next step: choose option 2 if the desired invariant is “current code must not create active reserved roles” with minimal impact; choose option 1 only if `Guest` must be globally inert everywhere.
+Add normal-gate tests for ban-absent → unban and preserve legacy replay/member-level semantics for a legitimate active `Guest`.
 
 ## Recommended next step
 
-Stop here. Do not dispatch Slice 4 until the adversarial HIGH is fixed or explicitly accepted by Jim.
+Resume Slice 3R with the active-Guest ban/unban remediation. Do not dispatch Slice 4 until the fix is implemented, mandatory checks pass, PR #5 CI is green, and adversarial + craft confirmation pass.

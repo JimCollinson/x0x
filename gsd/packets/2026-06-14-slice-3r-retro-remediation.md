@@ -51,11 +51,27 @@ The pre-code audit found shipped pre-ADR code could author `MemberRoleUpdated` c
 
 Rationale to record in the remediation checkpoint and PR note:
 
-- `Moderator` (rank 2) and `Guest` (rank 0) grant **no authority** — the only authority threshold in the code is `at_least(Admin)`; both sit below it and appear in no privilege check. An applied Moderator/Guest is an inert label, not an escalation. (`Owner`, the one role that does grant authority, is admin-equivalent and already handled.)
+- `Moderator` (rank 2) and `Guest` (rank 0) grant no **admin** authority — the admin authority threshold is `at_least(Admin)`; both sit below it. (`Owner`, the one role that does grant admin authority, is admin-equivalent and already handled.)
+- An active member of any role remains member-level; that is expected for legitimate legacy replay. Do not claim reserved roles are globally inert.
 - Authority comes from the signed commit + the `at_least(Admin)` check + the last-admin invariant — not from policing target-role vocabulary at apply time.
 - In a gossip network the apply path must accept any validly-signed peer commit, including from daemons still on the old version. Rejecting on apply would (a) break byte-for-byte legacy replay and (b) fork live state between upgraded and un-upgraded daemons. The admin/member-only **assignment** rule belongs at **authoring**, not apply.
+- Current code must not fabricate an active reserved-role member from a non-member through ban/unban.
 
 Updated R2 scope: confirm the REST role-assignment handler is the only `MemberRoleUpdated` authoring path or gate any other authoring path the same way; add tests for authoring-block, apply-accept, and last-admin invariant behavior. Leave existing `Owner`-on-apply rejection unchanged and carry a PR/gauntlet note that its replay/convergence implications need separate assessment.
+
+### Active-Guest adversarial blocker decision — Jim, 2026-06-14
+
+Adversarial confirmation found that current daemon code can fabricate an active `Guest` by banning an absent target (creating a banned `Guest` tombstone) and then unbanning it (reactivating that tombstone).
+
+Jim selected the smallest fix:
+
+- make ban/unban unable to turn a never-member tombstone into an active member;
+- acceptable implementation: unbanning a never-was-a-member tombstone does not activate it, or ban does not create an activatable tombstone for an absent target;
+- do not globally make `Guest` inert;
+- do not reject legacy `Moderator` / `Guest` signed apply;
+- preserve the corrected wording: reserved roles grant no admin authority; a legitimately active member of any role remains member-level; ban/unban can no longer fabricate an active member from a non-member.
+
+Add normal-gate tests for ban-absent → unban and for legitimate legacy active `Guest` replay/member-level behavior as needed.
 
 ### R1 — Fix non-creator last-admin self-leave corruption
 

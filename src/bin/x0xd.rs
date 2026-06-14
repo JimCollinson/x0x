@@ -7562,48 +7562,40 @@ fn authorized_treekem_membership_event_for_queue(
     info: &x0x::groups::GroupInfo,
     event: &NamedGroupMetadataEvent,
     sender_hex: &str,
-    creator_hex: &str,
 ) -> bool {
     match event {
         NamedGroupMetadataEvent::MemberAdded {
             actor,
-            commit: Some(_),
+            commit: Some(commit),
             treekem_commit_b64: Some(_),
             treekem_epoch: Some(_),
             ..
-        } => sender_hex == creator_hex && actor == sender_hex,
+        } => actor == &commit.committed_by,
         NamedGroupMetadataEvent::MemberRemoved {
             actor,
             agent_id,
-            commit: Some(_),
+            commit: Some(commit),
             treekem_commit_b64,
             treekem_epoch,
             ..
         } => {
-            let creator_remove = sender_hex == creator_hex
-                && actor == sender_hex
+            let admin_remove = actor == &commit.committed_by
                 && treekem_commit_b64.is_some()
                 && treekem_epoch.is_some();
-            let self_leave = sender_hex == agent_id
-                && actor == sender_hex
+            let self_leave = actor == &commit.committed_by
+                && agent_id == &commit.committed_by
                 && treekem_commit_b64.is_none()
                 && treekem_epoch.is_none();
-            creator_remove || self_leave
+            admin_remove || self_leave
         }
         NamedGroupMetadataEvent::MemberBanned {
             actor,
-            agent_id,
-            commit: Some(_),
+            agent_id: _,
+            commit: Some(commit),
             treekem_commit_b64: Some(_),
             treekem_epoch: Some(_),
             ..
-        } => {
-            actor == sender_hex
-                && info
-                    .caller_role(actor)
-                    .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin))
-                && info.caller_role(agent_id) != Some(x0x::groups::GroupRole::Owner)
-        }
+        } => actor == &commit.committed_by,
         NamedGroupMetadataEvent::JoinRequestApproved {
             actor,
             requester_agent_id,
@@ -8077,8 +8069,9 @@ async fn apply_named_group_metadata_event_inner(
     // learns it was cut from the roster. A transient unverified drop of either
     // is unrecoverable, so let them through; the apply arms below re-check
     // authority from the signed commit (GroupDeleted: AdminOrHigher via
-    // `commit.committed_by`; MemberRemoved: creator/self auth + signed-commit
-    // validation). The authenticated DM `sender_hex` is reliable regardless of
+    // `commit.committed_by`; MemberRemoved: actor/committer consistency plus
+    // AdminOrHigher or MemberSelf signed-commit validation). The authenticated
+    // DM `sender_hex` is reliable regardless of
     // the cache, so bypassing `verified` does not weaken membership
     // authorization — only the racy cache annotation is skipped.
     let bypass_verified = matches!(
@@ -8180,7 +8173,7 @@ async fn apply_named_group_metadata_event_inner(
 
     if allow_queue
         && treekem_membership_event_frontier(&event).is_some()
-        && authorized_treekem_membership_event_for_queue(&info, &event, &sender_hex, &creator_hex)
+        && authorized_treekem_membership_event_for_queue(&info, &event, &sender_hex)
     {
         if let Some(reason) = should_queue_treekem_membership_event(
             state,
@@ -8223,7 +8216,7 @@ async fn apply_named_group_metadata_event_inner(
             let Some(commit) = commit else {
                 return false;
             };
-            if sender_hex != creator_hex || actor != sender_hex {
+            if actor.as_str() != commit.committed_by.as_str() {
                 return false;
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
@@ -8438,11 +8431,12 @@ async fn apply_named_group_metadata_event_inner(
             let Some(commit) = commit else {
                 return false;
             };
-            let creator_auth = sender_hex == creator_hex && actor == sender_hex;
-            let self_leave_auth = sender_hex == agent_id && actor == sender_hex;
-            if !creator_auth && !self_leave_auth {
+            if actor.as_str() != commit.committed_by.as_str() {
                 return false;
             }
+            let self_leave_auth = agent_id.as_str() == commit.committed_by.as_str()
+                && treekem_commit_b64.is_none()
+                && treekem_epoch.is_none();
             let action_kind = if self_leave_auth {
                 x0x::groups::ActionKind::MemberSelf
             } else {
@@ -8707,13 +8701,7 @@ async fn apply_named_group_metadata_event_inner(
             let Some(commit) = commit else {
                 return false;
             };
-            let actor_role = info.caller_role(&actor);
-            let actor_authorized = actor == sender_hex
-                && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
-            if !actor_authorized {
-                return false;
-            }
-            if info.caller_role(&agent_id) == Some(x0x::groups::GroupRole::Owner) {
+            if actor.as_str() != commit.committed_by.as_str() {
                 return false;
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
@@ -11010,6 +10998,7 @@ async fn add_named_group_member(
         }
     };
     let local_agent = state.agent.agent_id();
+    let actor_hex = hex::encode(local_agent.as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
@@ -11021,11 +11010,11 @@ async fn add_named_group_member(
 
     let (metadata_topic, event, members, epoch) = {
         let mut named_groups = state.named_groups.write().await;
-        let Some(info) = named_groups.get_mut(&id) else {
+        let Some(info) = named_groups.get(&id) else {
             return not_found("group not found");
         };
-        if local_agent != info.creator {
-            return forbidden("only the creator can add members");
+        if let Err(e) = require_admin_or_above(info, &actor_hex) {
+            return e;
         }
         if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
             drop(named_groups);
@@ -11036,19 +11025,19 @@ async fn add_named_group_member(
         if info.has_member(&agent_hex) {
             return api_error(StatusCode::CONFLICT, "member already present");
         }
-        info.roster_revision = info.roster_revision.saturating_add(1);
-        let actor_hex = hex::encode(local_agent.as_bytes());
-        info.add_member(
+        let mut next = info.clone();
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        next.add_member(
             agent_hex.clone(),
             x0x::groups::GroupRole::Member,
             Some(actor_hex.clone()),
             req.display_name.clone(),
         );
         if let Some(display_name) = req.display_name.clone() {
-            info.set_display_name(&agent_hex, display_name);
+            next.set_display_name(&agent_hex, display_name);
         }
-        let revision = info.roster_revision;
-        let commit = match info.seal_commit(signing_kp, now_ms) {
+        let revision = next.roster_revision;
+        let commit = match next.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -11057,9 +11046,10 @@ async fn add_named_group_member(
                 );
             }
         };
-        let metadata_topic = info.metadata_topic.clone();
-        let event_group_id = info.stable_group_id().to_string();
-        let members = named_group_member_values(info);
+        let metadata_topic = next.metadata_topic.clone();
+        let event_group_id = next.stable_group_id().to_string();
+        let members = named_group_member_values(&next);
+        named_groups.insert(id.clone(), next);
         drop(named_groups);
 
         let mut epoch = None;
@@ -11151,13 +11141,8 @@ async fn add_treekem_named_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if local_agent != info.creator {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(
-                    serde_json::json!({ "ok": false, "error": "only the creator can add members" }),
-                ),
-            );
+        if let Err(e) = require_admin_or_above(info, &actor_hex) {
+            return e;
         }
         if info.has_member(&agent_hex) {
             return (
@@ -11296,8 +11281,7 @@ async fn remove_named_group_member(
             );
         }
     };
-    let local_agent = state.agent.agent_id();
-    let local_agent_hex = hex::encode(local_agent.as_bytes());
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     // Serialize against concurrent membership applies + other API mutators (see
     // `AppState::group_membership_locks`). Held across the delegation to the
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
@@ -11308,14 +11292,8 @@ async fn remove_named_group_member(
         if let Some(info) = groups.get(&id) {
             if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
                 drop(groups);
-                return remove_treekem_named_group_member(
-                    state,
-                    id,
-                    agent_id_hex,
-                    local_agent,
-                    local_agent_hex,
-                )
-                .await;
+                return remove_treekem_named_group_member(state, id, agent_id_hex, local_agent_hex)
+                    .await;
             }
         }
     }
@@ -11324,15 +11302,12 @@ async fn remove_named_group_member(
 
     let (metadata_topic, event, members, epoch) = {
         let mut named_groups = state.named_groups.write().await;
-        let Some(info) = named_groups.get_mut(&id) else {
+        let Some(info) = named_groups.get(&id) else {
             return not_found("group not found");
         };
 
-        if agent_id_hex == hex::encode(info.creator.as_bytes()) {
-            return bad_request("cannot remove creator via member API; delete the group instead");
-        }
-        if local_agent != info.creator {
-            return forbidden("only the creator can remove other members");
+        if let Err(e) = require_admin_or_above(info, &local_agent_hex) {
+            return e;
         }
         if !info.has_member(&agent_id_hex) {
             return not_found("member not found");
@@ -11342,10 +11317,11 @@ async fn remove_named_group_member(
             return resp;
         }
 
-        info.roster_revision = info.roster_revision.saturating_add(1);
-        let revision = info.roster_revision;
-        info.remove_member(&agent_id_hex, Some(hex::encode(local_agent.as_bytes())));
-        let commit = match info.seal_commit(signing_kp, now_ms) {
+        let mut next = info.clone();
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        let revision = next.roster_revision;
+        next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
+        let commit = match next.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -11354,9 +11330,10 @@ async fn remove_named_group_member(
                 );
             }
         };
-        let metadata_topic = info.metadata_topic.clone();
-        let event_group_id = info.stable_group_id().to_string();
-        let members = named_group_member_values(info);
+        let metadata_topic = next.metadata_topic.clone();
+        let event_group_id = next.stable_group_id().to_string();
+        let members = named_group_member_values(&next);
+        named_groups.insert(id.clone(), next);
         drop(named_groups);
 
         let mut epoch = None;
@@ -11529,7 +11506,6 @@ async fn remove_treekem_named_group_member(
     state: Arc<AppState>,
     id: String,
     agent_id_hex: String,
-    local_agent: AgentId,
     local_agent_hex: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
@@ -11554,23 +11530,8 @@ async fn remove_treekem_named_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        if agent_id_hex == hex::encode(info.creator.as_bytes()) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "cannot remove creator via member API; delete the group instead"
-                })),
-            );
-        }
-        if local_agent != info.creator {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "only the creator can remove other members"
-                })),
-            );
+        if let Err(e) = require_admin_or_above(info, &local_agent_hex) {
+            return e;
         }
         if !info.has_member(&agent_id_hex) {
             return (
@@ -12026,31 +11987,20 @@ fn require_admin_or_above(
     }
 }
 
-/// Exact ADR-0016 §3 error string for acts that would leave a live group
-/// with zero active admins. Fixed verbatim by the Phase 1 spec — do not edit.
-const LAST_ADMIN_PRECHECK_ERROR: &str =
-    "a group must always have at least one admin; make another member an admin first";
-
 /// Friendly REST pre-check for the ADR-0016 last-admin invariant.
 ///
 /// Applies the handler's intended roster mutation to a clone of the group
-/// and runs the shared invariant check over the proposed post-mutation
-/// state. Returns the 409 response to send when the act would strip the
-/// last active admin (legacy `Owner` counts as Admin). This is UX only —
-/// the authoritative enforcement is the same shared check inside
+/// through the shared library helper. Returns the 409 response to send
+/// when the act would strip the last active admin (legacy `Owner` counts
+/// as Admin). This is UX only — the authoritative enforcement is the same
+/// shared check inside
 /// `seal_commit` / `finalize_applied_commit` on every delivery path.
 fn last_admin_precheck(
     info: &x0x::groups::GroupInfo,
     apply: impl FnOnce(&mut x0x::groups::GroupInfo),
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
-    let mut proposed = info.clone();
-    apply(&mut proposed);
-    if x0x::groups::enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn).is_err()
-    {
-        Some(api_error(StatusCode::CONFLICT, LAST_ADMIN_PRECHECK_ERROR))
-    } else {
-        None
-    }
+    x0x::groups::last_admin_precheck_error(info, apply)
+        .map(|error| api_error(StatusCode::CONFLICT, error))
 }
 
 /// PATCH /groups/:id — update name/description (admin+).
@@ -12303,7 +12253,7 @@ async fn update_member_role(
     )
 }
 
-/// POST /groups/:id/ban/:agent_id — ban a member (admin+, target must not be owner).
+/// POST /groups/:id/ban/:agent_id — ban a member (admin+).
 async fn ban_group_member(
     State(state): State<Arc<AppState>>,
     Path((id, agent_id_hex)): Path<(String, String)>,
@@ -12317,7 +12267,7 @@ async fn ban_group_member(
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
     let mut groups = state.named_groups.write().await;
-    let Some(info) = groups.get_mut(&id) else {
+    let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
@@ -12327,32 +12277,30 @@ async fn ban_group_member(
         drop(groups);
         return ban_treekem_group_member(state, id, agent_id_hex, caller_hex).await;
     }
-    if info.caller_role(&agent_id_hex) == Some(x0x::groups::GroupRole::Owner) {
-        return forbidden("cannot ban owner");
-    }
     // ADR-0016 R2: friendly pre-check before any mutation/rekey side effect.
     if let Some(resp) = last_admin_precheck(info, |g| g.ban_member(&agent_id_hex, None)) {
         return resp;
     }
-    info.ban_member(&agent_id_hex, Some(caller_hex.clone()));
-    info.roster_revision = info.roster_revision.saturating_add(1);
-    let revision = info.roster_revision;
-    let metadata_topic = info.metadata_topic.clone();
-    let event_group_id = info.stable_group_id().to_string();
+    let mut next = info.clone();
+    next.ban_member(&agent_id_hex, Some(caller_hex.clone()));
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    let metadata_topic = next.metadata_topic.clone();
+    let event_group_id = next.stable_group_id().to_string();
 
     // Phase D.2: rotate the group shared secret so banned peer's stale secret
     // cannot decrypt new-epoch content. Capture remaining active members with
     // their KEM pubkeys so we can seal the new secret to each.
     let is_encrypted =
-        info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted;
+        next.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted;
     type RekeyBundle = (Option<[u8; 32]>, u64, Vec<(String, Option<String>)>);
     let (new_secret, new_epoch, remaining_targets): RekeyBundle = if is_encrypted {
-        let (sec_vec, ep) = info.rotate_shared_secret();
+        let (sec_vec, ep) = next.rotate_shared_secret();
         let mut sec = [0u8; 32];
         if sec_vec.len() == 32 {
             sec.copy_from_slice(&sec_vec);
         }
-        let remaining: Vec<(String, Option<String>)> = info
+        let remaining: Vec<(String, Option<String>)> = next
             .active_members()
             .map(|m| (m.agent_id.clone(), m.kem_public_key_b64.clone()))
             .collect();
@@ -12360,7 +12308,7 @@ async fn ban_group_member(
     } else {
         (None, 0, Vec::new())
     };
-    let commit = match info.seal_commit(signing_kp, now_ms) {
+    let commit = match next.seal_commit(signing_kp, now_ms) {
         Ok(c) => c,
         Err(e) => {
             return api_error(
@@ -12369,6 +12317,7 @@ async fn ban_group_member(
             );
         }
     };
+    groups.insert(id.clone(), next);
 
     drop(groups);
     save_named_groups(&state).await;
@@ -12478,12 +12427,6 @@ async fn ban_treekem_group_member(
         };
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
             return e;
-        }
-        if info.caller_role(&agent_id_hex) == Some(x0x::groups::GroupRole::Owner) {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "ok": false, "error": "cannot ban owner" })),
-            );
         }
         // ADR-0016 R2: friendly pre-check before any TreeKEM work begins.
         if let Some(resp) = last_admin_precheck(info, |g| g.ban_member(&agent_id_hex, None)) {
@@ -19827,13 +19770,11 @@ mod tests {
         assert!(authorized_treekem_membership_event_for_queue(
             &info,
             &self_leave,
-            &member_hex,
-            &creator_hex
+            &member_hex
         ));
-        assert!(!authorized_treekem_membership_event_for_queue(
+        assert!(authorized_treekem_membership_event_for_queue(
             &info,
             &self_leave,
-            &creator_hex,
             &creator_hex
         ));
 
@@ -19849,7 +19790,6 @@ mod tests {
         assert!(!authorized_treekem_membership_event_for_queue(
             &info,
             &admin_remove_without_treekem,
-            &creator_hex,
             &creator_hex
         ));
 
@@ -19865,7 +19805,6 @@ mod tests {
         assert!(authorized_treekem_membership_event_for_queue(
             &info,
             &admin_remove_with_treekem,
-            &creator_hex,
             &creator_hex
         ));
     }

@@ -220,6 +220,31 @@ fn secure_plane_legacy_default() -> SecureGroupPlane {
     SecureGroupPlane::Gss
 }
 
+/// Exact ADR-0016 §3 REST error string for acts that would leave a live
+/// group with zero active admins. Fixed verbatim by the Phase 1 spec.
+pub const LAST_ADMIN_PRECHECK_ERROR: &str =
+    "a group must always have at least one admin; make another member an admin first";
+
+/// Return the ADR-0016 last-admin REST pre-check error for a proposed
+/// post-mutation group state.
+///
+/// Callers provide the same mutation they are about to author/apply; this
+/// helper runs it on a clone and maps the shared invariant to the exact §3
+/// user-facing string. It is a UX pre-check only — the authoritative guard
+/// remains [`state_commit::enforce_last_admin_invariant`] at the commit
+/// authoring/apply choke-points.
+#[must_use]
+pub fn last_admin_precheck_error(
+    info: &GroupInfo,
+    apply: impl FnOnce(&mut GroupInfo),
+) -> Option<&'static str> {
+    let mut proposed = info.clone();
+    apply(&mut proposed);
+    state_commit::enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn)
+        .err()
+        .map(|_| LAST_ADMIN_PRECHECK_ERROR)
+}
+
 impl GroupInfo {
     /// Create a new `GroupInfo` with the given policy (defaults to `private_secure`).
     #[must_use]

@@ -45,6 +45,18 @@ It also applies the retro honesty fixes to the Slice 2 and Slice 3 checkpoint wo
 
 ## Approved remediation
 
+### R2 stop-condition decision update — Jim, 2026-06-14
+
+The pre-code audit found shipped pre-ADR code could author `MemberRoleUpdated` commits assigning `Moderator` / `Guest`. Jim selected Option 1: **accept-and-document; do not reject `Moderator` / `Guest` on signed/gossip apply in Slice 3R.**
+
+Rationale to record in the remediation checkpoint and PR note:
+
+- `Moderator` (rank 2) and `Guest` (rank 0) grant **no authority** — the only authority threshold in the code is `at_least(Admin)`; both sit below it and appear in no privilege check. An applied Moderator/Guest is an inert label, not an escalation. (`Owner`, the one role that does grant authority, is admin-equivalent and already handled.)
+- Authority comes from the signed commit + the `at_least(Admin)` check + the last-admin invariant — not from policing target-role vocabulary at apply time.
+- In a gossip network the apply path must accept any validly-signed peer commit, including from daemons still on the old version. Rejecting on apply would (a) break byte-for-byte legacy replay and (b) fork live state between upgraded and un-upgraded daemons. The admin/member-only **assignment** rule belongs at **authoring**, not apply.
+
+Updated R2 scope: confirm the REST role-assignment handler is the only `MemberRoleUpdated` authoring path or gate any other authoring path the same way; add tests for authoring-block, apply-accept, and last-admin invariant behavior. Leave existing `Owner`-on-apply rejection unchanged and carry a PR/gauntlet note that its replay/convergence implications need separate assessment.
+
 ### R1 — Fix non-creator last-admin self-leave corruption
 
 At current head, after Slice 3:
@@ -80,7 +92,7 @@ Required properties:
 - Principle: reject new reserved-role assignments; keep historical replay valid.
 - If historical `Moderator` / `Guest` role-update commits could have been produced by shipped code, stop and surface instead of breaking replay.
 - If they were never practically assignable, record the evidence in the checkpoint and reject them on the apply path.
-- `MemberRoleUpdated` apply rejects `Owner`, `Moderator`, and `Guest` when safe.
+- `MemberRoleUpdated` apply rejects `Owner`, `Moderator`, and `Guest` when safe. **Superseded for Moderator/Guest by Jim's stop-condition decision above: do not reject Moderator/Guest on apply in Slice 3R.**
 - `MemberRoleUpdated` apply still accepts `Admin` and `Member`.
 - Existing stored legacy `Owner` entries remain parseable and admin-equivalent.
 - Owner-to-admin normalization remains valid.
@@ -97,8 +109,8 @@ Fast-gate / normal nextest coverage:
 
 - Non-creator last-admin self-leave rejection does not mutate the original group state.
 - If a helper exposes the REST error, exact “before leaving” 409 string is asserted in normal tests.
-- Signed/gossip-style `MemberRoleUpdated` rejects `Owner`, `Moderator`, and `Guest`, if historical replay audit says this is safe.
-- Signed/gossip-style `MemberRoleUpdated` still accepts `Admin` and `Member`.
+- Signed/gossip-style `MemberRoleUpdated` accepts `Admin`, `Member`, and legacy `Moderator` / `Guest` per Jim's replay decision.
+- Last-admin invariant still rejects sole-admin demotion to below-Admin roles, including `Moderator` / `Guest`.
 - Owner-to-admin normalization remains valid.
 - Evidence test or checkpoint note confirms whether legacy `Moderator` / `Guest` role-update commits were ever producible by shipped assignment paths.
 - Existing Slice 1-3 targeted tests still pass.

@@ -1,7 +1,7 @@
 # Plan addendum 2 — Slice 3R retro blocker remediation
 
 - Date: 2026-06-14
-- Status: Approved by Jim; binding before Slice 4. Amends `phase-1-plan.md` execution order after Slice 3.
+- Status: Approved by Jim; binding before Slice 4. Amends `phase-1-plan.md` execution order after Slice 3. R2 decision updated after stop-condition audit, 2026-06-14: accept-and-document Moderator/Guest apply replay; do not reject Moderator/Guest on apply in Slice 3R.
 - Origin: Slice 1-3 retro adversarial + craft review (`gsd/checkpoints/2026-06-14-slice-1-3-retro-review.md`) found blockers in the Slice 1-3 foundation.
 
 ## Objective
@@ -33,6 +33,21 @@ Principle:
 
 If historical `Moderator` / `Guest` role-update commits could have been produced by shipped code, stop and surface instead of breaking replay. If they were never practically assignable, record the evidence in the remediation checkpoint and reject them on the apply path.
 
+### R2 stop-condition decision — Jim, 2026-06-14
+
+The audit found shipped pre-ADR code could author `MemberRoleUpdated` commits assigning `Moderator` / `Guest`, so rejecting them on apply would break historical replay and could fork live state between upgraded and un-upgraded daemons.
+
+Decision: **accept-and-document; do not reject `Moderator` / `Guest` on signed/gossip apply in Slice 3R.**
+
+Rationale to carry in the remediation checkpoint and PR note:
+
+- `Moderator` (rank 2) and `Guest` (rank 0) grant no Admin authority under the `at_least(Admin)` authority threshold.
+- Authority comes from the signed commit, the `at_least(Admin)` check, and the last-admin invariant — not target-role vocabulary policing at apply time.
+- The apply path must preserve validly signed peer commits from old daemons for byte-for-byte replay and live convergence.
+- The admin/member-only assignment rule belongs at authoring, not apply.
+
+Updated R2 task: confirm/gate current-code authoring paths so new assignments expose only `admin` / `member`; add tests that current authoring rejects reserved roles, signed apply accepts legacy `Moderator` / `Guest`, and the last-admin invariant rejects sole-admin demotion to below-Admin roles. Leave existing `Owner`-on-apply rejection unchanged and carry a PR/gauntlet note that it needs its own replay/convergence assessment because `Owner` grants authority.
+
 ## Out of scope
 
 - Slice 4 invite changes.
@@ -52,13 +67,13 @@ If historical `Moderator` / `Guest` role-update commits could have been produced
    - Preferred fix: clone-first plus explicit last-admin precheck before mutation/side effects.
    - It is acceptable to introduce the Slice 5 “before leaving” 409 string early, but do not implement the full Slice 5 leave/disband split.
    - Preserve existing creator-delete behavior for Slice 5.
-3. Fix reserved-role gossip apply:
+3. Disposition reserved-role signed apply:
    - Confirm whether Moderator/Guest role-update commits could have been produced by shipped code.
-   - If safe, reject `Owner`, `Moderator`, and `Guest` on `MemberRoleUpdated` apply path.
+   - If safe, reject `Owner`, `Moderator`, and `Guest` on `MemberRoleUpdated` apply path. **Superseded by R2 stop-condition decision above: shipped code could produce Moderator/Guest, so do not reject Moderator/Guest on apply in Slice 3R.**
    - Keep REST assignment behavior unchanged.
    - Preserve legacy stored roster parsing and legacy Owner entries.
 4. Tests:
-   - Fast-gate tests: non-creator last-admin self-leave rejection does not mutate original group state; exact “before leaving” error string if surfaced through a testable helper; signed/gossip-style `MemberRoleUpdated` rejects `Owner`, `Moderator`, and `Guest`; `Admin` / `Member` role updates still apply; Owner-to-admin normalization remains valid.
+   - Fast-gate tests: non-creator last-admin self-leave rejection does not mutate original group state; exact “before leaving” error string if surfaced through a testable helper; signed/gossip-style `MemberRoleUpdated` accepts `Admin`, `Member`, and legacy `Moderator` / `Guest` per Jim's replay decision; last-admin invariant still rejects sole-admin demotion to below-Admin roles; Owner-to-admin normalization remains valid.
    - Maintainer-gate / ignored daemon test only if feasible without broad harness work; do not build a flaky mesh test for a deterministic state-level property.
 5. Verification:
    - Run mandatory Rust checks in exact order: `cargo fmt --all`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo check --workspace --all-targets`.

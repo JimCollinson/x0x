@@ -8,8 +8,9 @@
 - Slice commits under verification:
   - `4da985e` — `feat(adr-0016-phase-1): retire owner-only group authority`
   - `6db3143` — `test(adr-0016): update last-admin REST fixture for admin genesis`
-- CI arbiter / green of record: draft mirror PR #5, <https://github.com/JimCollinson/x0x/pull/5>, head `6db3143`
-- Status: **Slice complete; CI green of record passed. Ready for Jim review / Slice 3 dispatch.**
+  - `b9f6b37` — `test(adr-0016-phase-1): cover legacy owner chain replay`
+- CI arbiter / green of record: draft mirror PR #5, <https://github.com/JimCollinson/x0x/pull/5>, head `b9f6b37`
+- Status: **Slice complete, including finish-off legacy Owner chain coverage; CI green of record passed after rerunning a named-group mesh/event-propagation failure. Ready for Jim review / Slice 3 dispatch.**
 
 ## Evidence item 1: receive-path creator-comparison grep
 
@@ -51,6 +52,7 @@ No additional authority mechanism beyond the spec's two known classes (literal c
   - Production genesis/card-import sites switched to `new_admin`.
 - Tests
   - Added `tests/owner_retirement.rs` normal-gate coverage for Admin genesis, R5 exact strings, promoted-admin policy/role/end-group via apply path, legacy `Owner` compatibility, and owner→admin normalization.
+  - Added finish-off legacy `Owner` chain replay coverage that hard-codes the legacy JSON BLAKE3 and roster root stability values and replays a legacy-owner-signed policy update byte-for-byte.
   - Updated state-commit/last-admin fixtures for Admin genesis while keeping explicit legacy-Owner fixtures where history preservation is under test.
   - Updated the Slice 1 ignored REST maintainer-gate fixture to expect the rejected demote to leave the creator as `admin` after Slice 2's genesis change.
 
@@ -63,6 +65,7 @@ No additional authority mechanism beyond the spec's two known classes (literal c
 - No hashing/signing/commit-format/state-hash semantics changed.
 - No `.gsd` files were added to the feature branch.
 - No hook, gate, CI workflow, test harness, daemon wrapper, build invocation, or environment setup was changed during Slice 2.
+- Finish-off commit `b9f6b37` was test-only and did not modify production serialization, role-byte values, hashing, signing, commit format, harness/build/env, or `.gsd` files.
 
 ## Setup prerequisite evidence
 
@@ -91,7 +94,7 @@ The hook ran on both Slice 2 pushes and passed before pushing to Jim's fork. CI 
 
 ### Local mandatory Rust checks
 
-Run in feature worktree after implementation and again after the follow-up test fixture change where applicable:
+Run in feature worktree after implementation, again after the follow-up test fixture change where applicable, and again after finish-off test commit `b9f6b37`:
 
 | Command | Result |
 |---|---|
@@ -122,23 +125,33 @@ Follow-up local evidence:
 | `cargo nextest run --all-features --test named_group_integration -E 'test(last_admin_rest_self_demote_returns_409_exact_string)' --run-ignored all` | PASS — 1/1 |
 | `cargo nextest run --all-features --test named_group_integration --run-ignored ignored-only` | Local FAIL after 4 passes on `named_group_creator_delete_propagates_to_peer` with the same known macOS pair-mesh setup failure (`zero peers after 30s`). CI Linux run passed after the fixture fix. |
 
+### Finish-off legacy Owner chain evidence
+
+Finish-off commit `b9f6b37` added only `tests/owner_retirement.rs` coverage. Local evidence in feature worktree:
+
+| Command | Result |
+|---|---|
+| `cargo nextest run --all-features --test owner_retirement -E 'test(owner_retirement_legacy_owner_chain_replays_byte_for_byte)'` | PASS — 1/1 |
+| `cargo nextest run --all-features -E 'test(owner_retirement)'` | PASS — 8/8 |
+
 ### CI arbiter / green of record
 
-Draft mirror PR #5, <https://github.com/JimCollinson/x0x/pull/5>, head `6db3143`:
+Draft mirror PR #5, <https://github.com/JimCollinson/x0x/pull/5>, head `b9f6b37`:
 
 - Build: all platform build jobs SUCCESS (`linux-x64-gnu`, `linux-x64-musl`, `linux-arm64-gnu`, `macos-x64`, `macos-arm64`, `windows-x64`).
 - CI: Format Check SUCCESS; Clippy Lint SUCCESS; Test Suite SUCCESS; Coverage Gate SUCCESS; Documentation SUCCESS; API + GUI Parity Gate SUCCESS.
 - Integration & Soak Tests: API Coverage Guard SUCCESS; Property Tests SUCCESS; Multi-Agent Integration SUCCESS; Soak Test SKIPPED by workflow.
 - Security Audit: Cargo Audit SUCCESS; Panic Scanner SUCCESS.
+- Initial Test Suite attempt at `b9f6b37` failed before completion in `named_group_join_metadata_event::forged_member_joined_admin_role_or_secret_is_rejected` (`alice never reported rejecting forged admin MemberJoined`). The new finish-off test had already passed in that run. The failed CI job was rerun without code, harness, environment, or workflow changes; rerun Test Suite job `81287790733` passed in 8m33s.
 
 CI is the green of record; local full-suite failures were not used to claim readiness and were tied to baseline evidence.
 
 ## Honesty rules check
 
 - No-harness-modification: PASS. No test harness, wrapper, daemon invocation, build, gate, hook, or CI workflow was changed during Slice 2.
-- Baseline-diff for evidence: PASS. Local failures used as caveats are the exact macOS timing/mesh classes baseline-reproduced in `gsd/evidence/2026-06-13-slice-1-local-gate.md`; CI passed cleanly on the branch.
-- Evidence reproducible-from-branch: PASS. Readiness evidence is from committed feature branch `6db3143` plus CI PR #5. Local `.gsd/gate.sh` is a clone-local tripwire only and is not needed for CI.
-- Local vs CI consistency: expected difference. Local macOS full nextest hits known mesh/timing issues; CI Linux runner is green of record.
+- Baseline-diff for evidence: PASS. Local failures used as caveats are the exact macOS timing/mesh classes baseline-reproduced in `gsd/evidence/2026-06-13-slice-1-local-gate.md`. The one CI failure at `b9f6b37` was not dismissed as proof of readiness; the branch was not considered ready until PR #5's rerun CI was green. The failed attempt is recorded as a failed attempt, and the new finish-off test passed in that failed run.
+- Evidence reproducible-from-branch: PASS. Readiness evidence is from committed feature branch `b9f6b37` plus CI PR #5. Local `.gsd/gate.sh` is a clone-local tripwire only and is not needed for CI.
+- Local vs CI consistency: expected difference for known macOS mesh/timing cases. CI Linux runner is green of record after rerun at `b9f6b37`.
 
 ## Deviations / notes
 

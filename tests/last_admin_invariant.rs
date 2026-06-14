@@ -31,13 +31,17 @@ fn hex_id(kp: &AgentKeypair) -> String {
 
 /// Build a group whose sole member is `owner_kp` as legacy `Owner`.
 fn build_owner_group(owner_kp: &AgentKeypair, name: &str) -> GroupInfo {
-    GroupInfo::with_policy(
+    let mut info = GroupInfo::with_policy(
         name.to_string(),
         "desc".into(),
         owner_kp.agent_id(),
         "aa".repeat(16),
         GroupPolicyPreset::PublicRequestSecure.to_policy(),
-    )
+    );
+    let owner_hex = hex_id(owner_kp);
+    info.set_member_role(&owner_hex, GroupRole::Owner);
+    info.recompute_state_hash();
+    info
 }
 
 /// Replica that shares the authority's genesis (mirrors what migration

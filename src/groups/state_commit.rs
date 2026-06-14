@@ -24,7 +24,7 @@
 //! 2. **Prev-hash chain** — `prev_state_hash` must equal the current
 //!    `state_hash` of the local `GroupInfo`.
 //! 3. **Authority** — the signer's role at the local view must permit the
-//!    action (e.g. Owner for policy changes, Admin for member management).
+//!    action (e.g. Admin or legacy Owner for privileged group changes).
 //! 4. **Signature** — the event is signed by the advertised signer's
 //!    ML-DSA-65 key, and the `committed_by` field binds the actor.
 //! 5. **Withdrawal terminality** — once a group is marked withdrawn by a
@@ -441,11 +441,11 @@ pub enum ApplyError {
     #[error("invalid signature: {0}")]
     InvalidSignature(String),
 
-    /// A structural invariant was violated (e.g. owner removal, duplicate).
+    /// A structural invariant was violated (e.g. zero active admins, duplicate).
     #[error("invariant violation: {0}")]
     Invariant(String),
 
-    /// The group has been withdrawn; no further non-owner actions apply.
+    /// The group has been withdrawn; no further live-state actions apply.
     #[error("group is withdrawn")]
     Withdrawn,
 
@@ -470,10 +470,8 @@ pub enum ApplyError {
 /// apply-time against the signer's current effective role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
-    /// Owner-only: policy change, role-change-of-admin-or-above, withdrawal.
-    OwnerOnly,
-    /// Admin or higher: add/remove member, approve/reject request, ban, unban,
-    /// role-change-of-member-or-below, metadata edit.
+    /// Admin or higher: privileged group control-plane changes. Legacy Owner
+    /// entries also satisfy this through [`GroupRole::at_least`].
     AdminOrHigher,
     /// Active-member self-action (e.g. leave group).
     MemberSelf,
@@ -486,7 +484,6 @@ impl ActionKind {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Self::OwnerOnly => "owner-only",
             Self::AdminOrHigher => "admin-or-higher",
             Self::MemberSelf => "member-self",
             Self::NonMemberRequest => "non-member-request",
@@ -600,7 +597,6 @@ pub fn validate_apply(
         .map(|m| m.role);
 
     let authorized = match action_kind {
-        ActionKind::OwnerOnly => signer_role == Some(GroupRole::Owner),
         ActionKind::AdminOrHigher => signer_role
             .map(|r| r.at_least(GroupRole::Admin))
             .unwrap_or(false),
@@ -1111,7 +1107,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::StaleRevision { got: 1, have: 1 }));
         let _ = owner_hex; // silence unused
     }
@@ -1143,12 +1139,12 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::PrevHashMismatch { .. }));
     }
 
     #[test]
-    fn validate_apply_rejects_unauthorized_owner_action() {
+    fn validate_apply_rejects_unauthorized_admin_action() {
         let kp = AgentKeypair::generate().unwrap();
         let signer_hex = hex::encode(kp.agent_id().as_bytes());
         let owner_hex = "ff".repeat(32);
@@ -1179,7 +1175,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::Unauthorized { .. }));
     }
 
@@ -1245,7 +1241,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::Withdrawn));
     }
 
@@ -1276,7 +1272,7 @@ mod tests {
             members_v2: &members,
             group_id: "g-right",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::GroupIdMismatch { .. }));
     }
 }

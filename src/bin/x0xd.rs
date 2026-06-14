@@ -675,7 +675,7 @@ fn apply_withdrawn_group_card_to_group_info(
     info.members_v2
         .entry(card.owner_agent_id.clone())
         .or_insert_with(|| {
-            x0x::groups::GroupMember::new_owner(card.owner_agent_id.clone(), None, card.created_at)
+            x0x::groups::GroupMember::new_admin(card.owner_agent_id.clone(), None, card.created_at)
         });
     true
 }
@@ -8076,7 +8076,7 @@ async fn apply_named_group_metadata_event_inner(
     // the *removed member itself*, which is direct-delivered the commit so it
     // learns it was cut from the roster. A transient unverified drop of either
     // is unrecoverable, so let them through; the apply arms below re-check
-    // authority from the signed commit (GroupDeleted: OwnerOnly via
+    // authority from the signed commit (GroupDeleted: AdminOrHigher via
     // `commit.committed_by`; MemberRemoved: creator/self auth + signed-commit
     // validation). The authenticated DM `sender_hex` is reliable regardless of
     // the cache, so bypassing `verified` does not weaken membership
@@ -8568,23 +8568,22 @@ async fn apply_named_group_metadata_event_inner(
             };
             // Authority comes from the signed commit, not the transport
             // sender. `validate_apply` (below) verifies the ML-DSA signature
-            // and that the signer (`commit.committed_by`) holds the Owner role
-            // — `OwnerOnly`. The `actor` field is advisory metadata, so we only
+            // and that the signer (`commit.committed_by`) holds an Admin-or-higher
+            // role. The `actor` field is advisory metadata, so we only
             // require it to name the cryptographically-verified signer; we do
             // *not* gate on `sender_hex`, which is the relaying/transport peer
             // (wrong for gossip-relayed copies) and unreliable for an
-            // unverified direct delete. The signer must be this group's
-            // creator, preserving the original creator-only delete semantics.
-            // This lets a creator's terminal delete apply on a joiner whose
-            // identity-discovery cache hasn't yet bound the creator's AgentId.
-            if actor != commit.committed_by || commit.committed_by != creator_hex {
+            // unverified direct delete. This lets an admin's terminal delete
+            // apply on a joiner whose identity-discovery cache hasn't yet bound
+            // the admin's AgentId.
+            if actor != commit.committed_by {
                 return false;
             }
             let current = info.clone();
             if let Err(e) = apply_stateful_event_to_group(
                 &current,
                 &commit,
-                x0x::groups::ActionKind::OwnerOnly,
+                x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = revision.max(next.roster_revision);
                     next.updated_at = commit.committed_at;
@@ -8614,7 +8613,7 @@ async fn apply_named_group_metadata_event_inner(
         }
         NamedGroupMetadataEvent::PolicyUpdated {
             revision,
-            actor,
+            actor: _,
             policy,
             commit,
             ..
@@ -8622,15 +8621,11 @@ async fn apply_named_group_metadata_event_inner(
             let Some(commit) = commit else {
                 return false;
             };
-            let creator_auth = sender_hex == creator_hex && actor == sender_hex;
-            if !creator_auth {
-                return false;
-            }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
                 &current,
                 &commit,
-                x0x::groups::ActionKind::OwnerOnly,
+                x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.policy_revision = revision.max(next.policy_revision);
                     next.policy = policy.clone();
@@ -8677,30 +8672,19 @@ async fn apply_named_group_metadata_event_inner(
             if target.is_removed() || target.is_banned() {
                 return false;
             }
-            let actor_role_val = actor_role.unwrap_or(x0x::groups::GroupRole::Guest);
-            if actor_role_val == x0x::groups::GroupRole::Admin
-                && (target.role == x0x::groups::GroupRole::Owner
-                    || target.role == x0x::groups::GroupRole::Admin
-                    || role == x0x::groups::GroupRole::Owner
-                    || role == x0x::groups::GroupRole::Admin)
-            {
-                return false;
-            }
             if role == x0x::groups::GroupRole::Owner {
                 return false;
             }
-            let action_kind = if target.role.at_least(x0x::groups::GroupRole::Admin)
-                || role.at_least(x0x::groups::GroupRole::Admin)
-            {
-                x0x::groups::ActionKind::OwnerOnly
-            } else {
-                x0x::groups::ActionKind::AdminOrHigher
-            };
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(&current, &commit, action_kind, |next| {
-                next.roster_revision = revision.max(next.roster_revision);
-                next.set_member_role(&agent_id, role);
-            }) else {
+            let Ok(next) = apply_stateful_event_to_group(
+                &current,
+                &commit,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision = revision.max(next.roster_revision);
+                    next.set_member_role(&agent_id, role);
+                },
+            ) else {
                 return false;
             };
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
@@ -11786,7 +11770,7 @@ async fn get_group_state(
 /// chain and republish the signed public card (no-op payload change —
 /// used to refresh / repair / force-propagate the chain).
 ///
-/// Owner or admin only.
+/// Admin or higher only.
 async fn seal_group_state(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -11802,7 +11786,7 @@ async fn seal_group_state(
             .map(|r| r.at_least(x0x::groups::GroupRole::Admin))
             .unwrap_or(false)
         {
-            return forbidden("owner or admin required to seal state");
+            return forbidden("admin role required");
         }
     }
     let commit = publish_group_card_with_reseal(&state, &id).await;
@@ -11823,7 +11807,7 @@ async fn seal_group_state(
 /// supersedes any prior public card regardless of TTL; peers evict
 /// stale listings on receipt.
 ///
-/// Owner only.
+/// Admin or higher only.
 async fn withdraw_group_state(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -11840,8 +11824,8 @@ async fn withdraw_group_state(
         let Some(info) = groups.get_mut(&id) else {
             return not_found("group not found");
         };
-        if info.caller_role(&local_hex) != Some(x0x::groups::GroupRole::Owner) {
-            return forbidden("owner required to withdraw");
+        if let Err(e) = require_admin_or_above(info, &local_hex) {
+            return e;
         }
         match info.seal_withdrawal(signing_kp, now_ms) {
             Ok(c) => c,
@@ -12042,16 +12026,6 @@ fn require_admin_or_above(
     }
 }
 
-fn require_owner(
-    info: &x0x::groups::GroupInfo,
-    caller_hex: &str,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    match info.caller_role(caller_hex) {
-        Some(x0x::groups::GroupRole::Owner) => Ok(()),
-        _ => Err(forbidden("owner role required")),
-    }
-}
-
 /// Exact ADR-0016 §3 error string for acts that would leave a live group
 /// with zero active admins. Fixed verbatim by the Phase 1 spec — do not edit.
 const LAST_ADMIN_PRECHECK_ERROR: &str =
@@ -12150,7 +12124,7 @@ async fn update_named_group(
     )
 }
 
-/// PATCH /groups/:id/policy — update policy (owner-only).
+/// PATCH /groups/:id/policy — update policy (admin+).
 async fn update_group_policy(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -12163,7 +12137,7 @@ async fn update_group_policy(
     let Some(info) = groups.get_mut(&id) else {
         return not_found("group not found");
     };
-    if let Err(e) = require_owner(info, &caller_hex) {
+    if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
     }
 
@@ -12249,20 +12223,10 @@ async fn update_member_role(
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
-    let Some(new_role) = x0x::groups::GroupRole::from_name(&req.role) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": "invalid role" })),
-        );
+    let new_role = match x0x::groups::GroupRole::assignable_from_name(&req.role) {
+        Ok(role) => role,
+        Err(error) => return bad_request(error),
     };
-    if new_role == x0x::groups::GroupRole::Owner {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::json!({ "ok": false, "error": "ownership transfer not supported yet" }),
-            ),
-        );
-    }
 
     let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get_mut(&id) else {
@@ -12290,21 +12254,8 @@ async fn update_member_role(
         );
     }
 
-    let actor_role = info.caller_role(&caller_hex);
-    let target_role = Some(target_entry.role);
-
-    let authorized = match actor_role {
-        Some(x0x::groups::GroupRole::Owner) => true,
-        Some(x0x::groups::GroupRole::Admin) => target_role.is_some_and(|tr| {
-            tr != x0x::groups::GroupRole::Owner && tr != x0x::groups::GroupRole::Admin
-        }),
-        _ => false,
-    };
-    if !authorized {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "ok": false, "error": "insufficient role" })),
-        );
+    if let Err(e) = require_admin_or_above(info, &caller_hex) {
+        return e;
     }
 
     // ADR-0016 R2: friendly pre-check — a demotion must not strip the last
@@ -13631,12 +13582,12 @@ async fn import_group_card(
         }
         stub.prev_state_hash = card.prev_state_hash.clone();
         stub.withdrawn = card.withdrawn;
-        // The stub should not treat the caller as the owner — reset members_v2
-        // and store the owner (from card) as the active Owner.
+        // The stub should not treat the caller as an admin — reset members_v2
+        // and store the authority (from card) as the active Admin.
         stub.members_v2.clear();
         stub.members_v2.insert(
             card.owner_agent_id.clone(),
-            x0x::groups::GroupMember::new_owner(card.owner_agent_id.clone(), None, card.created_at),
+            x0x::groups::GroupMember::new_admin(card.owner_agent_id.clone(), None, card.created_at),
         );
         // Phase D.2: the importer is NOT a member yet. They must not have a
         // shared secret until a SecureShareDelivered envelope arrives after
@@ -13677,7 +13628,7 @@ async fn import_group_card(
             .members_v2
             .entry(card.owner_agent_id.clone())
             .or_insert_with(|| {
-                x0x::groups::GroupMember::new_owner(
+                x0x::groups::GroupMember::new_admin(
                     card.owner_agent_id.clone(),
                     None,
                     card.created_at,
@@ -19781,7 +19732,7 @@ mod tests {
     }
 
     #[test]
-    fn treekem_metadata_event_phase3_classifier_allows_owner_delete() {
+    fn treekem_metadata_event_phase3_classifier_allows_group_delete() {
         let event = NamedGroupMetadataEvent::MemberRemoved {
             group_id: "aa".repeat(16),
             revision: 1,

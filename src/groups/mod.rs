@@ -264,7 +264,7 @@ impl GroupInfo {
         let mut members_v2 = BTreeMap::new();
         members_v2.insert(
             creator_hex.clone(),
-            GroupMember::new_owner(creator_hex.clone(), None, now),
+            GroupMember::new_admin(creator_hex.clone(), None, now),
         );
 
         // Generate a fresh shared secret for MlsEncrypted groups. SignedPublic
@@ -471,7 +471,7 @@ impl GroupInfo {
     /// discovery purposes — peers holding stale public cards must drop them
     /// on receipt of this commit regardless of TTL.
     ///
-    /// Withdrawal is owner-authored; callers must check role before calling.
+    /// Withdrawal is admin-authored; callers must check role before calling.
     pub fn seal_withdrawal(
         &mut self,
         keypair: &AgentKeypair,
@@ -578,7 +578,7 @@ impl GroupInfo {
             for id in all_ids {
                 let display_name = self.display_names.get(&id).cloned();
                 let member = if id == creator_hex {
-                    GroupMember::new_owner(id.clone(), display_name, now)
+                    GroupMember::new_admin(id.clone(), display_name, now)
                 } else {
                     GroupMember::new_member(
                         id.clone(),
@@ -880,7 +880,7 @@ impl GroupInfo {
         self.active_members().count()
     }
 
-    /// Count of currently active Admins (including Owner).
+    /// Count of currently active Admins (including legacy Owner).
     #[must_use]
     pub fn active_admin_count(&self) -> usize {
         self.members_v2
@@ -889,7 +889,7 @@ impl GroupInfo {
             .count()
     }
 
-    /// Owner's agent hex, if one exists.
+    /// Active legacy Owner's agent hex, if one exists.
     #[must_use]
     pub fn owner_agent_id(&self) -> Option<String> {
         self.members_v2
@@ -977,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_info_new_seeds_owner() {
+    fn test_group_info_new_seeds_admin() {
         let info = GroupInfo::new(
             "Test Group".to_string(),
             "A test".to_string(),
@@ -985,9 +985,9 @@ mod tests {
             "aabb".repeat(8),
         );
         let creator_hex = hex::encode([1u8; 32]);
-        let owner = info.members_v2.get(&creator_hex).unwrap();
-        assert_eq!(owner.role, GroupRole::Owner);
-        assert!(owner.is_active());
+        let admin = info.members_v2.get(&creator_hex).unwrap();
+        assert_eq!(admin.role, GroupRole::Admin);
+        assert!(admin.is_active());
         assert_eq!(info.policy, GroupPolicy::default());
         assert_eq!(info.active_member_count(), 1);
     }
@@ -1069,7 +1069,7 @@ mod tests {
         assert_eq!(info.members_v2.len(), 3);
         let creator_hex = hex::encode([1u8; 32]);
         let bob_hex = hex::encode([2u8; 32]);
-        assert_eq!(info.members_v2[&creator_hex].role, GroupRole::Owner);
+        assert_eq!(info.members_v2[&creator_hex].role, GroupRole::Admin);
         assert_eq!(info.members_v2[&bob_hex].role, GroupRole::Member);
         assert_eq!(
             info.members_v2[&bob_hex].display_name.as_deref(),
@@ -1151,7 +1151,7 @@ mod tests {
     fn test_caller_role() {
         let info = GroupInfo::new("T".into(), "".into(), agent(1), "aa".repeat(16));
         let creator_hex = hex::encode([1u8; 32]);
-        assert_eq!(info.caller_role(&creator_hex), Some(GroupRole::Owner));
+        assert_eq!(info.caller_role(&creator_hex), Some(GroupRole::Admin));
         let stranger_hex = hex::encode([9u8; 32]);
         assert_eq!(info.caller_role(&stranger_hex), None);
     }

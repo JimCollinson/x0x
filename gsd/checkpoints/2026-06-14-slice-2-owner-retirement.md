@@ -10,7 +10,7 @@
   - `6db3143` — `test(adr-0016): update last-admin REST fixture for admin genesis`
   - `b9f6b37` — `test(adr-0016-phase-1): cover legacy owner chain replay`
 - CI arbiter / green of record: draft mirror PR #5, <https://github.com/JimCollinson/x0x/pull/5>, head `b9f6b37`
-- Status: **Slice complete, including finish-off legacy Owner chain coverage; CI green of record passed after rerunning a named-group mesh/event-propagation failure. Ready for Jim review / Slice 3 dispatch.**
+- Status: **Slice complete, including finish-off legacy Owner roster-stability and current-code replay coverage; CI green of record passed after rerunning a named-group mesh/event-propagation failure. Ready for Jim review / Slice 3 dispatch.**
 
 ## Evidence item 1: receive-path creator-comparison grep
 
@@ -52,7 +52,7 @@ No additional authority mechanism beyond the spec's two known classes (literal c
   - Production genesis/card-import sites switched to `new_admin`.
 - Tests
   - Added `tests/owner_retirement.rs` normal-gate coverage for Admin genesis, R5 exact strings, promoted-admin policy/role/end-group via apply path, legacy `Owner` compatibility, and owner→admin normalization.
-  - Added finish-off legacy `Owner` chain replay coverage that hard-codes the legacy JSON BLAKE3 and roster root stability values and replays a legacy-owner-signed policy update byte-for-byte.
+  - Added finish-off legacy `Owner` roster-stability/current-code replay coverage that hard-codes the legacy JSON BLAKE3 and roster root stability values, then authors and replays Owner-containing commits with current code. This does **not** claim a genuine pre-Slice-2 historical commit fixture replay.
   - Updated state-commit/last-admin fixtures for Admin genesis while keeping explicit legacy-Owner fixtures where history preservation is under test.
   - Updated the Slice 1 ignored REST maintainer-gate fixture to expect the rejected demote to leave the creator as `admin` after Slice 2's genesis change.
 
@@ -125,13 +125,13 @@ Follow-up local evidence:
 | `cargo nextest run --all-features --test named_group_integration -E 'test(last_admin_rest_self_demote_returns_409_exact_string)' --run-ignored all` | PASS — 1/1 |
 | `cargo nextest run --all-features --test named_group_integration --run-ignored ignored-only` | Local FAIL after 4 passes on `named_group_creator_delete_propagates_to_peer` with the same known macOS pair-mesh setup failure (`zero peers after 30s`). CI Linux run passed after the fixture fix. |
 
-### Finish-off legacy Owner chain evidence
+### Finish-off legacy Owner roster-stability / current-code replay evidence
 
 Finish-off commit `b9f6b37` added only `tests/owner_retirement.rs` coverage. Local evidence in feature worktree:
 
 | Command | Result |
 |---|---|
-| `cargo nextest run --all-features --test owner_retirement -E 'test(owner_retirement_legacy_owner_chain_replays_byte_for_byte)'` | PASS — 1/1 |
+| `cargo nextest run --all-features --test owner_retirement -E 'test(owner_retirement_legacy_owner_chain_replays_byte_for_byte)'` | PASS — 1/1. Name predates the retro calibration; the test proves fixed legacy Owner roster serialization/root stability plus current-code replay over Owner-containing rosters, not a checked-in pre-Slice-2 historical commit fixture. |
 | `cargo nextest run --all-features -E 'test(owner_retirement)'` | PASS — 8/8 |
 
 ### CI arbiter / green of record

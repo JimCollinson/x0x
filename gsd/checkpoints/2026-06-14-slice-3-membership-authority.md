@@ -21,7 +21,7 @@
 - `src/groups/mod.rs`
   - Added `LAST_ADMIN_PRECHECK_ERROR` and `last_admin_precheck_error` library seam so the exact §3 string is normal-gate testable outside the `x0xd` bin test target.
 - `tests/membership_authority.rs`
-  - New normal-gate coverage for promoted-admin add/remove/ban through REST-semantics helpers and gossip/state-commit apply.
+  - New normal-gate coverage for promoted-admin add/remove/ban through REST-semantics helpers and gossip/state-commit apply. This is helper/seam coverage, not actual daemon HTTP handler coverage.
   - Covers promoted admin removing/banning a legacy `Owner` when another admin remains.
   - Covers exact last-admin 409 string via the shared library seam.
   - Covers plain `member` add/remove/ban denial through REST semantics and gossip apply.
@@ -116,7 +116,7 @@ CI is the green of record.
 ## Deviations / notes
 
 - Added a small public `x0x::groups` helper/constant solely to make the exact last-admin §3 string normal-gate testable, per the packet's instruction that `x0xd` bin tests are not run and daemon tests are ignored.
-- No ignored HTTP daemon tests were added; normal-gate coverage was sufficient through the library/state-commit seam.
+- No ignored HTTP daemon tests were added; normal-gate coverage is through REST-semantics helper/library/state-commit seams. Actual daemon HTTP coverage remains maintainer-gate / ignored-suite exposure unless explicitly added later.
 - Delegated TreeKEM ban without target KeyPackage remains a 424-class missing-material condition for non-last-admin cases, as required and still deferred to Phase 2 for full operational support.
 - TreeKEM apply still preserves existing self-leave handling; Slice 5 remains responsible for leave/disband semantics.
 - The planning packet file `gsd/packets/2026-06-14-slice-3-membership-authority.md` is present as an untracked orchestrator-provided file in the planning worktree; this checkpoint commit stages only the checkpoint file.

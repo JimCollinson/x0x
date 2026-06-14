@@ -5,11 +5,23 @@
 //! same `seal_commit` / `seal_withdrawal` seam, and the gossip receiver uses
 //! the same validate → mirror mutation → finalize sequence exercised here.
 
-use x0x::groups::state_commit::validate_apply;
+use std::collections::BTreeMap;
+
+use x0x::groups::state_commit::{compute_roster_root, validate_apply};
 use x0x::groups::{
-    ActionKind, ApplyContext, ApplyError, GroupInfo, GroupPolicyPreset, GroupRole, GroupStateCommit,
+    ActionKind, ApplyContext, ApplyError, GroupInfo, GroupMember, GroupPolicyPreset, GroupRole,
+    GroupStateCommit,
 };
 use x0x::identity::AgentKeypair;
+
+const STABLE_OWNER_ID: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const STABLE_ADMIN_ID: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const STABLE_MEMBER_ID: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+const EXPECTED_LEGACY_OWNER_ROSTER_JSON_BLAKE3: &str =
+    "333a5ebb8d5d9ab042dc2017e32a1760d6d5c8e13045ae00814cc31b8aa84c02";
+const EXPECTED_LEGACY_OWNER_ROSTER_ROOT: &str =
+    "082266e4717640a855bfb4284ecc0f99af19838569c62dd5013a9854bc5df62d";
 
 fn hex_id(kp: &AgentKeypair) -> String {
     hex::encode(kp.agent_id().as_bytes())
@@ -30,6 +42,73 @@ fn legacy_owner_group(owner_kp: &AgentKeypair, name: &str) -> GroupInfo {
     info.set_member_role(&hex_id(owner_kp), GroupRole::Owner);
     info.recompute_state_hash();
     info
+}
+
+fn legacy_mixed_role_group(
+    owner_kp: &AgentKeypair,
+    admin_kp: &AgentKeypair,
+    member_kp: &AgentKeypair,
+    name: &str,
+) -> GroupInfo {
+    let mut info = legacy_owner_group(owner_kp, name);
+    let owner_hex = hex_id(owner_kp);
+    let admin_hex = hex_id(admin_kp);
+    let member_hex = hex_id(member_kp);
+
+    info.add_member(
+        admin_hex,
+        GroupRole::Admin,
+        Some(owner_hex.clone()),
+        Some("admin".into()),
+    );
+    info.add_member(
+        member_hex,
+        GroupRole::Member,
+        Some(owner_hex),
+        Some("member".into()),
+    );
+    info.recompute_state_hash();
+    info
+}
+
+fn stable_legacy_owner_roster() -> BTreeMap<String, GroupMember> {
+    let mut roster = BTreeMap::new();
+    roster.insert(
+        STABLE_OWNER_ID.to_string(),
+        GroupMember::new_owner(
+            STABLE_OWNER_ID.to_string(),
+            Some("legacy owner".into()),
+            1_000,
+        ),
+    );
+    roster.insert(
+        STABLE_ADMIN_ID.to_string(),
+        GroupMember {
+            role: GroupRole::Admin,
+            ..GroupMember::new_member(
+                STABLE_ADMIN_ID.to_string(),
+                Some("admin".into()),
+                Some(STABLE_OWNER_ID.to_string()),
+                2_000,
+            )
+        },
+    );
+    roster.insert(
+        STABLE_MEMBER_ID.to_string(),
+        GroupMember::new_member(
+            STABLE_MEMBER_ID.to_string(),
+            Some("member".into()),
+            Some(STABLE_ADMIN_ID.to_string()),
+            3_000,
+        ),
+    );
+    roster
+}
+
+fn assert_commit_matches_group(group: &GroupInfo, commit: &GroupStateCommit) {
+    assert_eq!(group.state_hash.as_str(), commit.state_hash.as_str());
+    let roster_root = compute_roster_root(&group.members_v2);
+    assert_eq!(roster_root.as_str(), commit.roster_root.as_str());
 }
 
 fn gossip_apply(
@@ -220,6 +299,88 @@ fn owner_retirement_legacy_owner_still_satisfies_admin_or_higher() {
     .expect("legacy owner validates as admin-or-higher");
 
     assert_eq!(next.state_hash, authority.state_hash);
+}
+
+#[test]
+fn owner_retirement_legacy_owner_chain_replays_byte_for_byte() {
+    let stability_roster = stable_legacy_owner_roster();
+    let serialized_stability_roster =
+        serde_json::to_vec(&stability_roster).expect("legacy owner roster serializes");
+    let serialized_stability_roster_hash = blake3::hash(&serialized_stability_roster)
+        .to_hex()
+        .to_string();
+    assert_eq!(
+        serialized_stability_roster_hash,
+        EXPECTED_LEGACY_OWNER_ROSTER_JSON_BLAKE3
+    );
+    assert_eq!(
+        compute_roster_root(&stability_roster),
+        EXPECTED_LEGACY_OWNER_ROSTER_ROOT
+    );
+
+    let owner = AgentKeypair::generate().unwrap();
+    let admin = AgentKeypair::generate().unwrap();
+    let member = AgentKeypair::generate().unwrap();
+    let owner_hex = hex_id(&owner);
+    let member_hex = hex_id(&member);
+    let mut authority = legacy_mixed_role_group(&owner, &admin, &member, "Legacy T");
+    let replica = legacy_mixed_role_group(&owner, &admin, &member, "Legacy T");
+
+    assert_eq!(authority.members_v2[&owner_hex].role, GroupRole::Owner);
+    assert_eq!(authority.members_v2[&member_hex].role, GroupRole::Member);
+    assert_eq!(authority.state_hash, replica.state_hash);
+    assert_eq!(
+        compute_roster_root(&authority.members_v2),
+        compute_roster_root(&replica.members_v2)
+    );
+
+    authority.policy = GroupPolicyPreset::PublicAnnounce.to_policy();
+    authority.policy_revision = authority.policy_revision.saturating_add(1);
+    let policy_commit = authority
+        .seal_commit(&owner, 1_000)
+        .expect("legacy owner authors policy update");
+    assert_commit_matches_group(&authority, &policy_commit);
+
+    let replayed_policy = gossip_apply(
+        &replica,
+        &policy_commit,
+        ActionKind::AdminOrHigher,
+        |next| {
+            next.policy = GroupPolicyPreset::PublicAnnounce.to_policy();
+            next.policy_revision = next.policy_revision.saturating_add(1);
+        },
+    )
+    .expect("legacy owner policy commit replays");
+    assert_commit_matches_group(&replayed_policy, &policy_commit);
+    assert_eq!(
+        replayed_policy.members_v2[&owner_hex].role,
+        GroupRole::Owner
+    );
+
+    authority.set_member_role(&member_hex, GroupRole::Admin);
+    authority.roster_revision = authority.roster_revision.saturating_add(1);
+    let role_commit = authority
+        .seal_commit(&admin, 2_000)
+        .expect("current admin authors role update while owner stays legacy");
+    assert_eq!(
+        role_commit.prev_state_hash.as_deref(),
+        Some(policy_commit.state_hash.as_str())
+    );
+    assert_commit_matches_group(&authority, &role_commit);
+
+    let replayed_role = gossip_apply(
+        &replayed_policy,
+        &role_commit,
+        ActionKind::AdminOrHigher,
+        |next| {
+            next.set_member_role(&member_hex, GroupRole::Admin);
+            next.roster_revision = next.roster_revision.saturating_add(1);
+        },
+    )
+    .expect("admin role commit replays over legacy owner roster");
+    assert_commit_matches_group(&replayed_role, &role_commit);
+    assert_eq!(replayed_role.members_v2[&owner_hex].role, GroupRole::Owner);
+    assert_eq!(replayed_role.members_v2[&member_hex].role, GroupRole::Admin);
 }
 
 #[test]

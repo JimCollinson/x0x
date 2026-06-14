@@ -1402,7 +1402,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
 // ===========================================================================
 
 /// Why: ADR-0016 fixes this REST contract verbatim — demoting the sole
-/// admin-or-higher member (here: the creator/owner demoting itself) must
+/// admin-or-higher member (here: the creator/admin demoting itself) must
 /// return 409 with exactly the §3 error string, and the roster must be
 /// left untouched.
 #[tokio::test]
@@ -1435,7 +1435,7 @@ async fn last_admin_rest_self_demote_returns_409_exact_string() {
         Some("a group must always have at least one admin; make another member an admin first")
     );
 
-    // The roster must be unchanged: the creator still holds owner rank.
+    // The roster must be unchanged: the creator still holds admin rank.
     let members: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}/members")))
         .send()
@@ -1444,19 +1444,19 @@ async fn last_admin_rest_self_demote_returns_409_exact_string() {
         .json()
         .await
         .unwrap();
-    let still_owner = members["members"]
+    let still_admin = members["members"]
         .as_array()
         .map(|ms| {
             ms.iter()
-                .any(|m| m["agent_id"] == self_hex.as_str() && m["role"] == "owner")
+                .any(|m| m["agent_id"] == self_hex.as_str() && m["role"] == "admin")
         })
         .unwrap_or(false);
     assert!(
-        still_owner,
+        still_admin,
         "roster mutated by a rejected demote: {members}"
     );
 
-    // Self-normalising owner → admin keeps the admin count at 1 and passes.
+    // Re-asserting admin keeps the admin count at 1 and passes.
     let resp = authed_client(&d)
         .patch(d.url(&format!("/groups/{group_id}/members/{self_hex}/role")))
         .json(&serde_json::json!({ "role": "admin" }))

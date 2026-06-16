@@ -4,7 +4,7 @@
 - Slice/question: Slice 4 — Invites per-issuer + creator provenance (R7/R8), plus code-review HIGH remediation
 - Prepared by: OpenCode implementer
 - Feature branch/head: `feat/adr-0016-phase-1-authority-alignment` @ `4fabfccada662d43719c7da71dd1d8818ccb5157`
-- Status: **Implementation remediated; ready for independent review**
+- Status: **Blocked — adversarial HIGH state-hash/roster coherence finding**
 
 ## What changed
 
@@ -153,15 +153,36 @@ Maintainer-gate daemon/mesh assertions remain affected by the pre-existing start
 ## Review gates
 
 - Prior code review: `issues_found` with one HIGH finding on non-TreeKEM admin-issued invite convergence; remediated in `4fabfcc`.
-- Repeat independent code review after remediation: Not run — required before Slice 4 can be accepted as Done.
+- Repeat independent code review after remediation: `passed`.
+  - Reviewer/tool: `codereviewer` subagent.
+  - Commands run:
+    - `cargo fmt --all -- --check` — PASS.
+    - `cargo clippy --all-features --all-targets -- -D warnings` — PASS.
+    - `cargo check --workspace --all-targets` — PASS.
+    - `cargo nextest run --all-features --all-targets -E 'test(non_treekem_admin_invite_joiner_validates_member_added_state_chain)'` — PASS, 1/1.
+    - `cargo nextest run --all-features --test invite_authority` — PASS, 3/3.
+    - `cargo nextest run --all-features -E 'test(invite) & !binary(named_group_join_metadata_event)'` — PASS, 23/23.
+    - `cargo nextest run --all-features --all-targets -E 'test(treekem_invite_stub_matches_authority_base_hash)'` — PASS, 1/1.
+    - `gh pr checks 5 --repo JimCollinson/x0x` — all green except known red `Test Suite` + `Multi-Agent Integration`, classified under the internal arbiter carve-out.
+  - Judgment: original HIGH was real; repro meaningful; remediation had no code-review blockers.
+- Verifier: `passed` with CI carve-out caveat.
+  - Reviewer/tool: `verifier` subagent.
+  - Note: `gsd/checkpoints/2026-06-16-slice-4-verification.md`.
+  - Result: 8/8 goals verified, but later adversarial review superseded this as final acceptance evidence.
 - Clean-context test: Not run — deferred until behaviour is complete enough to exercise from repo/docs / PR-readiness.
-- Adversarial review: Not run — required before Slice 4 can be accepted as Done unless Jim explicitly waives or defers.
-- Craft Review: Not run — required before Slice 4 can be accepted as Done unless Jim explicitly waives or defers.
+- Adversarial review: **NOT-READY**.
+  - Reviewer/tool: `adversarial` subagent, same reported model family (`openai/gpt-5.5`), so independence is weaker than cross-provider.
+  - HIGH blocker: non-TreeKEM join stores a roster that does not match its `state_hash`. The adversarial reviewer cited `src/bin/x0xd.rs:10708-10710` preserving `base_state_hash`, `src/bin/x0xd.rs:10713-10724` adding the joiner to non-TreeKEM `members_v2`, and `src/bin/x0xd.rs:10733-10734` avoiding recompute when `base_state_hash` exists. Result: persisted `members_v2 = base roster + joiner` while `state_hash` commits to pre-join base roster, weakening state-chain coherence even though it fixes the original `PrevHashMismatch`.
+  - MEDIUM: join-result “inviter” check compares sender to `MemberAdded.actor`, not an independently stored expected invite inviter; checkpoint wording overclaims inviter routing validation.
+  - MEDIUM: legacy/missing-base invites now hard-fail; may be acceptable for R8, but compatibility decision is not explicit.
+  - MEDIUM: fast invite authority tests mirror helper behavior rather than the real daemon handler.
+  - Test-quality note: remediation test proves the original `PrevHashMismatch`, but also encodes the incoherent state-staging approach and does not prove full daemon convergence.
+- Craft Review: Not run — adversarial HIGH blocks acceptance; run after remediation.
 
 ## Current gate status
 
-Implementation and local verification are complete. PR #5 internal CI arbiter is satisfied under the approved generalized known-flake carve-out. Slice 4 should not be marked Done until the remediation receives repeat independent code/adversarial/Craft review, or Jim explicitly waives/defers those gates.
+Implementation and local verification are complete, and PR #5 internal CI arbiter is satisfied under the approved generalized known-flake carve-out, but Slice 4 is **not ready** because adversarial review found an unresolved HIGH state-hash/roster coherence issue. Slice 4 must not be marked Done until this is remediated and repeat review gates pass.
 
 ## Recommended next step
 
-Run repeat independent code review focused on `680198b..4fabfcc`, then run/record the required adversarial and Craft reviews for Slice 4. If those pass with no blocking findings, approve the next packet (Slice 5).
+Remediate the state-hash/roster coherence issue: do not persist an active joiner in non-TreeKEM `members_v2` while retaining the pre-join base `state_hash`. Reassess the join-result sender check (`MemberAdded.actor` versus expected invite inviter) and explicitly document/decide legacy invite behavior. Then rerun mandatory checks, targeted tests, PR #5 arbiter, code review, verifier, adversarial, and Craft Review.

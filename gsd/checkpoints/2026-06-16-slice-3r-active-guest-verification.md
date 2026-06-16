@@ -7,6 +7,7 @@
 - Remediation delta checked: `779835028dae3324a20534f07f0402c47e6d6fe8..c7e91b2`
 - Full Slice 3R delta checked: `6ebac93e423e3fab60f91481adad6a86fb212445..c7e91b2`
 - Status: **gaps_found**
+- Supersession note: final disposition is recorded in `gsd/checkpoints/2026-06-16-slice-3r-disposition.md`. This verification note is preserved as evidence that the `c7e91b2` fix attempt was reviewed and found insufficient before it was reverted.
 
 ## Goal-backward result
 

@@ -5,6 +5,7 @@
 - Feature branch/head: `feat/adr-0016-phase-1-authority-alignment` @ `779835028dae3324a20534f07f0402c47e6d6fe8`
 - Slice delta: `6ebac93e423e3fab60f91481adad6a86fb212445..779835028dae3324a20534f07f0402c47e6d6fe8`
 - Status: **Blocked after adversarial confirmation. Jim selected follow-up remediation direction; do not dispatch Slice 4 until implemented and reviewed.**
+- Supersession note: final disposition is recorded in `gsd/checkpoints/2026-06-16-slice-3r-disposition.md`. This checkpoint is preserved as the honest historical record of the first Slice 3R implementation, the adversarial blocker, and the failed `c7e91b2` follow-up attempt.
 
 ## What happened
 

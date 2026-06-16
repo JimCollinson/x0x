@@ -9488,7 +9488,7 @@ async fn apply_named_group_metadata_event_inner(
             }
 
             // 7. Idempotent — if the joiner is already active, a replayed
-            //    MemberJoined after the owner committed the add is a no-op and
+            //    MemberJoined after the inviter committed the add is a no-op and
             //    must not consume any fresh invite record.
             if info.has_active_member(&member_agent_id) {
                 return false;
@@ -10594,12 +10594,9 @@ async fn create_group_invite(
         };
 
         let agent_id = state.agent.agent_id();
-        if agent_id != info.creator {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "ok": false, "error": "only the creator can generate invites" })),
-            )
-                .into_response();
+        let inviter_hex = hex::encode(agent_id.as_bytes());
+        if let Err(e) = require_admin_or_above(info, &inviter_hex) {
+            return e.into_response();
         }
         let mut invite = x0x::groups::invite::SignedInvite::new(
             info.mls_group_id.clone(),
@@ -10673,10 +10670,22 @@ async fn join_group_via_invite(
 
     let agent_id = state.agent.agent_id();
     let group_id_hex = invite.group_id.clone();
-    let creator = match parse_agent_id_hex(&invite.inviter) {
+    let inviter = match parse_agent_id_hex(&invite.inviter) {
         Ok(id) => id,
         Err(e) => {
             return bad_request(format!("invalid inviter: {e}"));
+        }
+    };
+    let creator_hex = match invite.creator_agent_id_from_base_state() {
+        Ok(creator_hex) => creator_hex,
+        Err(e) => {
+            return bad_request(e);
+        }
+    };
+    let creator = match parse_agent_id_hex(&creator_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            return bad_request(format!("invalid base-state creator: {e}"));
         }
     };
 
@@ -10736,7 +10745,7 @@ async fn join_group_via_invite(
             if let Some(stable_group_id) = invite.stable_group_id.clone() {
                 info.genesis = Some(x0x::groups::GroupGenesis::with_existing_id(
                     stable_group_id,
-                    invite.inviter.clone(),
+                    creator_hex.clone(),
                     info.created_at,
                     invite.genesis_creation_nonce.clone().unwrap_or_else(|| {
                         hex::encode(blake3::hash(group_id_hex.as_bytes()).as_bytes())
@@ -10795,7 +10804,7 @@ async fn join_group_via_invite(
             // Publish a signed MemberJoined event on the metadata topic so
             // the inviter (and every other current member running the
             // metadata listener) updates `members_v2` to include us. Without
-            // this, the owner's `validate_public_message` rejects every
+            // this, the authority's `validate_public_message` rejects every
             // post we make under `WritePolicyViolation { MembersOnly }` —
             // see docs/design/groups-join-roster-propagation.md.
             //
@@ -10903,14 +10912,14 @@ async fn join_group_via_invite(
                         state_for_poll,
                         group_id_for_poll,
                         event_group_id_for_poll,
-                        creator,
+                        inviter,
                         member_for_poll,
                     )
                     .await;
                 });
             }
 
-            // Announce join on the chat topic so the creator sees us —
+            // Announce join on the chat topic so the inviter sees us —
             // fire-and-forget. The result was already discarded pre-fix,
             // and spawning keeps the handler responsive when the gossip
             // publish path is slow under back-pressure.
@@ -17818,10 +17827,13 @@ async fn handle_join_result_message(
                 event = named_group_metadata_event_kind(&event),
                 sender = %hex::encode(sender.as_bytes()),
             );
-            let (group_id, member_agent_id) = match &event {
+            let (group_id, member_agent_id, inviter_agent_id) = match &event {
                 NamedGroupMetadataEvent::MemberAdded {
-                    group_id, agent_id, ..
-                } => (group_id.clone(), agent_id.clone()),
+                    group_id,
+                    agent_id,
+                    actor,
+                    ..
+                } => (group_id.clone(), agent_id.clone(), actor.clone()),
                 _ => {
                     tracing::warn!("ignoring non-MemberAdded join-result response");
                     return;
@@ -17833,23 +17845,19 @@ async fn handle_join_result_message(
                 return;
             }
             let sender_hex = hex::encode(sender.as_bytes());
-            let creator_hex = {
+            let group_exists = {
                 let groups = state.named_groups.read().await;
-                groups
-                    .get(&group_id)
-                    .or_else(|| {
-                        groups
-                            .values()
-                            .find(|info| info.stable_group_id() == group_id)
-                    })
-                    .map(|info| hex::encode(info.creator.as_bytes()))
+                groups.get(&group_id).is_some()
+                    || groups
+                        .values()
+                        .any(|info| info.stable_group_id() == group_id)
             };
-            let Some(creator_hex) = creator_hex else {
+            if !group_exists {
                 tracing::warn!(group_id = %LogHexId::group(&group_id), "ignoring join-result for unknown local group");
                 return;
-            };
-            if sender_hex != creator_hex {
-                tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), creator = %LogHexId::agent(&creator_hex), "ignoring join-result from non-creator");
+            }
+            if sender_hex != inviter_agent_id {
+                tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), inviter = %LogHexId::agent(&inviter_agent_id), "ignoring join-result from non-inviter");
                 return;
             }
             apply_named_group_metadata_event(state, event, *sender, true).await;

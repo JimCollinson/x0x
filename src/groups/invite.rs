@@ -202,6 +202,69 @@ impl SignedInvite {
         !self.signature.is_empty()
     }
 
+    /// Derive the genesis creator from the invite's embedded base-state
+    /// roster snapshot.
+    ///
+    /// `inviter` is unsigned routing metadata. Current invite-join handling must
+    /// not treat it as creator provenance; the creator is the initial seeded
+    /// roster entry (`added_by == None`) from the authority's base state.
+    /// Pending/ban-placeholder records can also have no `added_by`, so prefer
+    /// the entry whose `joined_at` matches the authority's `group_created_at`
+    /// when that timestamp is present, then fall back to the earliest such
+    /// base-state entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the invite has no base roster snapshot, no seeded
+    /// base-state member entry, or the derived member id is not a 32-byte hex
+    /// agent id.
+    pub fn creator_agent_id_from_base_state(&self) -> Result<String, String> {
+        let base_members = self.base_members_v2.as_ref().ok_or_else(|| {
+            "invite missing base member snapshot; cannot derive creator provenance".to_string()
+        })?;
+
+        let mut candidates: Vec<_> = base_members
+            .iter()
+            .filter(|(agent_id, member)| {
+                member.added_by.is_none() && member.agent_id.eq_ignore_ascii_case(agent_id)
+            })
+            .collect();
+
+        if let Some(created_at) = self.group_created_at {
+            let created_at_candidates: Vec<_> = candidates
+                .iter()
+                .copied()
+                .filter(|(_, member)| member.joined_at == created_at)
+                .collect();
+            if !created_at_candidates.is_empty() {
+                candidates = created_at_candidates;
+            }
+        }
+
+        let (creator_hex, _) = candidates
+            .into_iter()
+            .min_by(|(left_id, left), (right_id, right)| {
+                left.joined_at
+                    .cmp(&right.joined_at)
+                    .then_with(|| left.updated_at.cmp(&right.updated_at))
+                    .then_with(|| left_id.cmp(right_id))
+            })
+            .ok_or_else(|| {
+                "invite base member snapshot has no seeded creator provenance".to_string()
+            })?;
+
+        let creator_bytes =
+            hex::decode(creator_hex).map_err(|e| format!("invalid base-state creator hex: {e}"))?;
+        if creator_bytes.len() != crate::identity::PEER_ID_LENGTH {
+            return Err(format!(
+                "invalid base-state creator length: expected 32 bytes, got {}",
+                creator_bytes.len()
+            ));
+        }
+
+        Ok(creator_hex.to_string())
+    }
+
     /// Encode this invite as a shareable link.
     ///
     /// Format: `x0x://invite/<base64url(json)>`
@@ -365,6 +428,75 @@ mod tests {
         assert_eq!(invite.base_members_v2, restored.base_members_v2);
         assert_eq!(invite.base_prev_state_hash, restored.base_prev_state_hash);
         assert_eq!(invite.secure_plane, restored.secure_plane);
+    }
+
+    #[test]
+    fn creator_provenance_comes_from_base_state_not_inviter() {
+        let creator = agent(1);
+        let inviter = agent(2);
+        let mut info =
+            crate::groups::GroupInfo::new("T".to_string(), String::new(), creator, "aa".repeat(16));
+        let creator_hex = hex::encode(creator.as_bytes());
+        let inviter_hex = hex::encode(inviter.as_bytes());
+        info.add_member(
+            inviter_hex.clone(),
+            crate::groups::GroupRole::Admin,
+            Some(creator_hex.clone()),
+            None,
+        );
+
+        let mut invite =
+            SignedInvite::new(info.mls_group_id.clone(), info.name.clone(), &inviter, 0);
+        invite.group_created_at = Some(info.created_at);
+        invite.base_members_v2 = Some(info.members_v2.clone());
+
+        assert_eq!(invite.inviter, inviter_hex);
+        assert_eq!(
+            invite
+                .creator_agent_id_from_base_state()
+                .expect("derive creator from base roster"),
+            creator_hex
+        );
+    }
+
+    #[test]
+    fn creator_provenance_survives_creator_role_changes() {
+        let creator = agent(1);
+        let inviter = agent(2);
+        let mut info =
+            crate::groups::GroupInfo::new("T".to_string(), String::new(), creator, "aa".repeat(16));
+        let creator_hex = hex::encode(creator.as_bytes());
+        let inviter_hex = hex::encode(inviter.as_bytes());
+        info.add_member(
+            inviter_hex,
+            crate::groups::GroupRole::Admin,
+            Some(creator_hex.clone()),
+            None,
+        );
+        info.set_member_role(&creator_hex, crate::groups::GroupRole::Member);
+
+        let mut invite =
+            SignedInvite::new(info.mls_group_id.clone(), info.name.clone(), &inviter, 0);
+        invite.group_created_at = Some(info.created_at);
+        invite.base_members_v2 = Some(info.members_v2.clone());
+
+        assert_eq!(
+            invite
+                .creator_agent_id_from_base_state()
+                .expect("creator provenance is history, not authority"),
+            creator_hex
+        );
+    }
+
+    #[test]
+    fn creator_provenance_does_not_fall_back_to_unsigned_inviter() {
+        let inviter = agent(2);
+        let invite = SignedInvite::new("aa".repeat(16), "T".to_string(), &inviter, 0);
+
+        assert_eq!(
+            invite.creator_agent_id_from_base_state().unwrap_err(),
+            "invite missing base member snapshot; cannot derive creator provenance"
+        );
     }
 
     #[test]

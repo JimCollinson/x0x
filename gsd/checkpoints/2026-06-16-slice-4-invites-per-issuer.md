@@ -186,3 +186,76 @@ Implementation and local verification are complete, and PR #5 internal CI arbite
 ## Recommended next step
 
 Remediate the state-hash/roster coherence issue: do not persist an active joiner in non-TreeKEM `members_v2` while retaining the pre-join base `state_hash`. Reassess the join-result sender check (`MemberAdded.actor` versus expected invite inviter) and explicitly document/decide legacy invite behavior. Then rerun mandatory checks, targeted tests, PR #5 arbiter, code review, verifier, adversarial, and Craft Review.
+
+---
+
+## Follow-up remediation — coherent stubs + rejoin REST view
+
+- Date: 2026-06-16
+- Feature branch/head: `feat/adr-0016-phase-1-authority-alignment` @ `67bda7513634a534991aaf7d96e4087c9be9e92b`
+- Status: **Blocked — repeat code review returned MEDIUM issues; PR #5 not yet green-of-record**
+
+### Additional commits
+
+- `70db9af7cc1e1253358aaa360809fac58ee7e76a` — `fix(adr-0016-phase-1): keep invite join stubs coherent`
+  - Modern non-TreeKEM invite stubs with `base_state_hash` stay exactly at the invite authority frontier.
+  - Missing joiners are not inserted as active local members before the inviter-authored `MemberAdded` commit.
+  - Regression strengthened for pre-commit exclusion, post-apply convergence, and state-hash/roster coherence.
+- `67bda7513634a534991aaf7d96e4087c9be9e92b` — `fix(adr-0016-phase-1): refresh invite rejoin display metadata`
+  - Fixes the real-daemon `named_group_rejoin_after_leave` regression without reintroducing active local add under a base hash.
+  - When the invite authority base already contains the local joiner, only non-committed display/key-package metadata is refreshed for the local REST view; role/state and `state_hash` remain at the base frontier.
+
+### Local verification evidence after `67bda75`
+
+Mandatory Rust order:
+
+- `cargo fmt --all` — PASS
+- `cargo clippy --all-features --all-targets -- -D warnings` — PASS
+- `cargo check --workspace --all-targets` — PASS
+
+Targeted checks:
+
+- `cargo nextest run --all-features --all-targets -E 'test(non_treekem_invite_stub_refreshes_existing_joiner_display_without_rehash) or test(non_treekem_admin_invite_joiner_validates_member_added_state_chain) or test(treekem_invite_stub_matches_authority_base_hash)'` — PASS, 3/3
+- `cargo nextest run --all-features --test invite_authority` — PASS, 3/3
+- `cargo nextest run --all-features -E 'test(invite) & !binary(named_group_join_metadata_event)'` — PASS, 23/23
+- `cargo nextest run --all-features --test named_group_integration --run-ignored ignored-only -E 'test(named_group_rejoin_after_leave)'` — PASS, 1/1
+
+Additional attempted local check:
+
+- `cargo nextest run --all-features --test named_group_integration --run-ignored ignored-only` — FAIL before completing due known daemon-startup health-timeout:
+  - `named_group_creator_delete_propagates_to_peer`
+  - `x0xd pair-alice-52254 did not become healthy within 90s`
+- Single-test rerun of that timed-out test also failed with the same startup signature:
+  - `x0xd pair-alice-54775 did not become healthy within 90s`
+- This was not used as pass evidence.
+
+### PR #5 CI status at checkpoint
+
+Head `67bda7513634a534991aaf7d96e4087c9be9e92b` was pushed to Jim's fork. At the time of this checkpoint:
+
+- `Test Suite`: run `27642281701`, job `81745156482` — FAIL with daemon-startup timeout:
+  - failing test `x0x::named_group_join_metadata_event::forged_member_joined_admin_role_or_secret_is_rejected`
+  - verbatim line: `x0xd pair-alice-32496 did not become healthy within 90s`
+  - summary: `1747/1752 tests run: 1746 passed (1 slow), 1 failed, 161 skipped`
+- `Property Tests` — PASS
+- `Format Check`, `Clippy Lint`, `Coverage Gate`, `Documentation`, `API + GUI Parity Gate`, `API Coverage Guard`, `Cargo Audit`, `Panic Scanner`, release metadata, and completed build jobs — PASS
+- `Multi-Agent Integration` and `Build windows-x64` were still pending when this checkpoint was recorded.
+
+No CI carve-out determination is final yet because all jobs had not completed.
+
+### Repeat code review after `67bda75`
+
+Reviewer/tool: `codereviewer` subagent.
+
+Result: `issues_found`.
+
+Findings:
+
+- Prior adversarial HIGH appears remediated. Reviewer found no evidence that `67bda75` grants active membership to a missing non-TreeKEM joiner or breaks state-chain hash coherence.
+- MEDIUM: expected-inviter check still compares join-result sender to `MemberAdded.actor`; it does not compare against an independently stored expected inviter from the original invite/poll target.
+- MEDIUM/coverage: legacy missing-base invite behavior is inconsistent in comments/code path. `invite_join_group_info` still contains a fallback branch for missing-base non-TreeKEM invites, but real `join_group_via_invite` calls `creator_agent_id_from_base_state()` first and appears to reject such invites before fallback can run. If intentional, document as compatibility decision; if not, fix.
+- PROCESS/CI: PR #5 not green at review time; do not claim CI green.
+
+### Current gate status
+
+Slice 4 remains **not Done**. Do not proceed to verifier/adversarial/Craft until the code-review issues are fixed or explicitly accepted/deferred by Jim, and until PR #5 reaches a final arbiter determination.

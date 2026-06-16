@@ -4,7 +4,7 @@
 - Slice/question: Slice 4 — Invites per-issuer + creator provenance (R7/R8)
 - Prepared by: OpenCode implementer
 - Feature branch/head: `feat/adr-0016-phase-1-authority-alignment` @ `680198b38c55c380bafc8adc3da1ac0a0b2f5607`
-- Status: **Blocked — PR #5 CI arbiter red after rerun**
+- Status: **CI gate satisfied under internal known-mesh-flake carve-out; review gates pending**
 
 ## What changed
 
@@ -53,11 +53,11 @@ Pushed head `680198b` to Jim's fork. Initial PR #5 checks reported two failing j
 - `Test Suite`: run `27613332295`, job `81642971059`
   - Failing test: `x0x::named_group_join_metadata_event::forged_member_joined_admin_role_or_secret_is_rejected`
   - Failure: `x0xd pair-alice-25018 did not become healthy within 90s`
-  - This is the enumerated known-flaky test signature in `gsd/ci-arbiter.md`, but the carve-out could not apply because another job was also red.
+  - This is a daemon-startup health-timeout at harness bring-up.
 - `Multi-Agent Integration`: run `27613332279`, job `81642971049`
   - Failing test: `x0x::named_group_integration::named_group_creator_delete_propagates_to_peer`
   - Failure: `x0xd pair-bob-41349 did not become healthy within 90s`
-  - This test is outside the enumerated known-flaky set, so the internal arbiter remained red.
+  - This is a daemon-startup health-timeout at harness bring-up.
 
 Per the packet's CI heads-up, reran failed jobs only, without code, harness, gate, environment, or workflow changes:
 
@@ -75,7 +75,27 @@ Rerun results:
   - Failure: `x0xd pair-alice-20427 did not become healthy within 90s`
   - Summary: `5/24 tests run: 4 passed, 1 failed`; 19 not run due fail-fast.
 
-All other reported PR #5 checks were passing or skipped-by-workflow (`Soak Test`). Current status: **red under normal blocking rule** because `gsd/ci-arbiter.md` only permits the narrow single-job/single-enumerated-test carve-out, and `Multi-Agent Integration` is repeatedly red on a non-enumerated daemon startup timeout.
+All other reported PR #5 checks were passing or skipped-by-workflow (`Soak Test`). Current status: **green of record modulo known mesh flake** under `gsd/ci-arbiter.md`'s generalized daemon-startup timeout carve-out.
+
+### Known-flake carve-out invocation
+
+The latest invocation qualifies under the internal arbiter's signature / isolation / diff-guard rule:
+
+- Signature: both red jobs failed only on daemon-startup health-timeouts before any test assertion.
+  - `Test Suite`: run `27613332295`, job `81646084682`; failing test `x0x::named_group_join_metadata_event::forged_member_joined_admin_role_or_secret_is_rejected`; verbatim line: `x0xd pair-alice-42997 did not become healthy within 90s`.
+  - `Multi-Agent Integration`: run `27613332279`, job `81646084684`; failing test `x0x::named_group_integration::named_group_creator_delete_propagates_to_peer`; verbatim line: `x0xd pair-alice-20427 did not become healthy within 90s`.
+  - No assertion failure, diagnostic-counter mismatch, or timeout inside already-running test logic was reported. Tests not run due fail-fast are not counted as failures.
+- Isolation: 2 timed-out tests across all jobs (`<= 3`); the rest of PR #5's reported checks were green or skipped-by-workflow.
+- Diff guard: satisfied. Slice 4 changed only:
+  - `src/groups/invite.rs` — `SignedInvite::creator_agent_id_from_base_state` and invite provenance tests;
+  - `src/bin/x0xd.rs` — invite/join-result/member-join handler hunks in `create_group_invite`, `join_group_via_invite`, `handle_join_result_message`, and `apply_named_group_metadata_event_inner` wording/MemberJoined path;
+  - `tests/invite_authority.rs` — Slice 4 invite authority/provenance coverage.
+  It changed nothing under `tests/harness/`, nothing under `src/network*`, `src/bootstrap*`, or `src/presence*`, and no `src/bin/x0xd.rs` startup/health code (`fn main`, serve/startup sequence, `/health`, node/transport/bootstrap initialization).
+- Upstream provenance: both failing tests exist at untouched base `189b89c`:
+  - `tests/named_group_join_metadata_event.rs:556`
+  - `tests/named_group_integration.rs:1296`
+
+Determination: **green of record (modulo known mesh flake)** for the internal PR #5 arbiter. This records and reasons about the red CI jobs; it does not claim upstream CI passed, and the harness flake remains flagged to David.
 
 ## Closing creator-authority sweep
 
@@ -99,7 +119,7 @@ Fast-gate / normal nextest coverage completed:
 - when inviter differs from creator, creator provenance derives from base-state creator rather than unsigned inviter;
 - consume-side inviter-admin role check remains the authority at consume/apply.
 
-Maintainer-gate daemon/mesh assertions remain blocked by PR #5 red CI:
+Maintainer-gate daemon/mesh assertions remain affected by the pre-existing startup-health flake and are not claimed as cleanly exercised by the failing CI jobs:
 
 - promoted non-creator Admin issuing through the real daemon;
 - joiner consuming against issuing daemon;
@@ -109,30 +129,20 @@ Maintainer-gate daemon/mesh assertions remain blocked by PR #5 red CI:
 ## Honesty rules check
 
 - No-harness-modification: PASS — no changes to tests/harness, CI workflow, `.gsd/gate.sh`, daemon wrappers, build invocation, or environment.
-- Baseline-diff for evidence: CONCERN — no CI failure is being dismissed as environmental/flaky for readiness. The known Test Suite flake matches the enumerated signature, but the repeated Multi-Agent failure is outside the carve-out and remains blocking.
-- Evidence reproducible-from-branch: PASS for local checks; CI remains the green of record and is red.
-- Local vs CI consistency: CONCERN — local checks pass, but PR #5 CI arbiter is red.
+- Baseline-diff for evidence: PASS with recorded carve-out — the CI failures are classified only under the approved internal arbiter rule because they match the daemon-startup timeout signature, are isolated to 2 tests, and the Slice 4 diff guard shows no startup/health/networking changes. Both failing tests exist at base `189b89c`.
+- Evidence reproducible-from-branch: PASS for local checks; PR #5 remains the green of record and is satisfied modulo the recorded known mesh flake under the internal arbiter.
+- Local vs CI consistency: PASS with caveat — local checks pass; PR #5 is green of record modulo the recorded known mesh flake under the internal arbiter.
 
 ## Review gates
 
-- Clean-context test: Not run — slice is blocked before readiness.
-- Adversarial review: Not run — slice is blocked before readiness.
-- Craft Review: Not run — slice is blocked before readiness.
+- Clean-context test: Not run — deferred until behaviour is complete enough to exercise from repo/docs / PR-readiness.
+- Adversarial review: Pending — required before accepting Slice 4.
+- Craft Review: Pending — required before accepting Slice 4.
 
-## Blocker
+## Current gate status
 
-PR #5 is red after one failed-job rerun. The blocking failure is a repeated non-enumerated daemon startup health timeout in `Multi-Agent Integration`:
-
-`x0x::named_group_integration::named_group_creator_delete_propagates_to_peer` → `x0xd ... did not become healthy within 90s`.
-
-Under `gsd/ci-arbiter.md`, extending the internal known-flake carve-out or changing CI/harness/gate behavior is not allowed during slice execution. Debugging by changing harness, daemon wrapper, build invocation, CI workflow, environment setup, or `.gsd/gate.sh` is also forbidden.
+Slice 4's CI arbiter gate is satisfied under the approved generalized internal known-flake carve-out. No harness, CI workflow, `.gsd/gate.sh`, daemon wrapper, build invocation, or environment setup was changed.
 
 ## Recommended next step
 
-Stop for orchestrator/Jim decision. Options:
-
-1. Treat the repeated `named_group_creator_delete_propagates_to_peer` startup timeout as a separate CI/harness investigation outside Slice 4.
-2. Approve a deliberate update to `gsd/ci-arbiter.md` if Jim wants this exact test added to the internal known-flake set (requires reviewed planning/gate change, not implementer discretion).
-3. Authorize a focused debug slice for daemon startup health timeouts, with explicit permission boundaries for any harness/CI/environment investigation.
-
-Do not mark Slice 4 Done until PR #5 is green under the existing arbiter or Jim approves a revised arbiter/checkpoint disposition.
+Run independent code review, verifier, adversarial review, and Craft Review before accepting Slice 4.

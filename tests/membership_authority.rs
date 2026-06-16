@@ -19,7 +19,6 @@ const MISSING_TREEKEM_KEY_PACKAGE: &str = "member is missing TreeKEM KeyPackage"
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RestError {
-    BadRequest(&'static str),
     Forbidden(&'static str),
     Conflict(&'static str),
     FailedDependency(&'static str),
@@ -163,32 +162,6 @@ fn rest_ban_member_semantics(
     next.roster_revision = next.roster_revision.saturating_add(1);
     next.ban_member(target_hex, Some(actor_hex));
     let commit = next.seal_commit(actor, 2_000).expect("admin ban seals");
-    *info = next;
-    Ok(commit)
-}
-
-fn rest_unban_member_semantics(
-    info: &mut GroupInfo,
-    actor: &AgentKeypair,
-    target_hex: &str,
-) -> Result<GroupStateCommit, RestError> {
-    let actor_hex = hex_id(actor);
-    require_admin_rest_semantics(info, &actor_hex)?;
-    if !info.is_banned(target_hex) {
-        return Err(RestError::BadRequest("member is not banned"));
-    }
-    let mut next = info.clone();
-    next.roster_revision = next.roster_revision.saturating_add(1);
-    if next.secure_plane == SecureGroupPlane::TreeKem {
-        if let Some(member) = next.members_v2.get_mut(target_hex) {
-            member.state = x0x::groups::GroupMemberState::Removed;
-            member.updated_at = 2_000;
-            member.removed_by = None;
-        }
-    } else {
-        next.unban_member(target_hex);
-    }
-    let commit = next.seal_commit(actor, 2_000).expect("admin unban seals");
     *info = next;
     Ok(commit)
 }
@@ -378,82 +351,6 @@ fn membership_authority_promoted_admin_bans_member_rest_semantics() {
 
     assert_eq!(commit.committed_by, hex_id(&admin));
     assert!(info.members_v2[&target_hex].is_banned());
-}
-
-#[test]
-fn membership_authority_ban_absent_then_unban_does_not_create_active_member() {
-    let creator = AgentKeypair::generate().unwrap();
-    let admin = AgentKeypair::generate().unwrap();
-    let absent = AgentKeypair::generate().unwrap();
-    let mut info = group_with_promoted_admin(&creator, &admin);
-    let absent_hex = hex_id(&absent);
-    let active_before = info.active_member_count();
-
-    rest_ban_member_semantics(&mut info, &admin, &absent_hex).unwrap();
-    assert!(info.is_banned(&absent_hex));
-    assert_eq!(info.members_v2[&absent_hex].role, GroupRole::Guest);
-    assert_eq!(info.active_member_count(), active_before);
-
-    let commit = rest_unban_member_semantics(&mut info, &admin, &absent_hex).unwrap();
-
-    assert_eq!(commit.committed_by, hex_id(&admin));
-    assert!(!info.is_banned(&absent_hex));
-    assert!(!info.has_active_member(&absent_hex));
-    assert!(info.members_v2[&absent_hex].is_removed());
-    assert_eq!(info.caller_role(&absent_hex), None);
-    assert_eq!(info.active_member_count(), active_before);
-}
-
-#[test]
-fn membership_authority_legacy_guest_remains_member_level_after_ban_unban() {
-    let creator = AgentKeypair::generate().unwrap();
-    let admin = AgentKeypair::generate().unwrap();
-    let member = AgentKeypair::generate().unwrap();
-    let target = AgentKeypair::generate().unwrap();
-    let mut info = group_with_admin_member_and_target(&creator, &admin, &member, &target);
-    let target_hex = hex_id(&target);
-    info.set_member_role(&target_hex, GroupRole::Guest);
-
-    assert!(info.has_active_member(&target_hex));
-    assert_eq!(info.caller_role(&target_hex), Some(GroupRole::Guest));
-    assert!(!info
-        .caller_role(&target_hex)
-        .is_some_and(|role| role.at_least(GroupRole::Admin)));
-
-    rest_ban_member_semantics(&mut info, &admin, &target_hex).unwrap();
-    rest_unban_member_semantics(&mut info, &admin, &target_hex).unwrap();
-
-    assert!(info.has_active_member(&target_hex));
-    assert_eq!(info.caller_role(&target_hex), Some(GroupRole::Guest));
-    assert!(!info
-        .caller_role(&target_hex)
-        .is_some_and(|role| role.at_least(GroupRole::Admin)));
-}
-
-#[test]
-fn membership_authority_legacy_guest_without_add_metadata_remains_member_level_after_ban_unban() {
-    let creator = AgentKeypair::generate().unwrap();
-    let admin = AgentKeypair::generate().unwrap();
-    let member = AgentKeypair::generate().unwrap();
-    let target = AgentKeypair::generate().unwrap();
-    let mut info = group_with_admin_member_and_target(&creator, &admin, &member, &target);
-    let target_hex = hex_id(&target);
-    let target_member = info.members_v2.get_mut(&target_hex).unwrap();
-    target_member.role = GroupRole::Guest;
-    target_member.added_by = None;
-    target_member.display_name = None;
-    target_member.kem_public_key_b64 = None;
-    target_member.treekem_key_package_b64 = None;
-    target_member.updated_at = target_member.joined_at.saturating_add(1);
-
-    rest_ban_member_semantics(&mut info, &admin, &target_hex).unwrap();
-    rest_unban_member_semantics(&mut info, &admin, &target_hex).unwrap();
-
-    assert!(info.has_active_member(&target_hex));
-    assert_eq!(info.caller_role(&target_hex), Some(GroupRole::Guest));
-    assert!(!info
-        .caller_role(&target_hex)
-        .is_some_and(|role| role.at_least(GroupRole::Admin)));
 }
 
 #[test]

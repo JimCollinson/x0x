@@ -823,18 +823,11 @@ impl GroupInfo {
     /// Mark a member as Banned.
     pub fn ban_member(&mut self, agent_id_hex: &str, banned_by: Option<String>) {
         let now = now_millis();
-        let creator_hex = hex::encode(self.creator.as_bytes());
         self.members_v2
             .entry(agent_id_hex.to_string())
             .and_modify(|m| {
-                let was_never_member_tombstone =
-                    Self::is_never_member_ban_tombstone(m, &creator_hex);
                 m.state = GroupMemberState::Banned;
-                m.updated_at = if was_never_member_tombstone {
-                    m.joined_at
-                } else {
-                    now.max(m.joined_at.saturating_add(1))
-                };
+                m.updated_at = now;
                 m.removed_by = banned_by.clone();
             })
             .or_insert_with(|| GroupMember {
@@ -852,32 +845,11 @@ impl GroupInfo {
             });
     }
 
-    fn is_never_member_ban_tombstone(member: &GroupMember, creator_hex: &str) -> bool {
-        member.state == GroupMemberState::Banned
-            && member.role == GroupRole::Guest
-            && member.added_by.is_none()
-            && member.agent_id != creator_hex
-            && member.user_id.is_none()
-            && member.display_name.is_none()
-            && member.kem_public_key_b64.is_none()
-            && member.treekem_key_package_b64.is_none()
-            && member.joined_at == member.updated_at
-    }
-
-    /// Unban — prior members transition Banned → Active (keeps current role).
-    ///
-    /// Bans for absent agents are retained as Guest tombstones so they can
-    /// block future joins while banned. Unbanning that never-member tombstone
-    /// removes the ban without fabricating an active Guest/member.
+    /// Unban — transition Banned → Active (keeps current role).
     pub fn unban_member(&mut self, agent_id_hex: &str) {
-        let creator_hex = hex::encode(self.creator.as_bytes());
         if let Some(m) = self.members_v2.get_mut(agent_id_hex) {
             if m.state == GroupMemberState::Banned {
-                m.state = if Self::is_never_member_ban_tombstone(m, &creator_hex) {
-                    GroupMemberState::Removed
-                } else {
-                    GroupMemberState::Active
-                };
+                m.state = GroupMemberState::Active;
                 m.updated_at = now_millis();
                 m.removed_by = None;
             }
@@ -1119,60 +1091,6 @@ mod tests {
         info.unban_member(&hex_b);
         assert!(info.has_active_member(&hex_b));
         assert!(!info.is_banned(&hex_b));
-    }
-
-    #[test]
-    fn ban_absent_then_unban_does_not_create_member() {
-        let mut info = GroupInfo::new("T".into(), "".into(), agent(1), "aa".repeat(16));
-        let absent_hex = hex::encode([2u8; 32]);
-
-        info.ban_member(&absent_hex, Some("alice".into()));
-        assert!(info.is_banned(&absent_hex));
-        assert_eq!(info.members_v2[&absent_hex].role, GroupRole::Guest);
-        assert!(!info.has_active_member(&absent_hex));
-
-        info.unban_member(&absent_hex);
-        assert!(!info.is_banned(&absent_hex));
-        assert!(!info.has_active_member(&absent_hex));
-        assert!(info.members_v2[&absent_hex].is_removed());
-        assert_eq!(info.caller_role(&absent_hex), None);
-    }
-
-    #[test]
-    fn ban_unban_preserves_legitimate_guest_member() {
-        let mut info = GroupInfo::new("T".into(), "".into(), agent(1), "aa".repeat(16));
-        let guest_hex = hex::encode([2u8; 32]);
-        info.add_member(
-            guest_hex.clone(),
-            GroupRole::Member,
-            Some("alice".into()),
-            None,
-        );
-        info.set_member_role(&guest_hex, GroupRole::Guest);
-
-        info.ban_member(&guest_hex, Some("alice".into()));
-        assert!(info.is_banned(&guest_hex));
-
-        info.unban_member(&guest_hex);
-        assert!(info.has_active_member(&guest_hex));
-        assert_eq!(info.caller_role(&guest_hex), Some(GroupRole::Guest));
-    }
-
-    #[test]
-    fn ban_unban_preserves_legacy_guest_member_without_add_metadata() {
-        let mut info = GroupInfo::new("T".into(), "".into(), agent(1), "aa".repeat(16));
-        let guest_hex = hex::encode([2u8; 32]);
-        info.add_member(guest_hex.clone(), GroupRole::Member, None, None);
-        let guest = info.members_v2.get_mut(&guest_hex).unwrap();
-        guest.role = GroupRole::Guest;
-        guest.updated_at = guest.joined_at.saturating_add(1);
-
-        info.ban_member(&guest_hex, Some("alice".into()));
-        assert!(info.is_banned(&guest_hex));
-
-        info.unban_member(&guest_hex);
-        assert!(info.has_active_member(&guest_hex));
-        assert_eq!(info.caller_role(&guest_hex), Some(GroupRole::Guest));
     }
 
     #[test]

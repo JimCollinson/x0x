@@ -10649,6 +10649,93 @@ async fn create_group_invite(
         .into_response()
 }
 
+fn invite_join_group_info(
+    invite: &x0x::groups::invite::SignedInvite,
+    creator: AgentId,
+    creator_hex: &str,
+    group_id_hex: &str,
+    joiner_hex: &str,
+    display_name: Option<String>,
+    treekem_key_package_b64: Option<String>,
+) -> x0x::groups::GroupInfo {
+    let invite_is_treekem = invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
+
+    // Create group info from invite. D.4 requires the joiner to seed
+    // the same stable group identity + policy snapshot as the authority
+    // so later signed state commits can chain from the same base.
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        invite.group_name.clone(),
+        invite.group_description.clone().unwrap_or_default(),
+        creator,
+        group_id_hex.to_string(),
+        invite.policy.clone().unwrap_or_default(),
+    );
+    if let Some(group_created_at) = invite.group_created_at {
+        info.created_at = group_created_at;
+    }
+    if let Some(stable_group_id) = invite.stable_group_id.clone() {
+        info.genesis = Some(x0x::groups::GroupGenesis::with_existing_id(
+            stable_group_id,
+            creator_hex.to_string(),
+            info.created_at,
+            invite
+                .genesis_creation_nonce
+                .clone()
+                .unwrap_or_else(|| hex::encode(blake3::hash(group_id_hex.as_bytes()).as_bytes())),
+        ));
+    }
+    if let Some(secure_plane) = invite.secure_plane {
+        info.secure_plane = secure_plane;
+    }
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        info.shared_secret = None;
+    }
+    if let Some(base_secret_epoch) = invite.base_secret_epoch {
+        info.secret_epoch = base_secret_epoch;
+    }
+    if let Some(base_security_binding) = invite.base_security_binding.clone() {
+        info.security_binding = Some(base_security_binding);
+    } else if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        info.security_binding = Some(format!("treekem:epoch={}", info.secret_epoch));
+    }
+    if let Some(base_revision) = invite.base_state_revision {
+        info.state_revision = base_revision;
+        info.roster_revision = info.roster_revision.max(base_revision);
+    }
+    if let Some(base_members) = invite.base_members_v2.clone() {
+        info.members_v2 = base_members;
+    }
+    if let Some(base_state_hash) = invite.base_state_hash.clone() {
+        info.state_hash = base_state_hash;
+        info.prev_state_hash = invite.base_prev_state_hash.clone();
+    }
+
+    if !invite_is_treekem {
+        // Legacy non-TreeKEM joins still seed the joiner locally so the REST
+        // join behaves as before. When the invite carries authority base state,
+        // keep `state_hash` at that base frontier until the inviter's signed
+        // `MemberAdded` commit arrives; recomputing here would fork the
+        // joiner's chain and make the commit fail prev-hash validation.
+        info.add_member(
+            joiner_hex.to_string(),
+            x0x::groups::GroupRole::Member,
+            Some(invite.inviter.clone()),
+            display_name.clone(),
+        );
+        // Set joiner's display name if provided
+        if let Some(ref dn) = display_name {
+            info.set_display_name(joiner_hex, dn.clone());
+        }
+        if let Some(kp_b64) = treekem_key_package_b64 {
+            info.set_member_treekem_key_package(joiner_hex, kp_b64);
+        }
+    }
+    if invite.base_state_hash.is_none() {
+        info.recompute_state_hash();
+    }
+    info
+}
+
 /// POST /groups/join — join a group via invite link.
 async fn join_group_via_invite(
     State(state): State<Arc<AppState>>,
@@ -10729,67 +10816,16 @@ async fn join_group_via_invite(
                 save_mls_groups(&state).await;
             }
 
-            // Create group info from invite. D.4 requires the joiner to seed
-            // the same stable group identity + policy snapshot as the authority
-            // so later signed state commits can chain from the same base.
-            let mut info = x0x::groups::GroupInfo::with_policy(
-                invite.group_name.clone(),
-                invite.group_description.clone().unwrap_or_default(),
-                creator,
-                group_id_hex.clone(),
-                invite.policy.clone().unwrap_or_default(),
-            );
-            if let Some(group_created_at) = invite.group_created_at {
-                info.created_at = group_created_at;
-            }
-            if let Some(stable_group_id) = invite.stable_group_id.clone() {
-                info.genesis = Some(x0x::groups::GroupGenesis::with_existing_id(
-                    stable_group_id,
-                    creator_hex.clone(),
-                    info.created_at,
-                    invite.genesis_creation_nonce.clone().unwrap_or_else(|| {
-                        hex::encode(blake3::hash(group_id_hex.as_bytes()).as_bytes())
-                    }),
-                ));
-            }
             let joiner_hex = hex::encode(agent_id.as_bytes());
-            if invite_is_treekem {
-                info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
-                info.shared_secret = None;
-                info.secret_epoch = invite.base_secret_epoch.unwrap_or_default();
-                info.security_binding = invite
-                    .base_security_binding
-                    .clone()
-                    .or_else(|| Some(format!("treekem:epoch={}", info.secret_epoch)));
-                if let Some(base_revision) = invite.base_state_revision {
-                    info.state_revision = base_revision;
-                    info.roster_revision = info.roster_revision.max(base_revision);
-                }
-                if let Some(base_members) = invite.base_members_v2.clone() {
-                    info.members_v2 = base_members;
-                }
-                if let Some(base_state_hash) = invite.base_state_hash.clone() {
-                    info.state_hash = base_state_hash;
-                    info.prev_state_hash = invite.base_prev_state_hash.clone();
-                }
-            } else {
-                info.add_member(
-                    joiner_hex.clone(),
-                    x0x::groups::GroupRole::Member,
-                    Some(invite.inviter.clone()),
-                    req.display_name.clone(),
-                );
-                // Set joiner's display name if provided
-                if let Some(ref dn) = req.display_name {
-                    info.set_display_name(&joiner_hex, dn.clone());
-                }
-                if let Some(kp_b64) = treekem_key_package_b64.clone() {
-                    info.set_member_treekem_key_package(&joiner_hex, kp_b64);
-                }
-            }
-            if !invite_is_treekem || invite.base_state_hash.is_none() {
-                info.recompute_state_hash();
-            }
+            let info = invite_join_group_info(
+                &invite,
+                creator,
+                &creator_hex,
+                &group_id_hex,
+                &joiner_hex,
+                req.display_name.clone(),
+                treekem_key_package_b64.clone(),
+            );
 
             let chat_topic = info.general_chat_topic();
 
@@ -19940,6 +19976,125 @@ mod tests {
 
         assert_eq!(stub.state_hash, authority.state_hash);
         assert_eq!(stub.state_revision, authority.state_revision);
+    }
+
+    #[test]
+    fn non_treekem_admin_invite_joiner_validates_member_added_state_chain() {
+        let creator_kp = x0x::identity::AgentKeypair::generate().expect("creator keypair");
+        let inviter_kp = x0x::identity::AgentKeypair::generate().expect("inviter keypair");
+        let joiner_kp = x0x::identity::AgentKeypair::generate().expect("joiner keypair");
+        let creator_hex = hex::encode(creator_kp.agent_id().as_bytes());
+        let inviter_hex = hex::encode(inviter_kp.agent_id().as_bytes());
+        let joiner_hex = hex::encode(joiner_kp.agent_id().as_bytes());
+        let group_id = "cd".repeat(32);
+
+        let mut base = x0x::groups::GroupInfo::with_policy(
+            "public".to_string(),
+            "non-TreeKEM invite".to_string(),
+            creator_kp.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        assert_ne!(
+            base.secure_plane,
+            x0x::mls::SecureGroupPlane::TreeKem,
+            "fixture must exercise the non-TreeKEM path"
+        );
+        base.roster_revision = base.roster_revision.saturating_add(1);
+        base.add_member(
+            inviter_hex.clone(),
+            x0x::groups::GroupRole::Admin,
+            Some(creator_hex.clone()),
+            Some("inviter-admin".to_string()),
+        );
+        base.seal_commit(&creator_kp, 1_000)
+            .expect("creator promotion commit seals");
+
+        let mut invite = x0x::groups::invite::SignedInvite::new(
+            base.mls_group_id.clone(),
+            base.name.clone(),
+            &inviter_kp.agent_id(),
+            0,
+        );
+        invite.stable_group_id = Some(base.stable_group_id().to_string());
+        invite.group_created_at = Some(base.created_at);
+        invite.group_description = Some(base.description.clone());
+        invite.policy = Some(base.policy.clone());
+        invite.genesis_creation_nonce = base.genesis.as_ref().map(|g| g.creation_nonce.clone());
+        invite.base_state_revision = Some(base.state_revision);
+        invite.base_state_hash = Some(base.state_hash.clone());
+        invite.base_members_v2 = Some(base.members_v2.clone());
+        invite.base_prev_state_hash = base.prev_state_hash.clone();
+        invite.secure_plane = Some(base.secure_plane);
+        invite.base_secret_epoch = Some(base.secret_epoch);
+        invite.base_security_binding = base.security_binding.clone();
+
+        let display_name = Some("joiner".to_string());
+        let joiner_pre_commit = invite_join_group_info(
+            &invite,
+            creator_kp.agent_id(),
+            &creator_hex,
+            &group_id,
+            &joiner_hex,
+            display_name.clone(),
+            None,
+        );
+
+        let mut inviter_after = base.clone();
+        inviter_after.roster_revision = inviter_after.roster_revision.saturating_add(1);
+        inviter_after.add_member(
+            joiner_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(inviter_hex.clone()),
+            display_name.clone(),
+        );
+        let revision = inviter_after.roster_revision;
+        let member_added = inviter_after
+            .seal_commit(&inviter_kp, 2_000)
+            .expect("non-creator admin seals MemberAdded");
+
+        let apply_member_added = |current: &x0x::groups::GroupInfo| {
+            apply_stateful_event_to_group(
+                current,
+                &member_added,
+                x0x::groups::ActionKind::AdminOrHigher,
+                |next| {
+                    next.roster_revision = revision.max(next.roster_revision);
+                    next.add_member(
+                        joiner_hex.clone(),
+                        x0x::groups::GroupRole::Member,
+                        Some(inviter_hex.clone()),
+                        display_name.clone(),
+                    );
+                },
+            )
+        };
+
+        let creator_after = apply_member_added(&base)
+            .expect("creator should validate inviter-authored MemberAdded");
+        let joiner_after = apply_member_added(&joiner_pre_commit).expect(
+            "joiner should validate non-creator inviter MemberAdded against the invite base state",
+        );
+
+        for (label, info) in [
+            ("creator", &creator_after),
+            ("inviter", &inviter_after),
+            ("joiner", &joiner_after),
+        ] {
+            assert!(
+                info.has_active_member(&joiner_hex),
+                "{label} roster should contain joiner after MemberAdded"
+            );
+            assert_eq!(
+                info.caller_role(&inviter_hex),
+                Some(x0x::groups::GroupRole::Admin),
+                "{label} roster should preserve non-creator inviter Admin authority"
+            );
+        }
+        assert_eq!(creator_after.state_hash, inviter_after.state_hash);
+        assert_eq!(joiner_after.state_hash, inviter_after.state_hash);
+        assert_eq!(creator_after.state_revision, inviter_after.state_revision);
+        assert_eq!(joiner_after.state_revision, inviter_after.state_revision);
     }
 
     #[test]

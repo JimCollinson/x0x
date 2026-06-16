@@ -45,9 +45,9 @@ pub struct SignedInvite {
     /// `GroupGenesis` payload, not just the same stable group id.
     #[serde(default)]
     pub genesis_creation_nonce: Option<String>,
-    /// Authority state revision at invite creation time. TreeKEM joiners seed
-    /// their stub from this so later signed membership commits validate against
-    /// the authority's actual state-chain frontier.
+    /// Authority state revision at invite creation time. Joiners seed their
+    /// local state from this so later signed membership commits validate
+    /// against the authority's actual state-chain frontier.
     #[serde(default)]
     pub base_state_revision: Option<u64>,
     /// Authority state hash at invite creation time.

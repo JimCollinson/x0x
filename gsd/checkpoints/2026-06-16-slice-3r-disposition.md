@@ -3,7 +3,7 @@
 - Date: 2026-06-16
 - Slice/question: Slice 3R final disposition after reserved-role / active-Guest retro findings
 - Feature branch/head at start: `feat/adr-0016-phase-1-authority-alignment` @ `c7e91b2`
-- Disposition: **accepted as pre-existing/out-of-scope; revert `c7e91b2`; keep `7798350`; proceed to Slice 4 after post-revert CI is green.**
+- Disposition: **accepted as pre-existing/out-of-scope; revert `c7e91b2`; keep `7798350`; close Slice 3R under the internal known-mesh-flake arbiter carve-out; proceed to Slice 4.**
 - Supersedes: the open active-Guest blocker status in `gsd/checkpoints/2026-06-14-slice-3r-retro-remediation.md` and the failed-fix gap in `gsd/checkpoints/2026-06-16-slice-3r-active-guest-verification.md`.
 
 ## Status
@@ -14,7 +14,7 @@ Slice 3R is dispositioned as follows:
 - `c7e91b2` was a follow-up attempt to change ban/unban tombstone behavior; it failed review/CI and is being reverted rather than folded into the PR.
 - The active-`Guest` ban-tombstone behavior is accepted as pre-existing upstream behavior and out of scope for ADR-0016 Phase 1 Slice 3R.
 - Reserved `Moderator` / `Guest` signed apply remains accepted for legacy replay/convergence; current assignment remains gated at authoring.
-- Post-revert tree is byte-for-byte identical to the previously green `7798350` tree, but PR #5 is still not green at `449ac80` because the existing daemon-health test `named_group_join_metadata_event::forged_member_joined_admin_role_or_secret_is_rejected` failed twice after x0xd startup did not become healthy within 90s. Slice 4 remains blocked until PR #5 is actually green.
+- Post-revert tree is byte-for-byte identical to the previously green `7798350` tree. PR #5 has a red Rust test job at `449ac80`, but it qualifies under `gsd/ci-arbiter.md`'s internal known-flake carve-out: the only failing test is the enumerated pre-existing mesh flake `named_group_join_metadata_event::forged_member_joined_admin_role_or_secret_is_rejected`, and it failed before assertions because an `x0xd` instance did not become healthy within 90s.
 
 ## Rationale
 
@@ -44,14 +44,23 @@ The earlier over-broad wording has already been corrected in current planning no
   - `cargo nextest run --all-features --test membership_authority` — 14/14.
   - `cargo nextest run --all-features -E 'test(membership_authority_non_creator_last_admin_self_leave) or test(membership_authority_signed_role_update_apply_accepts_current_and_legacy_labels) or test(last_admin_gossip_apply_rejects_owner_demoted_to_reserved_low_roles)'` — 3/3.
 - Push evidence: pushed `449ac80` to Jim's fork; clone-local pre-push gate ran `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`, both PASS.
-- PR #5 CI at post-revert head `449ac80`: **not green yet**.
+- PR #5 CI at post-revert head `449ac80`: **green of record modulo known mesh flake** under `gsd/ci-arbiter.md` § known-flake carve-out.
   - First observed failure: run `27608164487`, job `81625359547`, `Test Suite`, `named_group_join_metadata_event::forged_member_joined_admin_role_or_secret_is_rejected`, `x0xd pair-alice-6444 did not become healthy within 90s`.
   - Failed-job rerun: same workflow run, job `81627981660`, `Test Suite`, same test, `x0xd pair-alice-23248 did not become healthy within 90s`.
+  - Latest requested rerun: same workflow run `27608164487`, job `81631116680`, `Test Suite`, same sole failure, `x0xd pair-alice-29148 did not become healthy within 90s`; summary was 1740 passed, 1 failed, 5 not run due fail-fast.
   - All other PR #5 checks reported pass; Soak Test skipped by workflow.
 
-## Current blocker
+## Known-flake carve-out determination
 
-PR #5 is red at `449ac80`; do not dispatch Slice 4 until the CI arbiter is green. Because `449ac80`'s source tree matches the previously green `7798350` tree exactly, the repeated failure is classified as the known daemon startup / mesh-health flake class, not a Slice 3R code delta. Green of record is still absent until PR #5 reports all required checks passing at the post-revert head.
+The latest invocation qualifies for the internal arbiter carve-out:
+
+- No required check is red except the Rust `Test Suite` job.
+- The only failing test is the enumerated known-flaky test: `named_group_join_metadata_event::forged_member_joined_admin_role_or_secret_is_rejected`.
+- The failure is a daemon-startup health-timeout before any test assertion: `x0xd pair-alice-29148 did not become healthy within 90s`.
+- Tests not run due fail-fast are not failures under the carve-out rule.
+- `449ac80`'s tree matches the previously green `7798350` tree: `git diff --quiet 779835028dae3324a20534f07f0402c47e6d6fe8` returned `0`.
+
+Determination: **green of record (modulo known mesh flake)** for the internal PR #5 arbiter. Slice 3R is closed. This records and reasons about the red run; it does not claim upstream CI passed, and the flake remains flagged to David as a pre-existing harness issue.
 
 ## PR-note location
 

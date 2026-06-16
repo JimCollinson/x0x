@@ -4,7 +4,7 @@
 - Slice/question: Slice 4 — Invites per-issuer + creator provenance (R7/R8)
 - Prepared by: OpenCode implementer
 - Feature branch/head: `feat/adr-0016-phase-1-authority-alignment` @ `680198b38c55c380bafc8adc3da1ac0a0b2f5607`
-- Status: **CI gate satisfied under internal known-mesh-flake carve-out; review gates pending**
+- Status: **Blocked — code review HIGH correctness risk**
 
 ## What changed
 
@@ -136,13 +136,29 @@ Maintainer-gate daemon/mesh assertions remain affected by the pre-existing start
 ## Review gates
 
 - Clean-context test: Not run — deferred until behaviour is complete enough to exercise from repo/docs / PR-readiness.
-- Adversarial review: Pending — required before accepting Slice 4.
-- Craft Review: Pending — required before accepting Slice 4.
+- Code review: `issues_found`.
+  - Reviewer/tool: `codereviewer` subagent.
+  - Commands run by reviewer:
+    - `git status --short` — clean.
+    - `git diff --name-status 449ac80..680198b` — only `src/bin/x0xd.rs`, `src/groups/invite.rs`, `tests/invite_authority.rs`.
+    - `git diff --check 449ac80..680198b` — PASS.
+    - `cargo fmt --all -- --check` — PASS.
+    - `cargo clippy --all-features --all-targets -- -D warnings` — PASS.
+    - `cargo check --workspace --all-targets` — PASS.
+    - `cargo nextest run --all-features --test invite_authority` — PASS, 3/3.
+    - `cargo nextest run --all-features -E 'test(invite)'` — local FAIL on daemon-startup timeout in `named_group_join_metadata_event::issued_invite_secret_is_recorded_on_inviter` (`x0xd pair-alice-7351 did not become healthy within 90s`).
+    - `cargo nextest run --all-features -E 'test(invite) & !binary(named_group_join_metadata_event)'` — PASS, 23/23.
+    - `cargo nextest run --all-features -E 'test(creator_provenance) or test(invite_authority)'` — PASS, 6/6.
+    - `cargo audit` — unavailable locally; PR #5 Cargo Audit PASS.
+  - HIGH finding: non-TreeKEM admin-issued invites likely do not converge for non-creator admins. `join_group_via_invite` copies `invite.base_members_v2` only for TreeKEM invites; non-TreeKEM joins seed a new local `GroupInfo`, add only the joiner, and recompute state hash. A promoted non-creator admin inviter can then be absent from the joiner's non-TreeKEM local roster, so the inviter-authored `MemberAdded` commit may be rejected as unauthorized and/or state-hash-mismatched. This appears to violate R7 for SignedPublic/GSS groups, and current tests cover issue-side helper semantics rather than this join/apply convergence path.
+- Verifier: Not run — code review blocker must be resolved first.
+- Adversarial review: Not run — code review blocker must be resolved first.
+- Craft Review: Not run — code review blocker must be resolved first.
 
 ## Current gate status
 
-Slice 4's CI arbiter gate is satisfied under the approved generalized internal known-flake carve-out. No harness, CI workflow, `.gsd/gate.sh`, daemon wrapper, build invocation, or environment setup was changed.
+Slice 4's CI arbiter gate is satisfied under the approved generalized internal known-flake carve-out, but Slice 4 is blocked by the code review HIGH finding above. No harness, CI workflow, `.gsd/gate.sh`, daemon wrapper, build invocation, or environment setup was changed.
 
 ## Recommended next step
 
-Run independent code review, verifier, adversarial review, and Craft Review before accepting Slice 4.
+Remediate the non-TreeKEM admin-issued invite convergence risk, add/adjust tests that exercise creator != inviter join/apply semantics for non-TreeKEM where possible, rerun mandatory Rust checks and targeted invite checks, then repeat code review before verifier/adversarial/Craft Review.

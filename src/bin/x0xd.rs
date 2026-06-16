@@ -10659,6 +10659,7 @@ fn invite_join_group_info(
     treekem_key_package_b64: Option<String>,
 ) -> x0x::groups::GroupInfo {
     let invite_is_treekem = invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
+    let has_authority_base_state = invite.base_state_hash.is_some();
 
     // Create group info from invite. D.4 requires the joiner to seed
     // the same stable group identity + policy snapshot as the authority
@@ -10700,7 +10701,7 @@ fn invite_join_group_info(
     }
     if let Some(base_revision) = invite.base_state_revision {
         info.state_revision = base_revision;
-        info.roster_revision = info.roster_revision.max(base_revision);
+        info.roster_revision = base_revision;
     }
     if let Some(base_members) = invite.base_members_v2.clone() {
         info.members_v2 = base_members;
@@ -10710,12 +10711,12 @@ fn invite_join_group_info(
         info.prev_state_hash = invite.base_prev_state_hash.clone();
     }
 
-    if !invite_is_treekem {
-        // Legacy non-TreeKEM joins still seed the joiner locally so the REST
-        // join behaves as before. When the invite carries authority base state,
-        // keep `state_hash` at that base frontier until the inviter's signed
-        // `MemberAdded` commit arrives; recomputing here would fork the
-        // joiner's chain and make the commit fail prev-hash validation.
+    if !invite_is_treekem && !has_authority_base_state {
+        // Legacy missing-base non-TreeKEM invites predate authority snapshots,
+        // so they still seed the joiner locally and recompute below. Modern
+        // invites with a base state/hash must keep the committed roster and
+        // hash exactly at that authority frontier until the inviter's signed
+        // `MemberAdded` commit advances both together.
         info.add_member(
             joiner_hex.to_string(),
             x0x::groups::GroupRole::Member,
@@ -10730,7 +10731,7 @@ fn invite_join_group_info(
             info.set_member_treekem_key_package(joiner_hex, kp_b64);
         }
     }
-    if invite.base_state_hash.is_none() {
+    if !has_authority_base_state {
         info.recompute_state_hash();
     }
     info
@@ -10837,16 +10838,15 @@ async fn join_group_via_invite(
             save_named_groups(&state).await;
             ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
 
-            // Publish a signed MemberJoined event on the metadata topic so
-            // the inviter (and every other current member running the
-            // metadata listener) updates `members_v2` to include us. Without
-            // this, the authority's `validate_public_message` rejects every
-            // post we make under `WritePolicyViolation { MembersOnly }` —
-            // see docs/design/groups-join-roster-propagation.md.
+            // Publish a signed MemberJoined request on the metadata topic so
+            // the original inviter can validate the one-time invite and publish
+            // the authority-signed `MemberAdded` commit. Current members apply
+            // that commit, not this request, so the committed roster/state_hash
+            // advance together; see docs/design/groups-join-roster-propagation.md.
             //
-            // Failure here is logged but does not fail the join: the local
-            // join already succeeded, and the legacy chat-topic
-            // announcement below remains as a defence-in-depth signal.
+            // Failure here is logged but does not fail the local stub creation;
+            // the legacy chat-topic announcement below remains as a
+            // defence-in-depth signal.
             let signing_kp = state.agent.identity().agent_keypair();
             let now_ms = now_millis_u64();
             let member_pubkey_b64 = {
@@ -10960,10 +10960,9 @@ async fn join_group_via_invite(
             // and spawning keeps the handler responsive when the gossip
             // publish path is slow under back-pressure.
             let agent_hex = joiner_hex;
-            let display = info
-                .display_names
-                .get(&agent_hex)
-                .cloned()
+            let display = req
+                .display_name
+                .clone()
                 .unwrap_or_else(|| agent_hex[..8].to_string());
             let announcement = serde_json::json!({
                 "type": "group_event",
@@ -20039,6 +20038,15 @@ mod tests {
             display_name.clone(),
             None,
         );
+        assert_eq!(joiner_pre_commit.members_v2, base.members_v2);
+        assert_eq!(joiner_pre_commit.state_hash, base.state_hash);
+        assert_eq!(joiner_pre_commit.prev_state_hash, base.prev_state_hash);
+        assert_eq!(joiner_pre_commit.state_revision, base.state_revision);
+        assert_eq!(joiner_pre_commit.roster_revision, base.roster_revision);
+        assert!(
+            !joiner_pre_commit.members_v2.contains_key(&joiner_hex),
+            "joiner stub must not pre-commit the joiner under the authority base hash"
+        );
 
         let mut inviter_after = base.clone();
         inviter_after.roster_revision = inviter_after.roster_revision.saturating_add(1);
@@ -20076,6 +20084,15 @@ mod tests {
             "joiner should validate non-creator inviter MemberAdded against the invite base state",
         );
 
+        let assert_state_hash_coherent = |label: &str, info: &x0x::groups::GroupInfo| {
+            let mut recomputed = info.clone();
+            recomputed.recompute_state_hash();
+            assert_eq!(
+                recomputed.state_hash, info.state_hash,
+                "{label} state_hash must commit to its current roster/policy/meta/security fields"
+            );
+        };
+
         for (label, info) in [
             ("creator", &creator_after),
             ("inviter", &inviter_after),
@@ -20090,7 +20107,13 @@ mod tests {
                 Some(x0x::groups::GroupRole::Admin),
                 "{label} roster should preserve non-creator inviter Admin authority"
             );
+            assert_state_hash_coherent(label, info);
         }
+        assert_eq!(
+            member_added.roster_root,
+            x0x::groups::compute_roster_root(&joiner_after.members_v2),
+            "MemberAdded commit roster root must match the post-apply joiner roster"
+        );
         assert_eq!(creator_after.state_hash, inviter_after.state_hash);
         assert_eq!(joiner_after.state_hash, inviter_after.state_hash);
         assert_eq!(creator_after.state_revision, inviter_after.state_revision);

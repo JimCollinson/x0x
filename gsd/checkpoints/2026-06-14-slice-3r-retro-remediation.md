@@ -139,3 +139,33 @@ Add normal-gate tests for ban-absent → unban and preserve legacy replay/member
 ## Recommended next step
 
 Resume Slice 3R with the active-Guest ban/unban remediation. Do not dispatch Slice 4 until the fix is implemented, mandatory checks pass, PR #5 CI is green, and adversarial + craft confirmation pass.
+
+## Follow-up attempt — active-Guest remediation `c7e91b2` (2026-06-16)
+
+- Build commit: `c7e91b2` — `fix(adr-0016-phase-1): prevent active guest from ban tombstones`
+- Intent: implement Jim's option 2 by keeping never-member `Guest` ban tombstones from becoming active on unban, while preserving legitimate legacy active `Guest` member-level semantics.
+- Local deterministic checks before review:
+  - `cargo fmt --all` — PASS
+  - `cargo clippy --all-features --all-targets -- -D warnings` — PASS
+  - `cargo check --workspace --all-targets` — PASS
+  - `cargo nextest run --all-features --test membership_authority` — PASS, 17/17
+  - `cargo nextest run --all-features -E 'test(ban_absent) or test(legacy_guest)'` — PASS, 5/5
+  - broad filter still hit the known local macOS daemon/mesh failure in `named_group_join_metadata_event::forged_member_joined_admin_role_or_secret_is_rejected`; not used as passing readiness evidence.
+- Pushed to Jim's fork; pre-push hook passed.
+
+Result: **still blocked**.
+
+Code review and verifier both found the same blocker:
+
+- First absent ban creates `Guest`/`Banned` tombstone.
+- First unban sets it to `Removed` and updates `updated_at`.
+- Second ban sees an existing `Removed` record, no longer classifies it as a never-member tombstone, and changes timestamps.
+- Second unban then activates it as `Guest`.
+
+CI at `c7e91b2` also failed (`Test Suite` and `Multi-Agent Integration`), so it is not a green-of-record head.
+
+Required remediation before Slice 4:
+
+- Fix repeated absent ban/unban so a never-member tombstone remains non-activatable across cycles, or remove the tombstone on unban and recreate a banned tombstone on future bans.
+- Add a normal-gate repeated-cycle regression test.
+- Rerun mandatory checks, push, confirm PR #5 CI green, then rerun verifier/adversarial/craft.

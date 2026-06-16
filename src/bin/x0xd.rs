@@ -10711,6 +10711,27 @@ fn invite_join_group_info(
         info.prev_state_hash = invite.base_prev_state_hash.clone();
     }
 
+    if !invite_is_treekem && has_authority_base_state {
+        // Modern non-TreeKEM invite stubs keep the committed role/state roster
+        // exactly at the invite authority frontier. If that frontier already
+        // contains the local joiner (for example single-daemon self-rejoin via
+        // an invite minted before leaving), update only non-committed display /
+        // key-package metadata for the local REST view. Role/state stay as the
+        // authority snapshot recorded them, and `compute_roster_root` ignores
+        // these metadata fields, so the base `state_hash` remains coherent.
+        if let Some(member) = info.members_v2.get_mut(joiner_hex) {
+            if member.is_active() || member.state == x0x::groups::GroupMemberState::Pending {
+                if let Some(display_name) = display_name.clone() {
+                    member.display_name = Some(display_name);
+                }
+                if let Some(kp_b64) = treekem_key_package_b64.clone() {
+                    member.treekem_key_package_b64 = Some(kp_b64);
+                }
+                member.updated_at = now_millis_u64();
+            }
+        }
+    }
+
     if !invite_is_treekem && !has_authority_base_state {
         // Legacy missing-base non-TreeKEM invites predate authority snapshots,
         // so they still seed the joiner locally and recompute below. Modern
@@ -20118,6 +20139,78 @@ mod tests {
         assert_eq!(joiner_after.state_hash, inviter_after.state_hash);
         assert_eq!(creator_after.state_revision, inviter_after.state_revision);
         assert_eq!(joiner_after.state_revision, inviter_after.state_revision);
+    }
+
+    #[test]
+    fn non_treekem_invite_stub_refreshes_existing_joiner_display_without_rehash() {
+        let creator_kp = x0x::identity::AgentKeypair::generate().expect("creator keypair");
+        let joiner_kp = x0x::identity::AgentKeypair::generate().expect("joiner keypair");
+        let creator_hex = hex::encode(creator_kp.agent_id().as_bytes());
+        let joiner_hex = hex::encode(joiner_kp.agent_id().as_bytes());
+        let group_id = "ef".repeat(32);
+
+        let mut base = x0x::groups::GroupInfo::with_policy(
+            "public".to_string(),
+            "self rejoin invite".to_string(),
+            creator_kp.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        base.add_member(
+            joiner_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(creator_hex.clone()),
+            Some("old display".to_string()),
+        );
+        base.seal_commit(&creator_kp, 1_000)
+            .expect("base member commit seals");
+
+        let mut invite = x0x::groups::invite::SignedInvite::new(
+            base.mls_group_id.clone(),
+            base.name.clone(),
+            &creator_kp.agent_id(),
+            0,
+        );
+        invite.stable_group_id = Some(base.stable_group_id().to_string());
+        invite.group_created_at = Some(base.created_at);
+        invite.group_description = Some(base.description.clone());
+        invite.policy = Some(base.policy.clone());
+        invite.genesis_creation_nonce = base.genesis.as_ref().map(|g| g.creation_nonce.clone());
+        invite.base_state_revision = Some(base.state_revision);
+        invite.base_state_hash = Some(base.state_hash.clone());
+        invite.base_members_v2 = Some(base.members_v2.clone());
+        invite.base_prev_state_hash = base.prev_state_hash.clone();
+        invite.secure_plane = Some(base.secure_plane);
+        invite.base_secret_epoch = Some(base.secret_epoch);
+        invite.base_security_binding = base.security_binding.clone();
+
+        let stub = invite_join_group_info(
+            &invite,
+            creator_kp.agent_id(),
+            &creator_hex,
+            &group_id,
+            &joiner_hex,
+            Some("new display".to_string()),
+            None,
+        );
+
+        let joiner = stub
+            .members_v2
+            .get(&joiner_hex)
+            .expect("base-state joiner should still be present");
+        assert_eq!(joiner.state, x0x::groups::GroupMemberState::Active);
+        assert_eq!(joiner.role, x0x::groups::GroupRole::Member);
+        assert_eq!(joiner.display_name.as_deref(), Some("new display"));
+        assert_eq!(stub.state_hash, base.state_hash);
+        assert_eq!(stub.prev_state_hash, base.prev_state_hash);
+        assert_eq!(stub.state_revision, base.state_revision);
+
+        let mut recomputed = stub.clone();
+        recomputed.recompute_state_hash();
+        assert_eq!(
+            recomputed.state_hash, stub.state_hash,
+            "display-only refresh must not make the authority base hash incoherent"
+        );
     }
 
     #[test]

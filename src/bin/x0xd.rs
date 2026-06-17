@@ -8157,7 +8157,6 @@ async fn apply_named_group_metadata_event_inner(
         };
         info
     };
-    let creator_hex = hex::encode(info.creator.as_bytes());
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
         && treekem_metadata_event_requires_phase3(&event)
@@ -9196,7 +9195,10 @@ async fn apply_named_group_metadata_event_inner(
             false
         }
         NamedGroupMetadataEvent::GroupCardPublished { card, .. } => {
-            if sender_hex != creator_hex {
+            let sender_is_admin = info
+                .caller_role(&sender_hex)
+                .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
+            if !sender_is_admin {
                 return false;
             }
             if card.group_id != info.stable_group_id() {

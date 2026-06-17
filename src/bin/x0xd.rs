@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -451,9 +451,6 @@ struct AppState {
     mls_groups_path: PathBuf,
     /// Authority-signed MemberAdded results staged by an anchor for joiner polling.
     pending_join_results: RwLock<HashMap<String, PendingJoinResult>>,
-    /// Joiner-side expected inviter for pending TreeKEM join-result polls.
-    /// Keyed like `pending_join_results` by stable group id + member id.
-    expected_join_result_inviters: RwLock<HashMap<String, ExpectedJoinResultInviter>>,
     /// TreeKEM Welcome blobs staged by an anchor for pull-based delivery.
     pending_welcomes: RwLock<HashMap<String, PendingWelcome>>,
     /// In-progress pulled TreeKEM Welcome blob receives, keyed by blake3 id.
@@ -1643,7 +1640,6 @@ async fn main() -> Result<()> {
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
         pending_join_results: RwLock::new(HashMap::new()),
-        expected_join_result_inviters: RwLock::new(HashMap::new()),
         pending_welcomes: RwLock::new(HashMap::new()),
         pending_welcome_receives: RwLock::new(HashMap::new()),
         pending_welcome_waiters: RwLock::new(HashMap::new()),
@@ -10871,15 +10867,9 @@ async fn join_group_via_invite(
             };
             let stable_id_for_event = info.stable_group_id().to_string();
             if invite_is_treekem {
-                let mut expected = state.expected_join_result_inviters.write().await;
-                expected
-                    .retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
-                expected.insert(
+                record_expected_join_result_inviter(
                     join_result_key(&stable_id_for_event, &joiner_hex),
-                    ExpectedJoinResultInviter {
-                        inviter_agent_id: invite.inviter.clone(),
-                        created_at: Instant::now(),
-                    },
+                    invite.inviter.clone(),
                 );
             }
             let display_name_for_event = req.display_name.clone();
@@ -17718,6 +17708,9 @@ const JOIN_RESULT_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
 const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
+static EXPECTED_JOIN_RESULT_INVITERS: LazyLock<
+    StdMutex<HashMap<String, ExpectedJoinResultInviter>>,
+> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 const WELCOME_FETCH_RETRY_DELAYS: [Duration; 4] = [
     Duration::ZERO,
     Duration::from_secs(5),
@@ -17748,6 +17741,42 @@ fn validate_join_result_inviter(
         return Err("unexpected_actor");
     }
     Ok(())
+}
+
+fn record_expected_join_result_inviter(key: String, inviter_agent_id: String) {
+    let Ok(mut expected) = EXPECTED_JOIN_RESULT_INVITERS.lock() else {
+        tracing::warn!(
+            "expected join-result inviter map is poisoned; join-result response will be rejected"
+        );
+        return;
+    };
+    expected.retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
+    expected.insert(
+        key,
+        ExpectedJoinResultInviter {
+            inviter_agent_id,
+            created_at: Instant::now(),
+        },
+    );
+}
+
+fn expected_join_result_inviter(key: &str) -> Option<String> {
+    let Ok(mut expected) = EXPECTED_JOIN_RESULT_INVITERS.lock() else {
+        tracing::warn!(
+            "expected join-result inviter map is poisoned; rejecting join-result response"
+        );
+        return None;
+    };
+    expected.retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
+    expected
+        .get(key)
+        .map(|pending| pending.inviter_agent_id.clone())
+}
+
+fn clear_expected_join_result_inviter(key: &str) {
+    if let Ok(mut expected) = EXPECTED_JOIN_RESULT_INVITERS.lock() {
+        expected.remove(key);
+    }
 }
 
 async fn stage_join_result(
@@ -17937,14 +17966,7 @@ async fn handle_join_result_message(
                 return;
             }
             let expected_key = join_result_key(&group_id, &member_agent_id);
-            let expected_inviter = {
-                let mut expected = state.expected_join_result_inviters.write().await;
-                expected
-                    .retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
-                expected
-                    .get(&expected_key)
-                    .map(|pending| pending.inviter_agent_id.clone())
-            };
+            let expected_inviter = expected_join_result_inviter(&expected_key);
             if let Err(reason) = validate_join_result_inviter(
                 expected_inviter.as_deref(),
                 &sender_hex,
@@ -17961,11 +17983,7 @@ async fn handle_join_result_message(
                 return;
             }
             if apply_named_group_metadata_event(state, event, *sender, true).await {
-                state
-                    .expected_join_result_inviters
-                    .write()
-                    .await
-                    .remove(&expected_key);
+                clear_expected_join_result_inviter(&expected_key);
             }
         }
     }
@@ -17981,17 +17999,7 @@ async fn poll_join_result_until_treekem_ready(
     let deadline = tokio::time::Instant::now() + JOIN_RESULT_POLL_TIMEOUT;
     let expected_key = join_result_key(&event_group_id, &member_agent_id);
     let inviter_hex = hex::encode(inviter.as_bytes());
-    {
-        let mut expected = state.expected_join_result_inviters.write().await;
-        expected.retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
-        expected.insert(
-            expected_key.clone(),
-            ExpectedJoinResultInviter {
-                inviter_agent_id: inviter_hex,
-                created_at: Instant::now(),
-            },
-        );
-    }
+    record_expected_join_result_inviter(expected_key.clone(), inviter_hex);
     let mut timed_out = true;
     while tokio::time::Instant::now() < deadline {
         if state.treekem_groups.read().await.contains_key(&group_id) {
@@ -18049,11 +18057,7 @@ async fn poll_join_result_until_treekem_ready(
         }
         tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
     }
-    state
-        .expected_join_result_inviters
-        .write()
-        .await
-        .remove(&expected_key);
+    clear_expected_join_result_inviter(&expected_key);
     if timed_out {
         tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "timed out polling anchor for TreeKEM join result");
     }

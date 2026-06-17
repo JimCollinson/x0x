@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -451,6 +451,9 @@ struct AppState {
     mls_groups_path: PathBuf,
     /// Authority-signed MemberAdded results staged by an anchor for joiner polling.
     pending_join_results: RwLock<HashMap<String, PendingJoinResult>>,
+    /// Expected inviter for a pending TreeKEM join-result response, keyed by
+    /// stable group id + joining member id. Transient process-local state.
+    expected_join_result_inviters: StdMutex<HashMap<String, ExpectedJoinResultInviter>>,
     /// TreeKEM Welcome blobs staged by an anchor for pull-based delivery.
     pending_welcomes: RwLock<HashMap<String, PendingWelcome>>,
     /// In-progress pulled TreeKEM Welcome blob receives, keyed by blake3 id.
@@ -1640,6 +1643,7 @@ async fn main() -> Result<()> {
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
         pending_join_results: RwLock::new(HashMap::new()),
+        expected_join_result_inviters: StdMutex::new(HashMap::new()),
         pending_welcomes: RwLock::new(HashMap::new()),
         pending_welcome_receives: RwLock::new(HashMap::new()),
         pending_welcome_waiters: RwLock::new(HashMap::new()),
@@ -10870,6 +10874,7 @@ async fn join_group_via_invite(
             let stable_id_for_event = info.stable_group_id().to_string();
             if invite_is_treekem {
                 record_expected_join_result_inviter(
+                    state.as_ref(),
                     join_result_key(&stable_id_for_event, &joiner_hex),
                     invite.inviter.clone(),
                 );
@@ -17710,9 +17715,6 @@ const JOIN_RESULT_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
 const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
-static EXPECTED_JOIN_RESULT_INVITERS: LazyLock<
-    StdMutex<HashMap<String, ExpectedJoinResultInviter>>,
-> = LazyLock::new(|| StdMutex::new(HashMap::new()));
 const WELCOME_FETCH_RETRY_DELAYS: [Duration; 4] = [
     Duration::ZERO,
     Duration::from_secs(5),
@@ -17745,8 +17747,8 @@ fn validate_join_result_inviter(
     Ok(())
 }
 
-fn record_expected_join_result_inviter(key: String, inviter_agent_id: String) {
-    let Ok(mut expected) = EXPECTED_JOIN_RESULT_INVITERS.lock() else {
+fn record_expected_join_result_inviter(state: &AppState, key: String, inviter_agent_id: String) {
+    let Ok(mut expected) = state.expected_join_result_inviters.lock() else {
         tracing::warn!(
             "expected join-result inviter map is poisoned; join-result response will be rejected"
         );
@@ -17762,8 +17764,8 @@ fn record_expected_join_result_inviter(key: String, inviter_agent_id: String) {
     );
 }
 
-fn expected_join_result_inviter(key: &str) -> Option<String> {
-    let Ok(mut expected) = EXPECTED_JOIN_RESULT_INVITERS.lock() else {
+fn expected_join_result_inviter(state: &AppState, key: &str) -> Option<String> {
+    let Ok(mut expected) = state.expected_join_result_inviters.lock() else {
         tracing::warn!(
             "expected join-result inviter map is poisoned; rejecting join-result response"
         );
@@ -17775,8 +17777,8 @@ fn expected_join_result_inviter(key: &str) -> Option<String> {
         .map(|pending| pending.inviter_agent_id.clone())
 }
 
-fn clear_expected_join_result_inviter(key: &str) {
-    if let Ok(mut expected) = EXPECTED_JOIN_RESULT_INVITERS.lock() {
+fn clear_expected_join_result_inviter(state: &AppState, key: &str) {
+    if let Ok(mut expected) = state.expected_join_result_inviters.lock() {
         expected.remove(key);
     }
 }
@@ -17968,7 +17970,7 @@ async fn handle_join_result_message(
                 return;
             }
             let expected_key = join_result_key(&group_id, &member_agent_id);
-            let expected_inviter = expected_join_result_inviter(&expected_key);
+            let expected_inviter = expected_join_result_inviter(state.as_ref(), &expected_key);
             if let Err(reason) = validate_join_result_inviter(
                 expected_inviter.as_deref(),
                 &sender_hex,
@@ -17985,7 +17987,7 @@ async fn handle_join_result_message(
                 return;
             }
             if apply_named_group_metadata_event(state, event, *sender, true).await {
-                clear_expected_join_result_inviter(&expected_key);
+                clear_expected_join_result_inviter(state.as_ref(), &expected_key);
             }
         }
     }
@@ -18001,7 +18003,7 @@ async fn poll_join_result_until_treekem_ready(
     let deadline = tokio::time::Instant::now() + JOIN_RESULT_POLL_TIMEOUT;
     let expected_key = join_result_key(&event_group_id, &member_agent_id);
     let inviter_hex = hex::encode(inviter.as_bytes());
-    record_expected_join_result_inviter(expected_key.clone(), inviter_hex);
+    record_expected_join_result_inviter(state.as_ref(), expected_key.clone(), inviter_hex);
     let mut timed_out = true;
     while tokio::time::Instant::now() < deadline {
         if state.treekem_groups.read().await.contains_key(&group_id) {
@@ -18059,7 +18061,7 @@ async fn poll_join_result_until_treekem_ready(
         }
         tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
     }
-    clear_expected_join_result_inviter(&expected_key);
+    clear_expected_join_result_inviter(state.as_ref(), &expected_key);
     if timed_out {
         tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "timed out polling anchor for TreeKEM join result");
     }

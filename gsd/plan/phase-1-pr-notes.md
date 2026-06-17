@@ -17,3 +17,15 @@ Security framing: every path to trigger this requires admin authority; the place
 ## Creator provenance
 
 Creator provenance is best-effort historical, derived from the base-state snapshot; it is not authority-bearing and is not a tamper-evident guarantee.
+
+## Discovery receive-path scope clarification
+
+The known-local-group `GroupCardPublished` metadata-apply path now enforces that the sender is an active Admin before updating the local discovery card cache.
+
+The global discovery listener, directory shard listener, and ListedToContacts direct-card listener are a different surface: best-effort signed-hint / key-possession discovery caches. They verify the card signature (and privacy placement) but do **not** check the card signer against the receiver's current group roster.
+
+For known local groups, these pre-existing David C.2/D.3 discovery receive paths can cache or override a signed discovery listing without confirming the signer is currently an active Admin. This is cosmetic discovery cache state only, not committed group state, and is flagged to David as a pre-existing observation. Slice 4 intentionally does not harden those discovery receive paths.
+
+## Slice 4 daemon coverage scope
+
+The real three-daemon non-creator-admin invite proof now has both `public_open` and `private_secure` variants in `tests/named_group_join_metadata_event.rs`. The `public_open` variant covers non-TreeKEM convergence; the `private_secure` variant is the TreeKEM/expected-inviter join-result proof. Local execution attempts on macOS still hit the known daemon-startup timeout before assertions; keep the CI/startup-timeout carve-out caveat visible in readiness handoff.

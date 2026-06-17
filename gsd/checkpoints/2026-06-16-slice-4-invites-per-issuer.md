@@ -321,3 +321,62 @@ Focused checks:
 ### Current gate status
 
 The remediation implementation is locally committed. The new head has not been pushed, so PR #5 CI is not the green of record for this head yet. Next orchestrator action should be push-to-fork/CI, then repeat verifier/adversarial/Craft gates as required.
+
+---
+
+## Remaining remediation delta — discovery scope + TreeKEM e2e
+
+- Date: 2026-06-17
+- Feature branch/head: `feat/adr-0016-phase-1-authority-alignment` @ `9901c9c2a4834ddf20065bd9cfab1d2730838b9d`
+- Planning branch/head before this checkpoint update: `gsd/adr-0016-planning` @ `aea64953ff8f776aa43b44ae0a9f71a05844ef80`
+- Status: **implemented locally; not pushed; CI/review gates still required on the new head**
+
+### Additional commit
+
+- `9901c9c2a4834ddf20065bd9cfab1d2730838b9d` — `test(adr-0016-phase-1): add TreeKEM admin invite e2e`
+  - Refactors the existing real three-daemon non-creator-admin invite proof through a preset-aware helper.
+  - Keeps the `public_open` / non-TreeKEM e2e coverage.
+  - Adds a `private_secure` TreeKEM variant that exercises non-creator Admin invite issue, expected-inviter join-result / Welcome routing, creator-provenance-vs-inviter split, and final state/roster/security-binding convergence across creator, Admin, and joiner.
+
+### Item 1b — discovery claim scoped and flagged to David
+
+- Confirmed scope: the known-local-group `GroupCardPublished` metadata-apply path now enforces active Admin authority before accepting the card into the receiver's local cache (`4287904`).
+- Correction to prior over-broad wording: the global discovery listener, directory shard listener, and ListedToContacts direct-card listener are best-effort signed-hint / key-possession discovery caches, not current group-admin authority checks.
+- For known local groups, these pre-existing David C.2/D.3 discovery receive paths can cache or override a signed discovery listing without confirming the signer is currently an active Admin. This is cosmetic discovery cache state only, not committed group state.
+- Disposition: flag to David as a pre-existing observation. Slice 4 intentionally does **not** harden the discovery receive paths.
+- Scope guard satisfied: no edits to the global discovery, shard discovery, or ListedToContacts receive logic; no edits to `src/groups/directory.rs`.
+
+### Local verification evidence after `9901c9c`
+
+Mandatory Rust order after Rust test changes:
+
+- `cargo fmt --all` — PASS.
+- `cargo clippy --all-features --all-targets -- -D warnings` — PASS.
+- `cargo check --workspace --all-targets` — PASS.
+
+Focused checks:
+
+- `cargo nextest run --all-features --test invite_authority` — PASS, 3/3.
+- `cargo nextest run --all-features --all-targets -E 'test(join_result_requires_stored_expected_inviter) or test(treekem_invite_stub_matches_authority_base_hash)'` — PASS, 2/2.
+- `cargo nextest run --all-features --test named_group_join_metadata_event -E 'test(non_creator_admin_invite_e2e_converges_through_real_daemons) or test(non_creator_admin_private_secure_invite_e2e_uses_expected_inviter_join_result)'` — FAIL before assertions with daemon startup health-timeout: `x0xd test-alice-12532 did not become healthy within 90s`; second selected test was not run due fail-fast.
+- `cargo nextest run --all-features --test named_group_join_metadata_event -E 'test(non_creator_admin_private_secure_invite_e2e_uses_expected_inviter_join_result)'` — FAIL before assertions with daemon startup health-timeout: `x0xd test-alice-37643 did not become healthy within 90s`.
+
+The e2e failures match the known startup-timeout class and are not assertion failures. They are recorded as attempted evidence, not a clean local functional pass.
+
+### Review gate placeholders for rerun
+
+- Verifier: **Not rerun after `9901c9c`**. The committed artifact `gsd/checkpoints/2026-06-17-slice-4-grounded-remediation-verification-9568470.md` verifies the previous `9568470` head only; rerun verifier on the new head after orchestrator push/CI.
+- Adversarial review: **Not run after `9901c9c`**; required before marking Slice 4 Done unless Jim explicitly waives or defers.
+- Craft Review: **Not run after `9901c9c`**; required before marking Slice 4 Done unless Jim explicitly waives or defers.
+- Clean-context test: still deferred until PR-readiness / behaviour is exerciseable from repo/docs.
+
+### Honesty / scope
+
+- No changes to `tests/harness/**`, CI workflows, `.gsd/gate.sh`, daemon wrappers, build invocation, or environment setup.
+- No serde role names, role bytes, hashing, signing, commit format, storage format, wire format, `roster_root`, or `state_hash` computation changes.
+- No discovery receive-path hardening was performed; only planning/spec/PR-note wording scopes the claim and flags the observation.
+- No PR opened and no push performed.
+
+### Current gate status
+
+The remaining remediation delta is locally implemented and the verifier artifact from the prior head is now committed in planning. The build head is ahead of the fork by one commit and has not been pushed, so PR #5 CI is not the green of record for `9901c9c`. Slice 4 should remain **not Done** until orchestrator push/CI and rerun verifier/adversarial/Craft gates complete on the new head.

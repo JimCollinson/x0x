@@ -52,13 +52,13 @@ where
     }
 }
 
-async fn create_public_open_group(d: &AgentInstance, name: &str) -> String {
+async fn create_group_with_preset(d: &AgentInstance, name: &str, preset: &str) -> String {
     let resp: Value = authed_client(d)
         .post(d.url("/groups"))
         .json(&serde_json::json!({
             "name": name,
             "description": "join-metadata-event test",
-            "preset": "public_open",
+            "preset": preset,
         }))
         .send()
         .await
@@ -68,6 +68,10 @@ async fn create_public_open_group(d: &AgentInstance, name: &str) -> String {
         .expect("create group json");
     assert_eq!(resp["ok"], true, "create group response: {resp:?}");
     resp["group_id"].as_str().expect("group_id").to_string()
+}
+
+async fn create_public_open_group(d: &AgentInstance, name: &str) -> String {
+    create_group_with_preset(d, name, "public_open").await
 }
 
 async fn create_invite(d: &AgentInstance, group_id: &str) -> String {
@@ -745,23 +749,41 @@ async fn issued_invite_secret_is_recorded_on_inviter() {
         .await;
 }
 
-/// ADR-0016 Slice 4 daemon proof: a promoted, non-creator Admin issues an
-/// invite through the real REST handler, a separate daemon consumes it through
-/// `POST /groups/join`, and the resulting admin-authored `MemberAdded` commit
-/// converges across creator, admin, and joiner.
-#[tokio::test]
-async fn non_creator_admin_invite_e2e_converges_through_real_daemons() {
+async fn non_creator_admin_invite_e2e_converges_for_preset(
+    preset: &str,
+    group_name: &str,
+    expect_treekem: bool,
+) {
     let cluster = trio_with_extra_config("").await;
     let creator = &cluster.alice;
     let admin = &cluster.bob;
     let joiner = &cluster.charlie;
+    let join_timeout = if expect_treekem {
+        Duration::from_secs(90)
+    } else {
+        Duration::from_secs(45)
+    };
+    let final_timeout = if expect_treekem {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(60)
+    };
 
     let creator_id = creator.agent_id().await;
     let admin_id = admin.agent_id().await;
     let joiner_id = joiner.agent_id().await;
     assert_ne!(creator_id, admin_id, "fixture needs non-creator admin");
 
-    let group_id = create_public_open_group(creator, "Admin Invite E2E").await;
+    let group_id = create_group_with_preset(creator, group_name, preset).await;
+    if expect_treekem {
+        let binding = group_state_field(creator, &group_id, "security_binding")
+            .await
+            .expect("creator TreeKEM security binding after create");
+        assert!(
+            binding.starts_with("treekem:epoch="),
+            "private_secure variant must exercise TreeKEM, got {binding:?}"
+        );
+    }
     let admin_bootstrap_invite = create_invite(creator, &group_id).await;
     let admin_join = join_via_invite(admin, &admin_bootstrap_invite, "admin-before-role").await;
     assert_eq!(admin_join["ok"], true, "admin join: {admin_join:?}");
@@ -770,7 +792,7 @@ async fn non_creator_admin_invite_e2e_converges_through_real_daemons() {
         .unwrap_or(&group_id)
         .to_string();
 
-    let creator_sees_admin = wait_until(Duration::from_secs(45), || async {
+    let creator_sees_admin = wait_until(join_timeout, || async {
         list_members(creator, &group_id).await.contains(&admin_id)
     })
     .await;
@@ -781,7 +803,7 @@ async fn non_creator_admin_invite_e2e_converges_through_real_daemons() {
     let creator_hash_after_admin_join = group_state_field(creator, &group_id, "state_hash")
         .await
         .expect("creator state_hash after admin join");
-    let admin_caught_up = wait_until(Duration::from_secs(45), || async {
+    let admin_caught_up = wait_until(join_timeout, || async {
         group_state_field(admin, &admin_group_id, "state_hash")
             .await
             .as_deref()
@@ -791,7 +813,7 @@ async fn non_creator_admin_invite_e2e_converges_through_real_daemons() {
     assert!(admin_caught_up, "admin never caught up after initial join");
 
     let _ = set_member_role(creator, &group_id, &admin_id, "admin").await;
-    let role_converged = wait_until(Duration::from_secs(45), || async {
+    let role_converged = wait_until(join_timeout, || async {
         let creator_details = group_details(creator, &group_id).await;
         let admin_details = group_details(admin, &admin_group_id).await;
         let creator_hash = group_state_field(creator, &group_id, "state_hash").await;
@@ -826,7 +848,7 @@ async fn non_creator_admin_invite_e2e_converges_through_real_daemons() {
         .unwrap_or(&group_id)
         .to_string();
 
-    let converged = wait_until(Duration::from_secs(60), || async {
+    let converged = wait_until(final_timeout, || async {
         let creator_details = group_details(creator, &group_id).await;
         let admin_details = group_details(admin, &admin_group_id).await;
         let joiner_details = group_details(joiner, &joiner_group_id).await;
@@ -836,6 +858,19 @@ async fn non_creator_admin_invite_e2e_converges_through_real_daemons() {
         let creator_roster = group_state_field(creator, &group_id, "roster_root").await;
         let admin_roster = group_state_field(admin, &admin_group_id, "roster_root").await;
         let joiner_roster = group_state_field(joiner, &joiner_group_id, "roster_root").await;
+        let security_bindings_ok = if expect_treekem {
+            let creator_binding = group_state_field(creator, &group_id, "security_binding").await;
+            let admin_binding = group_state_field(admin, &admin_group_id, "security_binding").await;
+            let joiner_binding =
+                group_state_field(joiner, &joiner_group_id, "security_binding").await;
+            creator_binding
+                .as_deref()
+                .is_some_and(|binding| binding.starts_with("treekem:epoch="))
+                && creator_binding == admin_binding
+                && admin_binding == joiner_binding
+        } else {
+            true
+        };
 
         [&creator_details, &admin_details, &joiner_details]
             .iter()
@@ -849,6 +884,7 @@ async fn non_creator_admin_invite_e2e_converges_through_real_daemons() {
             && creator_roster.is_some()
             && creator_roster == admin_roster
             && admin_roster == joiner_roster
+            && security_bindings_ok
     })
     .await;
     assert!(
@@ -878,4 +914,27 @@ async fn non_creator_admin_invite_e2e_converges_through_real_daemons() {
         .delete(creator.url(&format!("/groups/{group_id}")))
         .send()
         .await;
+}
+
+/// ADR-0016 Slice 4 daemon proof: a promoted, non-creator Admin issues an
+/// invite through the real REST handler, a separate daemon consumes it through
+/// `POST /groups/join`, and the resulting admin-authored `MemberAdded` commit
+/// converges across creator, admin, and joiner.
+#[tokio::test]
+async fn non_creator_admin_invite_e2e_converges_through_real_daemons() {
+    non_creator_admin_invite_e2e_converges_for_preset("public_open", "Admin Invite E2E", false)
+        .await;
+}
+
+/// TreeKEM variant of the Slice 4 daemon proof: for a `private_secure` group,
+/// the joiner only becomes active after accepting the non-creator Admin's
+/// expected-inviter join result and Welcome.
+#[tokio::test]
+async fn non_creator_admin_private_secure_invite_e2e_uses_expected_inviter_join_result() {
+    non_creator_admin_invite_e2e_converges_for_preset(
+        "private_secure",
+        "TreeKEM Admin Invite E2E",
+        true,
+    )
+    .await;
 }

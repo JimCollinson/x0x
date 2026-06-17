@@ -927,10 +927,12 @@ async fn non_creator_admin_invite_e2e_converges_through_real_daemons() {
 }
 
 /// TreeKEM variant of the Slice 4 daemon proof: for a `private_secure` group,
-/// the joiner only becomes active after accepting the non-creator Admin's
-/// expected-inviter join result and Welcome.
+/// a non-creator Admin's invite drives the real join path to coherent
+/// TreeKEM-backed convergence. Direct expected-inviter sender validation is
+/// covered by the focused `join_result_requires_stored_expected_inviter` unit
+/// regression; this daemon test proves the secure-plane end-to-end join shape.
 #[tokio::test]
-async fn non_creator_admin_private_secure_invite_e2e_uses_expected_inviter_join_result() {
+async fn non_creator_admin_private_secure_invite_e2e_converges_through_real_daemons() {
     non_creator_admin_invite_e2e_converges_for_preset(
         "private_secure",
         "TreeKEM Admin Invite E2E",

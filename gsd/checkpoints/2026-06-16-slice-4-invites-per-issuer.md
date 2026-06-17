@@ -259,3 +259,65 @@ Findings:
 ### Current gate status
 
 Slice 4 remains **not Done**. Do not proceed to verifier/adversarial/Craft until the code-review issues are fixed or explicitly accepted/deferred by Jim, and until PR #5 reaches a final arbiter determination.
+
+---
+
+## Follow-up remediation — grounded Slice 4 pass
+
+- Date: 2026-06-17
+- Feature branch/head: `feat/adr-0016-phase-1-authority-alignment` @ `95684702f8061e42b1b16684cb37f5582dbcee7b`
+- Status: **implemented and committed locally; not pushed; CI/review gates still required on the new head**
+
+### Additional commits
+
+- `4287904ad5ad915c1d6c0b328056cbd5284eaf26` — `fix(adr-0016-phase-1): role-gate group card receipt`
+  - Replaced the `GroupCardPublished` receive-path creator check with `info.caller_role(&sender_hex)` and `role.at_least(GroupRole::Admin)`.
+  - Kept the existing `card.group_id == info.stable_group_id()` and `card.verify_signature()` checks.
+  - Discovery/cache note: if a receiver's local roster has not yet converged to show the sender as Admin, this discovery-cache receive path may transiently reject that card and later re-accept once roster convergence catches up; it is not the signed state chain.
+- `d40fb29d980ceed73903764dcf691b52d08f2691` — `refactor(adr-0016-phase-1): keep expected inviters on app state`
+  - Moved expected join-result inviter storage from the process-global `LazyLock<StdMutex<HashMap<...>>>` onto `AppState` beside pending join/welcome state.
+  - Preserved TTL pruning and clear-after-use; helper locks are synchronous and not held across `.await`.
+  - Explicitly touched `AppState` construction in `fn main` to initialize the transient map.
+- `95684702f8061e42b1b16684cb37f5582dbcee7b` — `test(adr-0016-phase-1): cover admin-issued invite e2e`
+  - Added a real three-daemon REST/handler-path test: creator creates `public_open`, non-creator member is promoted to Admin, that Admin issues an invite, a separate joiner consumes it through `POST /groups/join`, and creator/admin/joiner are asserted to converge on role, `added_by`, `state_hash`, and `roster_root`.
+  - The test also asserts observable routing/provenance split: invite `inviter` is the non-creator Admin, while group `creator` remains the historical creator.
+
+### Creator provenance / authority sweep
+
+`creator provenance is best-effort historical, derived from the base-state snapshot; it is not authority-bearing and is not a tamper-evident guarantee.`
+
+Post-Item-1 source search found no remaining creator authority path except Slice-5-deferred DELETE leave-vs-disband behavior:
+
+- API/list/detail rendering of `creator` is output/provenance only.
+- Invite join uses `creator_agent_id_from_base_state()` for creator provenance and keeps inviter/routing separate.
+- `treekem_leave_disposition` / `DELETE /groups/:id` still consult creator for leave-vs-disband semantics — explicit Slice 5 carry-note.
+- Join-request `creator_hex` remains a reserved direct-notification routing placeholder, not authority.
+- Tests use `creator` fixtures/provenance assertions.
+
+No deliberate creator-only card/discovery intent was found in the read docs/comments; ADR-0016 explicitly calls receive-path creator checks bugs to delete, and the publish path is already any-admin.
+
+### Local verification evidence after `9568470`
+
+Mandatory Rust order after Rust changes:
+
+- `cargo fmt --all` — PASS.
+- `cargo clippy --all-features --all-targets -- -D warnings` — PASS.
+- `cargo check --workspace --all-targets` — PASS.
+
+Focused checks:
+
+- `cargo nextest run --all-features --test invite_authority` — PASS, 3/3.
+- `cargo nextest run --all-features --all-targets -E 'test(non_treekem_invite_stub_refreshes_existing_joiner_display_without_rehash) or test(non_treekem_admin_invite_joiner_validates_member_added_state_chain) or test(treekem_invite_stub_matches_authority_base_hash) or test(join_result_requires_stored_expected_inviter) or test(creator_provenance_does_not_fall_back_to_unsigned_inviter)'` — PASS, 5/5.
+- New e2e attempted: `cargo nextest run --all-features --test named_group_join_metadata_event -E 'test(non_creator_admin_invite_e2e_converges_through_real_daemons)'` — FAIL before test assertions with daemon startup health-timeout (`x0xd test-alice-37390 did not become healthy within 90s`). Immediate rerun failed with the same startup signature (`x0xd test-alice-22608 did not become healthy within 90s`).
+- Non-`all-features` attempt of the new e2e also failed before assertions with the same startup signature (`x0xd test-alice-59955 did not become healthy within 90s`).
+- Existing daemon e2e comparison `cargo nextest run --test named_group_join_metadata_event -E 'test(member_joined_event_propagates_to_inviter)'` also failed before assertions with the same startup signature (`x0xd pair-alice-57129 did not become healthy within 90s`). These startup-timeouts are the packet's carve-out class and were not used as functional pass evidence.
+
+### Honesty / scope
+
+- No changes to `tests/harness/**`, CI workflows, `.gsd/gate.sh`, daemon wrappers, build invocation, or environment setup.
+- No serde role names, role bytes, hashing, signing, commit format, storage format, wire format, `roster_root`, or `state_hash` computation changes.
+- No PR opened and no push performed.
+
+### Current gate status
+
+The remediation implementation is locally committed. The new head has not been pushed, so PR #5 CI is not the green of record for this head yet. Next orchestrator action should be push-to-fork/CI, then repeat verifier/adversarial/Craft gates as required.

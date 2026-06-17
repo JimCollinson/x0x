@@ -13,3 +13,7 @@ Rationale for David: `Moderator`/`Guest` grant no admin authority because the au
 Banning an agent who is not a member inserts a `Guest`/`Banned` placeholder; unbanning reactivates an active `Guest` member-level entry. This was pre-existing upstream behavior in `GroupInfo::ban_member` (authored 2026-04, commit `ba965266`, present unchanged at base `189b89c`), not introduced by ADR-0016 Phase 1 and not changed in this PR.
 
 Security framing: every path to trigger this requires admin authority; the placeholder is member-level, not admin, has no KEM key, and never received the group secret. Under ADR-0016, Admin is root for the group, so this admin-only, keyless artifact does not add capability beyond what an admin can already do. It is flagged as a separate maintainer item if David wants to make banning a non-member a no-op.
+
+## Creator provenance
+
+Creator provenance is best-effort historical, derived from the base-state snapshot; it is not authority-bearing and is not a tamper-evident guarantee.

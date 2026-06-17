@@ -336,7 +336,8 @@ The remediation implementation is locally committed. The new head has not been p
 - `9901c9c2a4834ddf20065bd9cfab1d2730838b9d` — `test(adr-0016-phase-1): add TreeKEM admin invite e2e`
   - Refactors the existing real three-daemon non-creator-admin invite proof through a preset-aware helper.
   - Keeps the `public_open` / non-TreeKEM e2e coverage.
-  - Adds a `private_secure` TreeKEM variant that exercises non-creator Admin invite issue, expected-inviter join-result / Welcome routing, creator-provenance-vs-inviter split, and final state/roster/security-binding convergence across creator, Admin, and joiner.
+  - Adds a `private_secure` TreeKEM variant that exercises non-creator Admin invite issue, secure-plane join / Welcome handling, creator-provenance-vs-inviter split, and final state/roster/security-binding convergence across creator, Admin, and joiner.
+  - Direct expected-inviter sender/actor rejection remains covered by the focused `join_result_requires_stored_expected_inviter` unit regression; it is not overclaimed from the daemon e2e alone.
 
 ### Item 1b — discovery claim scoped and flagged to David
 
@@ -358,8 +359,15 @@ Focused checks:
 
 - `cargo nextest run --all-features --test invite_authority` — PASS, 3/3.
 - `cargo nextest run --all-features --all-targets -E 'test(join_result_requires_stored_expected_inviter) or test(treekem_invite_stub_matches_authority_base_hash)'` — PASS, 2/2.
-- `cargo nextest run --all-features --test named_group_join_metadata_event -E 'test(non_creator_admin_invite_e2e_converges_through_real_daemons) or test(non_creator_admin_private_secure_invite_e2e_uses_expected_inviter_join_result)'` — FAIL before assertions with daemon startup health-timeout: `x0xd test-alice-12532 did not become healthy within 90s`; second selected test was not run due fail-fast.
-- `cargo nextest run --all-features --test named_group_join_metadata_event -E 'test(non_creator_admin_private_secure_invite_e2e_uses_expected_inviter_join_result)'` — FAIL before assertions with daemon startup health-timeout: `x0xd test-alice-37643 did not become healthy within 90s`.
+- `cargo nextest run --all-features --test named_group_join_metadata_event -E 'test(non_creator_admin_invite_e2e_converges_through_real_daemons) or test(non_creator_admin_private_secure_invite_e2e_uses_expected_inviter_join_result)'` — FAIL before assertions with daemon startup health-timeout: `x0xd test-alice-12532 did not become healthy within 90s`; second selected test was not run due fail-fast. This command used the original over-broad TreeKEM test name before the wording/name was narrowed.
+- `cargo nextest run --all-features --test named_group_join_metadata_event -E 'test(non_creator_admin_private_secure_invite_e2e_uses_expected_inviter_join_result)'` — FAIL before assertions with daemon startup health-timeout: `x0xd test-alice-37643 did not become healthy within 90s`. This command used the original over-broad TreeKEM test name before the wording/name was narrowed.
+
+### Follow-up narrowing after code review
+
+- Date: 2026-06-17
+- Follow-up local build head: `feat/adr-0016-phase-1-authority-alignment` @ pending commit after `9901c9c2a4834ddf20065bd9cfab1d2730838b9d`
+- Code review finding: the `private_secure` e2e is meaningful but cannot uniquely prove direct `JoinResultMessage::Result` routing, because final convergence could also be satisfied by metadata gossip plus Welcome retrieval.
+- Disposition: narrowed the test comment/name and PR-note wording. The daemon e2e now claims TreeKEM secure-plane end-to-end join shape, Welcome/security-binding convergence, and creator-vs-inviter split. Direct expected-inviter sender/actor validation is explicitly attributed to the focused `join_result_requires_stored_expected_inviter` unit regression.
 
 The e2e failures match the known startup-timeout class and are not assertion failures. They are recorded as attempted evidence, not a clean local functional pass.
 

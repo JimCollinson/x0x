@@ -217,7 +217,8 @@ impl SignedInvite {
     ///
     /// Returns an error when the invite has no base roster snapshot, no seeded
     /// base-state member entry, or the derived member id is not a 32-byte hex
-    /// agent id.
+    /// agent id. Legacy/missing-base invites are rejected by the current join
+    /// path rather than falling back to unsigned `inviter` metadata.
     pub fn creator_agent_id_from_base_state(&self) -> Result<String, String> {
         let base_members = self.base_members_v2.as_ref().ok_or_else(|| {
             "invite missing base member snapshot; cannot derive creator provenance".to_string()

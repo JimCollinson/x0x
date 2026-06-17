@@ -451,6 +451,9 @@ struct AppState {
     mls_groups_path: PathBuf,
     /// Authority-signed MemberAdded results staged by an anchor for joiner polling.
     pending_join_results: RwLock<HashMap<String, PendingJoinResult>>,
+    /// Joiner-side expected inviter for pending TreeKEM join-result polls.
+    /// Keyed like `pending_join_results` by stable group id + member id.
+    expected_join_result_inviters: RwLock<HashMap<String, ExpectedJoinResultInviter>>,
     /// TreeKEM Welcome blobs staged by an anchor for pull-based delivery.
     pending_welcomes: RwLock<HashMap<String, PendingWelcome>>,
     /// In-progress pulled TreeKEM Welcome blob receives, keyed by blake3 id.
@@ -1640,6 +1643,7 @@ async fn main() -> Result<()> {
         mls_groups: RwLock::new(mls_groups),
         mls_groups_path,
         pending_join_results: RwLock::new(HashMap::new()),
+        expected_join_result_inviters: RwLock::new(HashMap::new()),
         pending_welcomes: RwLock::new(HashMap::new()),
         pending_welcome_receives: RwLock::new(HashMap::new()),
         pending_welcome_waiters: RwLock::new(HashMap::new()),
@@ -5960,6 +5964,12 @@ struct WelcomeRef {
 #[derive(Debug, Clone)]
 struct PendingJoinResult {
     event: NamedGroupMetadataEvent,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedJoinResultInviter {
+    inviter_agent_id: String,
     created_at: Instant,
 }
 
@@ -10732,27 +10742,12 @@ fn invite_join_group_info(
         }
     }
 
-    if !invite_is_treekem && !has_authority_base_state {
-        // Legacy missing-base non-TreeKEM invites predate authority snapshots,
-        // so they still seed the joiner locally and recompute below. Modern
-        // invites with a base state/hash must keep the committed roster and
-        // hash exactly at that authority frontier until the inviter's signed
-        // `MemberAdded` commit advances both together.
-        info.add_member(
-            joiner_hex.to_string(),
-            x0x::groups::GroupRole::Member,
-            Some(invite.inviter.clone()),
-            display_name.clone(),
-        );
-        // Set joiner's display name if provided
-        if let Some(ref dn) = display_name {
-            info.set_display_name(joiner_hex, dn.clone());
-        }
-        if let Some(kp_b64) = treekem_key_package_b64 {
-            info.set_member_treekem_key_package(joiner_hex, kp_b64);
-        }
-    }
     if !has_authority_base_state {
+        // The REST invite-join path rejects missing base roster snapshots before
+        // reaching this helper (`creator_agent_id_from_base_state`). This
+        // defensive recompute exists only for direct/helper construction and
+        // deliberately does not derive creator/member authority from unsigned
+        // `invite.inviter` metadata.
         info.recompute_state_hash();
     }
     info
@@ -10875,6 +10870,18 @@ async fn join_group_via_invite(
                 BASE64.encode(signing_kp.public_key().as_bytes())
             };
             let stable_id_for_event = info.stable_group_id().to_string();
+            if invite_is_treekem {
+                let mut expected = state.expected_join_result_inviters.write().await;
+                expected
+                    .retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
+                expected.insert(
+                    join_result_key(&stable_id_for_event, &joiner_hex),
+                    ExpectedJoinResultInviter {
+                        inviter_agent_id: invite.inviter.clone(),
+                        created_at: Instant::now(),
+                    },
+                );
+            }
             let display_name_for_event = req.display_name.clone();
             let canonical = canonical_member_joined_bytes(
                 &info.mls_group_id,
@@ -17726,6 +17733,23 @@ fn join_result_key(group_id: &str, member_agent_id: &str) -> String {
     format!("{group_id}:{member_agent_id}")
 }
 
+fn validate_join_result_inviter(
+    expected_inviter: Option<&str>,
+    sender_hex: &str,
+    member_added_actor: &str,
+) -> Result<(), &'static str> {
+    let Some(expected_inviter) = expected_inviter else {
+        return Err("missing_expected_inviter");
+    };
+    if sender_hex != expected_inviter {
+        return Err("unexpected_sender");
+    }
+    if member_added_actor != expected_inviter {
+        return Err("unexpected_actor");
+    }
+    Ok(())
+}
+
 async fn stage_join_result(
     state: &AppState,
     group_id: &str,
@@ -17912,11 +17936,37 @@ async fn handle_join_result_message(
                 tracing::warn!(group_id = %LogHexId::group(&group_id), "ignoring join-result for unknown local group");
                 return;
             }
-            if sender_hex != inviter_agent_id {
-                tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), inviter = %LogHexId::agent(&inviter_agent_id), "ignoring join-result from non-inviter");
+            let expected_key = join_result_key(&group_id, &member_agent_id);
+            let expected_inviter = {
+                let mut expected = state.expected_join_result_inviters.write().await;
+                expected
+                    .retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
+                expected
+                    .get(&expected_key)
+                    .map(|pending| pending.inviter_agent_id.clone())
+            };
+            if let Err(reason) = validate_join_result_inviter(
+                expected_inviter.as_deref(),
+                &sender_hex,
+                &inviter_agent_id,
+            ) {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&group_id),
+                    sender = %LogHexId::agent(&sender_hex),
+                    actor = %LogHexId::agent(&inviter_agent_id),
+                    expected_inviter = ?expected_inviter.as_deref().map(LogHexId::agent),
+                    reason,
+                    "ignoring join-result from unexpected inviter"
+                );
                 return;
             }
-            apply_named_group_metadata_event(state, event, *sender, true).await;
+            if apply_named_group_metadata_event(state, event, *sender, true).await {
+                state
+                    .expected_join_result_inviters
+                    .write()
+                    .await
+                    .remove(&expected_key);
+            }
         }
     }
 }
@@ -17929,9 +17979,24 @@ async fn poll_join_result_until_treekem_ready(
     member_agent_id: String,
 ) {
     let deadline = tokio::time::Instant::now() + JOIN_RESULT_POLL_TIMEOUT;
+    let expected_key = join_result_key(&event_group_id, &member_agent_id);
+    let inviter_hex = hex::encode(inviter.as_bytes());
+    {
+        let mut expected = state.expected_join_result_inviters.write().await;
+        expected.retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
+        expected.insert(
+            expected_key.clone(),
+            ExpectedJoinResultInviter {
+                inviter_agent_id: inviter_hex,
+                created_at: Instant::now(),
+            },
+        );
+    }
+    let mut timed_out = true;
     while tokio::time::Instant::now() < deadline {
         if state.treekem_groups.read().await.contains_key(&group_id) {
-            return;
+            timed_out = false;
+            break;
         }
         let request = JoinResultMessage::FetchRequest {
             group_id: event_group_id.clone(),
@@ -17984,7 +18049,14 @@ async fn poll_join_result_until_treekem_ready(
         }
         tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
     }
-    tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "timed out polling anchor for TreeKEM join result");
+    state
+        .expected_join_result_inviters
+        .write()
+        .await
+        .remove(&expected_key);
+    if timed_out {
+        tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "timed out polling anchor for TreeKEM join result");
+    }
 }
 
 async fn stage_treekem_welcome(
@@ -20304,6 +20376,26 @@ mod tests {
         let parsed = serde_json::from_slice::<JoinResultMessage>(&result_payload);
         assert!(parsed.is_ok(), "join-result response deserializes");
         assert!(matches!(parsed, Ok(JoinResultMessage::Result { .. })));
+    }
+
+    #[test]
+    fn join_result_requires_stored_expected_inviter() {
+        let expected = "11".repeat(32);
+        let other = "22".repeat(32);
+
+        assert_eq!(
+            validate_join_result_inviter(None, &expected, &expected).unwrap_err(),
+            "missing_expected_inviter"
+        );
+        assert_eq!(
+            validate_join_result_inviter(Some(&expected), &other, &expected).unwrap_err(),
+            "unexpected_sender"
+        );
+        assert_eq!(
+            validate_join_result_inviter(Some(&expected), &expected, &other).unwrap_err(),
+            "unexpected_actor"
+        );
+        assert!(validate_join_result_inviter(Some(&expected), &expected, &expected).is_ok());
     }
 
     #[test]

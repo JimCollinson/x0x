@@ -396,3 +396,72 @@ The e2e failures match the known startup-timeout class and are not assertion fai
 ### Current gate status
 
 The remaining remediation delta is locally implemented and the verifier artifact from the prior head is now committed in planning. The build head is ahead of the fork by one commit and has not been pushed, so PR #5 CI is not the green of record for `9901c9c`. Slice 4 should remain **not Done** until orchestrator push/CI and rerun verifier/adversarial/Craft gates complete on the new head.
+
+---
+
+## Final gate results after discovery/import scoping and TreeKEM claim narrowing
+
+- Date: 2026-06-17
+- Feature branch/head: `feat/adr-0016-phase-1-authority-alignment` @ `04a93afba2cabeb1627c7c484ad16ca9ba6fcd16`
+- Planning branch/head: `gsd/adr-0016-planning` @ `ec7e641` before this checkpoint update
+- Status: **Jim checkpoint — implementation/review goals passed; clean-context concerns and CI carve-out caveat must be acknowledged before PR/readiness**
+
+### Final build commits after `9568470`
+
+- `9901c9c2a4834ddf20065bd9cfab1d2730838b9d` — `test(adr-0016-phase-1): add TreeKEM admin invite e2e`
+- `04a93afba2cabeb1627c7c484ad16ca9ba6fcd16` — `test(adr-0016-phase-1): narrow TreeKEM invite e2e claim`
+
+### Final planning commits after `aea6495`
+
+- `080282f` — `chore(gsd): record slice 4 remediation delta`
+- `0dbe340` — `chore(gsd): narrow slice 4 TreeKEM evidence claim`
+- `ec7e641` — `chore(gsd): scope final slice 4 card surfaces`
+
+### Final CI / green-of-record
+
+PR #5 head verified as `04a93afba2cabeb1627c7c484ad16ca9ba6fcd16`.
+
+- PASS: API + GUI Parity Gate, API Coverage Guard, all build matrix jobs including Windows, Cargo Audit, Clippy Lint, Coverage Gate, Documentation, Format Check, Multi-Agent Integration, Panic Scanner, Property Tests, Validate release metadata.
+- SKIP: Soak Test.
+- FAIL accepted under Jim's live startup-timeout-only carve-out for this checkpoint:
+  - `Test Suite`: run `27722220877`, rerun job `82012649602`.
+  - Failing test: `x0x::named_group_join_metadata_event::forged_member_joined_admin_role_or_secret_is_rejected`.
+  - Verbatim failure: `x0xd pair-alice-12410 did not become healthy within 90s`.
+  - Summary: `1747/1754 tests run: 1746 passed, 1 failed, 161 skipped`.
+- Caveat: committed `gsd/ci-arbiter.md` has a stricter diff guard naming `fn main`; this checkpoint relies on Jim's live dispatch instruction that startup-timeout-only red is green-of-record and anything else red is a real signal.
+
+### Final local checks
+
+- `cargo fmt --all` — PASS.
+- `cargo clippy --all-features --all-targets -- -D warnings` — PASS.
+- `cargo check --workspace --all-targets` — PASS.
+- `cargo nextest run --all-features --test invite_authority` — PASS, 3/3.
+- `cargo nextest run --all-features --all-targets -E 'test(join_result_requires_stored_expected_inviter) or test(treekem_invite_stub_matches_authority_base_hash)'` — PASS, 2/2.
+- Clean-context additionally ran `cargo nextest run --all-features -E 'test(invite)'` and the real daemon admin-invite e2e; both failed before assertions with the known daemon-startup health-timeout class. These are recorded as attempted evidence, not clean local functional passes.
+
+### Final review gates
+
+- Code review: **passed** after the final TreeKEM evidence narrowing. No findings.
+- Verifier: **passed**.
+  - Artifact: `gsd/checkpoints/2026-06-17-slice-4-final-remediation-verification-04a93af.md`.
+  - Result: 5/5 final remediation goals verified; CI accepted only under the live startup-timeout carve-out caveat above.
+- Adversarial review: **READY**.
+  - First final pass after `04a93af` found one HIGH on `/groups/cards/import` scoping and one LOW on global discovery's unsigned legacy path.
+  - Remediation: planning/spec/checkpoint now explicitly scope `POST /groups/cards/import` as a pre-existing, user/local-initiated, out-of-Slice-4 surface that can refresh known local `GroupInfo` from an explicitly imported signed card, and state that global discovery retains a legacy unsigned-card compatibility path.
+  - Repeat adversarial result: READY; no remaining CRITICAL/HIGH/MEDIUM/LOW/NIT in focused Slice 4 scope.
+  - Caveat: same model family as verifier (`openai/gpt-5.5`), so independence is weaker than a cross-provider review.
+- Craft Review: **Pass**.
+  - No CONFORMANCE findings.
+  - One optional NIT to add an explicit supersession/final-gates note to this checkpoint; this section satisfies that recommendation.
+  - Caveat: same model family as verifier, so independence is weaker than cross-provider Craft.
+- Clean-context: **Concerns**.
+  - Source/docs were discoverable and aligned for Slice 4 claims.
+  - Concerns: exact packet invite filters and real daemon admin-invite e2e fail locally before assertions with `x0xd ... did not become healthy within 90s`; PR #5 is green only under Jim's explicit startup-timeout carve-out, not pure all-green CI; caveats live partly in planning/PR notes and must be carried into the eventual PR/handoff.
+
+### Final scope / handoff notes
+
+- Known-local-group `GroupCardPublished` metadata apply is active-Admin role-gated.
+- Global discovery, directory shard, ListedToContacts, and user-initiated `/groups/cards/import` card surfaces are pre-existing/out of Slice 4 and are flagged to David rather than hardened here.
+- Creator provenance is best-effort historical, base-state-derived, not authority-bearing and not tamper-evident.
+- Direct expected-inviter sender/actor rejection is covered by the focused unit regression; daemon e2es cover real REST join/convergence shapes but are startup-timeout affected locally.
+- Slice 5 carry-note: `DELETE /groups/:id` leave-vs-disband remains the last creator-identity site and must move off creator identity.

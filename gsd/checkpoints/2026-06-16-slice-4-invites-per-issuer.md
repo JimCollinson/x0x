@@ -342,10 +342,11 @@ The remediation implementation is locally committed. The new head has not been p
 ### Item 1b — discovery claim scoped and flagged to David
 
 - Confirmed scope: the known-local-group `GroupCardPublished` metadata-apply path now enforces active Admin authority before accepting the card into the receiver's local cache (`4287904`).
-- Correction to prior over-broad wording: the global discovery listener, directory shard listener, and ListedToContacts direct-card listener are best-effort signed-hint / key-possession discovery caches, not current group-admin authority checks.
+- Correction to prior over-broad wording: the global discovery listener, directory shard listener, and ListedToContacts direct-card listener are best-effort discovery caches, not current group-admin authority checks. Shard/contact delivery require signature/key possession; global discovery retains a legacy unsigned-card compatibility path and verifies signatures when present.
 - For known local groups, these pre-existing David C.2/D.3 discovery receive paths can cache or override a signed discovery listing without confirming the signer is currently an active Admin. This is cosmetic discovery cache state only, not committed group state.
 - Disposition: flag to David as a pre-existing observation. Slice 4 intentionally does **not** harden the discovery receive paths.
 - Scope guard satisfied: no edits to the global discovery, shard discovery, or ListedToContacts receive logic; no edits to `src/groups/directory.rs`.
+- User-initiated `POST /groups/cards/import` remains pre-existing and out of Slice 4 scope. It can refresh a known local `GroupInfo` from an explicitly imported signed card, including withdrawn cards, after key-possession signature verification without checking the signer against the current roster. This is not a peer-receive authority path, is not changed here, and is flagged to David as a separate maintainer decision if known-group imports should require current Admin authority or signed-state application.
 
 ### Local verification evidence after `9901c9c`
 
@@ -368,6 +369,13 @@ Focused checks:
 - Follow-up local build head: `feat/adr-0016-phase-1-authority-alignment` @ pending commit after `9901c9c2a4834ddf20065bd9cfab1d2730838b9d`
 - Code review finding: the `private_secure` e2e is meaningful but cannot uniquely prove direct `JoinResultMessage::Result` routing, because final convergence could also be satisfied by metadata gossip plus Welcome retrieval.
 - Disposition: narrowed the test comment/name and PR-note wording. The daemon e2e now claims TreeKEM secure-plane end-to-end join shape, Welcome/security-binding convergence, and creator-vs-inviter split. Direct expected-inviter sender/actor validation is explicitly attributed to the focused `join_result_requires_stored_expected_inviter` unit regression.
+
+### Follow-up after final adversarial card-surface review
+
+- Date: 2026-06-17
+- Adversarial finding: `POST /groups/cards/import` can mutate known local `GroupInfo` from an explicitly imported signed card after key-possession verification, so the earlier discovery-surface wording was too narrow when it said bypasses were cosmetic cache only.
+- Disposition: documented `POST /groups/cards/import` explicitly as a pre-existing, user/local-initiated, out-of-Slice-4 surface from the original dispatch's user/local-initiated class. It remains unchanged and is flagged to David as a separate maintainer decision if known-group imports should require current Admin authority or signed-state application.
+- Low wording fix: documented that global discovery preserves a legacy unsigned-card compatibility path and only verifies signatures when present; shard/contact delivery remain signed-card surfaces.
 
 The e2e failures match the known startup-timeout class and are not assertion failures. They are recorded as attempted evidence, not a clean local functional pass.
 

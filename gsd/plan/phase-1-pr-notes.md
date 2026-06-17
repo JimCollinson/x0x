@@ -22,9 +22,11 @@ Creator provenance is best-effort historical, derived from the base-state snapsh
 
 The known-local-group `GroupCardPublished` metadata-apply path now enforces that the sender is an active Admin before updating the local discovery card cache.
 
-The global discovery listener, directory shard listener, and ListedToContacts direct-card listener are a different surface: best-effort signed-hint / key-possession discovery caches. They verify the card signature (and privacy placement) but do **not** check the card signer against the receiver's current group roster.
+The global discovery listener, directory shard listener, and ListedToContacts direct-card listener are a different surface: best-effort signed-hint / key-possession discovery caches. Shard/contact delivery require a card signature; global discovery preserves a legacy unsigned-card compatibility path and verifies the card signature when one is present. None of these discovery receive paths check the card signer against the receiver's current group roster.
 
 For known local groups, these pre-existing David C.2/D.3 discovery receive paths can cache or override a signed discovery listing without confirming the signer is currently an active Admin. This is cosmetic discovery cache state only, not committed group state, and is flagged to David as a pre-existing observation. Slice 4 intentionally does not harden those discovery receive paths.
+
+The user-initiated `POST /groups/cards/import` path is also pre-existing and out of ADR-0016 Slice 4 scope. Unlike passive discovery receive, it may refresh an existing local `GroupInfo` from an explicitly imported signed card (including withdrawn cards) after key-possession signature verification, without checking the signer against the current roster. This is not a peer-receive authority path and is not changed here; flag it to David as a separate maintainer decision if he wants imports for known local groups to require current Admin authority or signed-state application.
 
 ## Slice 4 daemon coverage scope
 

@@ -11950,6 +11950,9 @@ async fn withdraw_group_state(
         if let Err(e) = require_admin_or_above(info, &local_hex) {
             return e;
         }
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
+        }
         let event_revision = info.roster_revision.saturating_add(1);
         let commit = match info.seal_withdrawal(signing_kp, now_ms) {
             Ok(c) => c,
@@ -13675,6 +13678,13 @@ async fn import_group_card(
 
     // Full policy is reconstructed from the card summary — all five axes round-trip.
     let policy = x0x::groups::GroupPolicy::from(&card.policy_summary);
+
+    {
+        let groups = state.named_groups.read().await;
+        if groups.get(&group_id).is_some_and(|info| info.withdrawn) {
+            return api_error(StatusCode::CONFLICT, "group is withdrawn");
+        }
+    }
 
     {
         let mut cache = state.group_card_cache.write().await;

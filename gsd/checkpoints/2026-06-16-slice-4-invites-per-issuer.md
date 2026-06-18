@@ -465,3 +465,19 @@ PR #5 head verified as `04a93afba2cabeb1627c7c484ad16ca9ba6fcd16`.
 - Creator provenance is best-effort historical, base-state-derived, not authority-bearing and not tamper-evident.
 - Direct expected-inviter sender/actor rejection is covered by the focused unit regression; daemon e2es cover real REST join/convergence shapes but are startup-timeout affected locally.
 - Slice 5 carry-note: `DELETE /groups/:id` leave-vs-disband remains the last creator-identity site and must move off creator identity.
+
+---
+
+## Closing cleanup — provenance wording and duplicate expected-inviter record
+
+- Date: 2026-06-18
+- Status: **Slice 4 closed after subtractive/clarifying cleanup**
+- Changes:
+  - Softened `creator_agent_id_from_base_state` comments to state creator provenance is best-effort historical display/genesis metadata, non-authority, and not robust to unusual roster shapes.
+  - Removed the redundant second `record_expected_join_result_inviter` call at the top of `poll_join_result_until_treekem_ready`; the expectation is recorded earlier in `join_group_via_invite` before the TreeKEM poll task is spawned or any join result can arrive.
+  - Cross-referenced the real-daemon e2e from the gate-runnable helper-mirror invite tests.
+  - Added PR-note guidance for David on the pre-existing daemon-startup harness flake and the likely `--no-hard-coded-bootstrap` hardening.
+- Evidence:
+  - Mandatory Rust checks rerun after Rust changes.
+  - Deterministic invite tests rerun.
+  - PR #5 remains the green-of-record source; no PR opened.

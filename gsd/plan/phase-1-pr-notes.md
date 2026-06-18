@@ -31,3 +31,7 @@ The user-initiated `POST /groups/cards/import` path is also pre-existing and out
 ## Slice 4 daemon coverage scope
 
 The real three-daemon non-creator-admin invite proof now has both `public_open` and `private_secure` variants in `tests/named_group_join_metadata_event.rs`. The `public_open` variant covers non-TreeKEM convergence; the `private_secure` variant covers the TreeKEM secure-plane end-to-end join shape, Welcome/security-binding convergence, and creator-vs-inviter split. Direct expected-inviter sender/actor rejection is covered by the focused `join_result_requires_stored_expected_inviter` unit regression rather than claimed from the daemon e2e alone. Local execution attempts on macOS still hit the known daemon-startup timeout before assertions; keep the CI/startup-timeout carve-out caveat visible in readiness handoff.
+
+## Pre-existing daemon-startup harness flake
+
+PR #5's remaining red is the pre-existing harness daemon-startup flake: `x0xd pair-alice-… did not become healthy within 90s`. The Slice 4 change set does not touch startup or networking code; the relevant diffs are invite/provenance handling and tests. Flag to David: the likely harness hardening is to spawn test daemons with `--no-hard-coded-bootstrap` (the flag exists and is used by the multi-instance example) so local daemon tests do not try to use the hard-coded bootstrap path.

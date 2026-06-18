@@ -303,14 +303,14 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |
 | GET | `/groups/:id/state` | `x0x group state <group_id>` | **Phase D.3**: inspect the signed state-commit chain |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
-| POST | `/groups/:id/state/withdraw` | `x0x group state-withdraw <group_id>` | **Phase D.3**: seal terminal withdrawal; evicts public card on peers |
+| POST | `/groups/:id/state/withdraw` | `x0x group disband <group_id>` | **Phase D.3**: any admin permanently disbands the group by sealing a terminal withdrawal; evicts public card on peers |
 | POST | `/groups/:id/send` | `x0x group send` | **Phase E**: publish a signed message to a SignedPublic group |
 | GET | `/groups/:id/messages` | `x0x group messages` | **Phase E**: retrieve cached public messages (non-members on Public read) |
 | GET | `/groups/discover/nearby` | `x0x group discover-nearby` | **Phase C.2**: presence-social browse of PublicDirectory groups |
 | GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |
 | POST | `/groups/discover/subscribe` | `x0x group discover-subscribe` | **Phase C.2**: subscribe to a tag/name/id shard |
 | DELETE | `/groups/discover/subscribe/:kind/:shard` | `x0x group discover-unsubscribe` | **Phase C.2**: unsubscribe from a shard |
-| DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave or delete the group |
+| DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave the group by self-removing, for any rank. The last admin is blocked; promote another admin first or use `x0x group disband` |
 
 ### Phase C.2 — distributed shard discovery
 
@@ -387,10 +387,11 @@ Each named group maintains a signed commit chain:
 - `POST /groups/:id/state/seal` (owner/admin) advances the chain by one
   revision and republishes the authority-signed public `GroupCard` to
   the global discovery topic. Returns the signed `GroupStateCommit`.
-- `POST /groups/:id/state/withdraw` (owner) seals a terminal
-  higher-revision commit with `withdrawn=true` and broadcasts the
-  withdrawal card. Peers evict stale listings on receipt regardless of
-  TTL.
+- `POST /groups/:id/state/withdraw` (`x0x group disband`, any admin)
+  permanently ends the group by sealing a terminal higher-revision commit with
+  `withdrawn=true`. The signed history remains verifiable, and the withdrawn
+  card propagates the supersession so peers evict stale listings on receipt
+  regardless of TTL.
 
 Cards and commits carry ML-DSA-65 signatures. Peers verify both the
 signature and the chain link (`prev_state_hash`) before accepting; stale

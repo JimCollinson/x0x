@@ -795,7 +795,7 @@ enum GroupSub {
         /// Display name.
         name: String,
     },
-    /// Leave (or delete) a group.
+    /// Leave a group.
     Leave {
         /// Group ID.
         group_id: String,
@@ -955,8 +955,9 @@ enum GroupSub {
         /// Group ID.
         group_id: String,
     },
-    /// Seal a terminal withdrawal commit (supersedes the public card).
-    StateWithdraw {
+    /// Disband a group by sealing a terminal withdrawal commit.
+    #[command(alias = "state-withdraw")]
+    Disband {
         /// Group ID.
         group_id: String,
     },
@@ -1617,8 +1618,8 @@ async fn run(
             Some(GroupSub::StateSeal { group_id }) => {
                 commands::group::state_seal(&client, &group_id).await
             }
-            Some(GroupSub::StateWithdraw { group_id }) => {
-                commands::group::state_withdraw(&client, &group_id).await
+            Some(GroupSub::Disband { group_id }) => {
+                commands::group::disband(&client, &group_id).await
             }
             Some(GroupSub::SecureEncrypt { group_id, payload }) => {
                 let bytes = if let Some(path) = payload.strip_prefix('@') {
@@ -1828,7 +1829,8 @@ x0x (v{VERSION})
 |   +-- group invite       Generate invite link
 |   +-- group join         Join via invite link
 |   +-- group set-name     Set display name in group
-|   +-- group leave        Leave or delete group
+|   +-- group leave        Leave group
+|   +-- group disband      Disband group
 |
 +-- Data
 |   +-- store list         List key-value stores

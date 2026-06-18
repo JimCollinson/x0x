@@ -99,6 +99,23 @@ fn group_update_rejects_empty_patch_before_daemon_check() {
     );
 }
 
+#[test]
+fn group_disband_primary_and_state_withdraw_alias_parse() {
+    let disband_help =
+        run_cli(&["group", "disband", "--help"]).expect("spawn x0x group disband --help");
+    assert!(
+        disband_help.status.success(),
+        "group disband --help should parse"
+    );
+
+    let alias_help = run_cli(&["group", "state-withdraw", "--help"])
+        .expect("spawn x0x group state-withdraw --help");
+    assert!(
+        alias_help.status.success(),
+        "hidden state-withdraw alias should remain parseable"
+    );
+}
+
 /// `x0x exec` exposes `sessions` and `cancel` as real, discoverable
 /// subcommands (not magic first-positional sentinels), while the
 /// `x0x exec <agent> -- <argv>` run form still parses. These assert the

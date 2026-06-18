@@ -8068,22 +8068,19 @@ async fn apply_named_group_metadata_event_inner(
     );
     // The transport `verified` flag asserts the sender's AgentId→MachineId
     // binding is in our identity-discovery cache — a best-effort annotation
-    // populated asynchronously from gossip announcements. Both a terminal
-    // `GroupDeleted` and a `MemberRemoved` carry a self-authenticating
-    // ML-DSA-signed state commit (`validate_apply` → `verify_structure` proves
-    // the signer authored it), so their authority does not depend on that
-    // cache. Both are also delivery-critical to a peer that is not (or no
-    // longer) in the metadata-topic eager mesh and cannot be backfilled by the
-    // single gossip broadcast: the deleted group's members, and — for removal —
-    // the *removed member itself*, which is direct-delivered the commit so it
-    // learns it was cut from the roster. A transient unverified drop of either
-    // is unrecoverable, so let them through; the apply arms below re-check
-    // authority from the signed commit (GroupDeleted: AdminOrHigher via
+    // populated asynchronously from gossip announcements. `MemberRemoved`
+    // carries a self-authenticating ML-DSA-signed state commit and is still
+    // delivery-critical for the removed member itself, which may no longer be
+    // in the metadata-topic eager mesh. `GroupDeleted` is retained here only
+    // for old-peer/replay compatibility: current group-ending disband uses the
+    // state-withdrawal/card path, but legacy direct-delivered delete events
+    // must still be able to apply. The apply arms below re-check authority
+    // from the signed commit (legacy GroupDeleted: AdminOrHigher via
     // `commit.committed_by`; MemberRemoved: actor/committer consistency plus
     // AdminOrHigher or MemberSelf signed-commit validation). The authenticated
-    // DM `sender_hex` is reliable regardless of
-    // the cache, so bypassing `verified` does not weaken membership
-    // authorization — only the racy cache annotation is skipped.
+    // DM `sender_hex` is reliable regardless of the cache, so bypassing
+    // `verified` does not weaken membership authorization — only the racy cache
+    // annotation is skipped.
     let bypass_verified = matches!(
         event,
         NamedGroupMetadataEvent::GroupDeleted {
@@ -8569,16 +8566,14 @@ async fn apply_named_group_metadata_event_inner(
             let Some(commit) = commit else {
                 return false;
             };
-            // Authority comes from the signed commit, not the transport
-            // sender. `validate_apply` (below) verifies the ML-DSA signature
-            // and that the signer (`commit.committed_by`) holds an Admin-or-higher
-            // role. The `actor` field is advisory metadata, so we only
-            // require it to name the cryptographically-verified signer; we do
-            // *not* gate on `sender_hex`, which is the relaying/transport peer
-            // (wrong for gossip-relayed copies) and unreliable for an
-            // unverified direct delete. This lets an admin's terminal delete
-            // apply on a joiner whose identity-discovery cache hasn't yet bound
-            // the admin's AgentId.
+            // Legacy compatibility: current group-ending disband is the
+            // state-withdrawal/card path, and DELETE /groups/:id now emits
+            // MemberRemoved self-leave only. Older peers/replays may still
+            // deliver GroupDeleted with a signed terminal commit, so apply it
+            // by the commit signer rather than by the transport sender.
+            // `validate_apply` verifies the ML-DSA signature and that
+            // `commit.committed_by` held an Admin-or-higher role. The advisory
+            // `actor` field must name that verified signer.
             if actor != commit.committed_by {
                 return false;
             }
@@ -11451,17 +11446,13 @@ async fn remove_named_group_member(
 enum TreeKemLeaveDisposition {
     ActiveMember,
     LocalOnlyDrop,
-    CreatorMustDelete,
 }
 
 fn treekem_leave_disposition(
     info: &x0x::groups::GroupInfo,
-    local_agent: AgentId,
     local_agent_hex: &str,
 ) -> TreeKemLeaveDisposition {
-    if local_agent == info.creator {
-        TreeKemLeaveDisposition::CreatorMustDelete
-    } else if info.has_active_member(local_agent_hex) {
+    if info.has_active_member(local_agent_hex) {
         TreeKemLeaveDisposition::ActiveMember
     } else {
         TreeKemLeaveDisposition::LocalOnlyDrop
@@ -11486,7 +11477,6 @@ async fn drop_local_named_group_state(state: &AppState, id: &str, reason: &str) 
 async fn leave_treekem_group(
     state: Arc<AppState>,
     id: String,
-    local_agent: AgentId,
     local_agent_hex: String,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let signing_kp = state.agent.identity().agent_keypair();
@@ -11499,7 +11489,7 @@ async fn leave_treekem_group(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
-        let disposition = treekem_leave_disposition(info, local_agent, &local_agent_hex);
+        let disposition = treekem_leave_disposition(info, &local_agent_hex);
         (
             info.clone(),
             info.metadata_topic.clone(),
@@ -11509,12 +11499,6 @@ async fn leave_treekem_group(
         )
     };
     match disposition {
-        TreeKemLeaveDisposition::CreatorMustDelete => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "ok": false, "error": "creator must delete the group" })),
-            );
-        }
         TreeKemLeaveDisposition::LocalOnlyDrop => {
             drop_local_named_group_state(&state, &id, "treekem_non_active_leave").await;
             return (
@@ -11523,6 +11507,11 @@ async fn leave_treekem_group(
             );
         }
         TreeKemLeaveDisposition::ActiveMember => {}
+    }
+
+    if let Some(error) = x0x::groups::last_admin_self_leave_precheck_error(&next, &local_agent_hex)
+    {
+        return api_error(StatusCode::CONFLICT, error);
     }
 
     next.roster_revision = next.roster_revision.saturating_add(1);
@@ -11883,7 +11872,7 @@ async fn withdraw_group_state(
     )
 }
 
-/// DELETE /groups/:id — leave or delete a group.
+/// DELETE /groups/:id — leave a group.
 async fn leave_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -11904,89 +11893,46 @@ async fn leave_group(
         return not_found("group not found");
     };
 
-    let is_creator = local_agent == info.creator;
-    if !is_creator && info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+    if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         drop(groups);
-        return leave_treekem_group(state, id, local_agent, local_agent_hex).await;
+        return leave_treekem_group(state, id, local_agent_hex).await;
     }
     let name = info.name.clone();
     let metadata_topic = info.metadata_topic.clone();
     let event_group_id = info.stable_group_id().to_string();
-    let event = if is_creator {
-        let revision = info.roster_revision.saturating_add(1);
-        let commit = match info.seal_withdrawal(signing_kp, now_ms) {
-            Ok(c) => c,
-            Err(e) => {
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("withdrawal seal failed: {e}"),
-                );
-            }
-        };
-        NamedGroupMetadataEvent::GroupDeleted {
-            group_id: event_group_id.clone(),
-            revision,
-            actor: local_agent_hex.clone(),
-            commit: Some(commit),
-        }
-    } else {
-        if let Some(resp) = treekem_membership_unsupported(info) {
-            return resp;
-        }
-        if let Some(error) =
-            x0x::groups::last_admin_self_leave_precheck_error(info, &local_agent_hex)
-        {
-            return api_error(StatusCode::CONFLICT, error);
-        }
-        let mut next = info.clone();
-        next.roster_revision = next.roster_revision.saturating_add(1);
-        let revision = next.roster_revision;
-        next.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
-        let commit = match next.seal_commit(signing_kp, now_ms) {
-            Ok(c) => c,
-            Err(e) => {
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("seal failed: {e}"),
-                );
-            }
-        };
-        *info = next;
-        NamedGroupMetadataEvent::MemberRemoved {
-            group_id: event_group_id,
-            revision,
-            actor: local_agent_hex.clone(),
-            agent_id: local_agent_hex.clone(),
-            treekem_commit_b64: None,
-            treekem_epoch: None,
-            commit: Some(commit),
+    if let Some(resp) = treekem_membership_unsupported(info) {
+        return resp;
+    }
+    if let Some(error) = x0x::groups::last_admin_self_leave_precheck_error(info, &local_agent_hex) {
+        return api_error(StatusCode::CONFLICT, error);
+    }
+    let mut next = info.clone();
+    next.roster_revision = next.roster_revision.saturating_add(1);
+    let revision = next.roster_revision;
+    next.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
+    let commit = match next.seal_commit(signing_kp, now_ms) {
+        Ok(c) => c,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("seal failed: {e}"),
+            );
         }
     };
-    // Creator-delete: capture the roster before teardown so we can direct-
-    // deliver the GroupDeleted commit. The gossip publish below is a single
-    // eager broadcast, and we stop the metadata listener immediately after —
-    // leaving no anti-entropy source — so a member not currently grafted into
-    // the eager mesh would otherwise never learn of the deletion.
-    let delete_recipients: Vec<String> = if is_creator {
-        info.members_v2
-            .keys()
-            .filter(|member| member.as_str() != local_agent_hex)
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
+    *info = next;
+    let event = NamedGroupMetadataEvent::MemberRemoved {
+        group_id: event_group_id,
+        revision,
+        actor: local_agent_hex.clone(),
+        agent_id: local_agent_hex.clone(),
+        treekem_commit_b64: None,
+        treekem_epoch: None,
+        commit: Some(commit),
     };
     drop(groups);
 
     save_named_groups(&state).await;
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    // Mirror the join/approve/reject path: also push the chain-linked
-    // GroupDeleted commit over the authenticated direct channel to each known
-    // member, since gossip cannot backfill it after teardown. Idempotent and
-    // re-validated on apply, so this is purely additive.
-    for recipient_hex in &delete_recipients {
-        spawn_named_group_event_delivery(&state, recipient_hex, &event);
-    }
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     state.named_groups.write().await.remove(&id);
@@ -11995,8 +11941,8 @@ async fn leave_group(
     cache.remove(&id);
     state.mls_groups.write().await.remove(&id);
     // ADR-0012: drop the live TreeKEM group and wipe its at-rest snapshot
-    // (which contains private key material) so a deleted secure group leaves
-    // nothing behind. No-op for GSS groups: no in-memory entry, and the
+    // (which contains private key material) so a left secure group leaves
+    // nothing behind locally. No-op for GSS groups: no in-memory entry, and the
     // snapshot file does not exist (NotFound is ignored).
     state.treekem_groups.write().await.remove(&id);
     let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
@@ -19974,11 +19920,11 @@ mod tests {
         info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
 
         assert_eq!(
-            treekem_leave_disposition(&info, creator, &creator_hex),
-            TreeKemLeaveDisposition::CreatorMustDelete
+            treekem_leave_disposition(&info, &creator_hex),
+            TreeKemLeaveDisposition::ActiveMember
         );
         assert_eq!(
-            treekem_leave_disposition(&info, member, &member_hex),
+            treekem_leave_disposition(&info, &member_hex),
             TreeKemLeaveDisposition::LocalOnlyDrop
         );
 
@@ -19989,13 +19935,13 @@ mod tests {
             None,
         );
         assert_eq!(
-            treekem_leave_disposition(&info, member, &member_hex),
+            treekem_leave_disposition(&info, &member_hex),
             TreeKemLeaveDisposition::ActiveMember
         );
 
         info.remove_member(&member_hex, Some(creator_hex));
         assert_eq!(
-            treekem_leave_disposition(&info, member, &member_hex),
+            treekem_leave_disposition(&info, &member_hex),
             TreeKemLeaveDisposition::LocalOnlyDrop
         );
     }

@@ -639,7 +639,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Delete,
         path: "/groups/:id",
         cli_name: "group leave",
-        description: "Leave or delete a group",
+        description: "Leave a group",
         category: "named-groups",
     },
     // ── Phase D.3: state-commit chain ────────────────────────────────────
@@ -660,8 +660,8 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     EndpointDef {
         method: Method::Post,
         path: "/groups/:id/state/withdraw",
-        cli_name: "group state-withdraw",
-        description: "Seal a terminal withdrawal commit and supersede public card",
+        cli_name: "group disband",
+        description: "Disband a group with a terminal withdrawal commit",
         category: "named-groups",
     },
     // ── Named groups: policy, roles, join requests, discovery ───────────

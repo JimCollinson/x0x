@@ -166,6 +166,17 @@ fn rest_ban_member_semantics(
     Ok(commit)
 }
 
+fn rest_withdraw_semantics(
+    info: &mut GroupInfo,
+    actor: &AgentKeypair,
+) -> Result<GroupStateCommit, RestError> {
+    let actor_hex = hex_id(actor);
+    require_admin_rest_semantics(info, &actor_hex)?;
+    Ok(info
+        .seal_withdrawal(actor, 2_000)
+        .expect("admin withdrawal seals"))
+}
+
 fn treekem_ban_preflight_semantics(
     info: &GroupInfo,
     actor_hex: &str,
@@ -225,6 +236,44 @@ fn gossip_apply(
     mutate(&mut next);
     next.finalize_applied_commit(commit)?;
     Ok(next)
+}
+
+fn assert_self_leave_converges(mut authority: GroupInfo, actor: &AgentKeypair) {
+    let replica = authority.clone();
+    let actor_hex = hex_id(actor);
+
+    let commit = rest_self_leave_semantics(&mut authority, actor).unwrap();
+
+    assert_eq!(commit.committed_by, actor_hex);
+    assert!(authority.members_v2[&actor_hex].is_removed());
+    assert!(
+        authority.active_admin_count() >= 1,
+        "self-leave must leave another active admin"
+    );
+
+    let next = gossip_apply(&replica, &commit, ActionKind::MemberSelf, |next| {
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        next.remove_member(&actor_hex, Some(actor_hex.clone()));
+    })
+    .expect("self-leave applies through signed member-self path");
+
+    assert_eq!(next.state_hash, authority.state_hash);
+    assert!(next.members_v2[&actor_hex].is_removed());
+}
+
+fn assert_self_leave_conflict_preserves(mut info: GroupInfo, actor: &AgentKeypair) {
+    let actor_hex = hex_id(actor);
+    let before = info.clone();
+
+    assert_eq!(
+        rest_self_leave_semantics(&mut info, actor).unwrap_err(),
+        RestError::Conflict(LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
+    );
+
+    assert_eq!(info.members_v2, before.members_v2);
+    assert_eq!(info.roster_revision, before.roster_revision);
+    assert_eq!(info.state_hash, before.state_hash);
+    assert_eq!(info.caller_role(&actor_hex), before.caller_role(&actor_hex));
 }
 
 fn assert_signed_role_update_applies(new_role: GroupRole) {
@@ -394,6 +443,44 @@ fn membership_authority_promoted_admin_removes_legacy_owner_not_last_admin() {
 }
 
 #[test]
+fn membership_authority_plain_member_self_leave_converges() {
+    let creator = AgentKeypair::generate().unwrap();
+    let admin = AgentKeypair::generate().unwrap();
+    let member = AgentKeypair::generate().unwrap();
+    let target = AgentKeypair::generate().unwrap();
+    let info = group_with_admin_member_and_target(&creator, &admin, &member, &target);
+
+    assert_self_leave_converges(info, &member);
+}
+
+#[test]
+fn membership_authority_non_last_admin_self_leave_converges() {
+    let creator = AgentKeypair::generate().unwrap();
+    let admin = AgentKeypair::generate().unwrap();
+    let info = group_with_promoted_admin(&creator, &admin);
+
+    assert_self_leave_converges(info, &admin);
+}
+
+#[test]
+fn membership_authority_creator_self_leave_converges_when_another_admin_remains() {
+    let creator = AgentKeypair::generate().unwrap();
+    let admin = AgentKeypair::generate().unwrap();
+    let info = group_with_promoted_admin(&creator, &admin);
+
+    assert_self_leave_converges(info, &creator);
+}
+
+#[test]
+fn membership_authority_legacy_owner_self_leave_converges_when_admin_remains() {
+    let owner = AgentKeypair::generate().unwrap();
+    let admin = AgentKeypair::generate().unwrap();
+    let info = legacy_owner_with_promoted_admin(&owner, &admin);
+
+    assert_self_leave_converges(info, &owner);
+}
+
+#[test]
 fn membership_authority_non_creator_last_admin_self_leave_returns_409_and_does_not_mutate() {
     let creator = AgentKeypair::generate().unwrap();
     let admin = AgentKeypair::generate().unwrap();
@@ -416,6 +503,65 @@ fn membership_authority_non_creator_last_admin_self_leave_returns_409_and_does_n
     assert_eq!(info.roster_revision, before.roster_revision);
     assert_eq!(info.state_hash, before.state_hash);
     assert_eq!(info.caller_role(&admin_hex), Some(GroupRole::Admin));
+}
+
+#[test]
+fn membership_authority_creator_last_admin_self_leave_returns_409_and_does_not_mutate() {
+    let creator = AgentKeypair::generate().unwrap();
+    let info = admin_group(&creator, "T");
+
+    assert_self_leave_conflict_preserves(info, &creator);
+}
+
+#[test]
+fn membership_authority_legacy_owner_last_admin_self_leave_returns_409_and_does_not_mutate() {
+    let owner = AgentKeypair::generate().unwrap();
+    let mut info = admin_group(&owner, "T");
+    info.set_member_role(&hex_id(&owner), GroupRole::Owner);
+    info.recompute_state_hash();
+
+    assert_self_leave_conflict_preserves(info, &owner);
+}
+
+#[test]
+fn membership_authority_crafted_last_admin_self_leave_rejected_at_finalize() {
+    let admin = AgentKeypair::generate().unwrap();
+    let info = admin_group(&admin, "T");
+    let admin_hex = hex_id(&admin);
+    let mut scratch = info.clone();
+    scratch.roster_revision = scratch.roster_revision.saturating_add(1);
+    scratch.remove_member(&admin_hex, Some(admin_hex.clone()));
+    let commit = craft_commit(&info, &scratch, &admin, 2_000);
+
+    let err = gossip_apply(&info, &commit, ActionKind::MemberSelf, |next| {
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        next.remove_member(&admin_hex, Some(admin_hex.clone()));
+    })
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ApplyError::Invariant(ref msg)
+            if msg == "post-mutation state would leave a live group with zero active admins"
+    ));
+}
+
+#[test]
+fn membership_authority_non_creator_admin_disbands_withdrawn_commit() {
+    let creator = AgentKeypair::generate().unwrap();
+    let admin = AgentKeypair::generate().unwrap();
+    let mut authority = group_with_promoted_admin(&creator, &admin);
+    let replica = authority.clone();
+
+    let commit = rest_withdraw_semantics(&mut authority, &admin).unwrap();
+
+    assert_eq!(commit.committed_by, hex_id(&admin));
+    assert!(authority.withdrawn);
+
+    let next = gossip_apply(&replica, &commit, ActionKind::AdminOrHigher, |_| {})
+        .expect("non-creator admin withdrawal applies through signed admin path");
+    assert!(next.withdrawn);
+    assert_eq!(next.state_hash, authority.state_hash);
 }
 
 #[test]

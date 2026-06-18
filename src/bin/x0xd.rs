@@ -9500,6 +9500,13 @@ async fn apply_named_group_metadata_event_inner(
                 );
                 return false;
             }
+            if info.withdrawn {
+                tracing::debug!(
+                    group_id = %resolved_group_key,
+                    "MemberJoined: rejecting — group is withdrawn"
+                );
+                return false;
+            }
 
             // 7. Idempotent — if the joiner is already active, a replayed
             //    MemberJoined after the inviter committed the add is a no-op and
@@ -10612,6 +10619,9 @@ async fn create_group_invite(
         if let Err(e) = require_admin_or_above(info, &inviter_hex) {
             return e.into_response();
         }
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp.into_response();
+        }
         let mut invite = x0x::groups::invite::SignedInvite::new(
             info.mls_group_id.clone(),
             info.name.clone(),
@@ -11571,6 +11581,9 @@ async fn leave_treekem_group(
                 Json(serde_json::json!({ "ok": false, "error": "group not found" })),
             );
         };
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
+        }
         let disposition = treekem_leave_disposition(info, &local_agent_hex);
         (
             info.clone(),
@@ -12010,6 +12023,9 @@ async fn leave_group(
     let Some(info) = groups.get_mut(&id) else {
         return not_found("group not found");
     };
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
+    }
 
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         drop(groups);

@@ -11926,6 +11926,9 @@ async fn withdraw_group_state(
             event,
         )
     };
+    // Unlike ordinary membership mutations, disband must broadcast terminal
+    // metadata/direct events before removing the local group. Do not hold the
+    // per-group membership lock across those async network side effects.
     drop(membership_guard);
     save_named_groups(&state).await;
 

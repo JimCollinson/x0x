@@ -303,7 +303,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |
 | GET | `/groups/:id/state` | `x0x group state <group_id>` | **Phase D.3**: inspect the signed state-commit chain |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
-| POST | `/groups/:id/state/withdraw` | `x0x group disband <group_id>` | **Phase D.3**: any admin permanently disbands the group by sealing a signed terminal withdrawal and notifying members with `GroupDeleted` over metadata/direct delivery |
+| POST | `/groups/:id/state/withdraw` | `x0x group disband <group_id>` | **Phase D.3**: any admin permanently disbands the group with a signed terminal withdrawal |
 | POST | `/groups/:id/send` | `x0x group send` | **Phase E**: publish a signed message to a SignedPublic group |
 | GET | `/groups/:id/messages` | `x0x group messages` | **Phase E**: retrieve cached public messages (non-members on Public read) |
 | GET | `/groups/discover/nearby` | `x0x group discover-nearby` | **Phase C.2**: presence-social browse of PublicDirectory groups |

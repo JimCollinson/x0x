@@ -92,7 +92,16 @@ Deferred by Jim on 2026-06-18; Slice 5 intentionally did not expand into the ful
 
 Green of record source: PR #5, <https://github.com/JimCollinson/x0x/pull/5>.
 
-- Status: pending — `7c09a68` was pushed to Jim's fork; latest PR #5 runs were still pending when the code-review blocker stopped the slice.
+- Status: **red** for `7c09a68`.
+- Passing checks include API + GUI Parity Gate, API Coverage Guard, Cargo Audit, Clippy Lint, Coverage Gate, Documentation, Format Check, Panic Scanner, Property Tests, release metadata validation, and platform builds. Soak Test skipped by workflow.
+- `Test Suite`: run `27752423931`, job `82105920746` — FAIL with known startup-timeout signature.
+  - Failing test: `x0x::named_group_join_metadata_event::forged_member_joined_admin_role_or_secret_is_rejected`.
+  - Verbatim line: `x0xd pair-alice-1742 did not become healthy within 90s`.
+  - This alone would match the internal carve-out signature, but CI is still red because of the Multi-Agent failure below.
+- `Multi-Agent Integration`: run `27752423927`, job `82105920578` — FAIL with real assertion/test-expectation mismatch, not startup timeout.
+  - Failing test: `x0x::named_group_integration::named_group_creator_delete_propagates_to_peer`.
+  - Verbatim assertion context: `delete response: Object {"error": String("a group must always have at least one admin; make another member an admin before leaving"), "ok": Bool(false)}` with `left: Bool(false)` / `right: true`.
+  - Interpretation: an ignored multi-agent test still expects creator `DELETE` to disband/propagate. Under Slice 5, creator `DELETE` is self-leave and the sole active admin is correctly blocked. This test needs a Slice 5 expectation update or replacement, but acceptance is already blocked by the withdrawal-propagation HIGH.
 - Known internal carve-out remains only for isolated daemon-startup `x0xd ... did not become healthy within <N>s` failures per `gsd/ci-arbiter.md`.
 
 ## Review gates
@@ -108,8 +117,8 @@ Green of record source: PR #5, <https://github.com/JimCollinson/x0x/pull/5>.
 
 ## Current gate status
 
-Slice 5 implementation and manifest parity are locally green, and `7c09a68` has been pushed to Jim's fork, but Slice 5 is **blocked** by the code-review HIGH withdrawal propagation gap. It is **not accepted/done**.
+Slice 5 implementation and manifest parity are locally green, and `7c09a68` has been pushed to Jim's fork, but Slice 5 is **blocked** by the code-review HIGH withdrawal propagation gap and PR #5 is red due a real stale multi-agent test expectation. It is **not accepted/done**.
 
 ## Recommended next step
 
-Stop for Jim/maintainer decision on withdrawal propagation. Do not expand Slice 5 in-session. Options to decide in a follow-up plan: keep disband as explicit local withdrawal plus documented propagation limits, defer private/hidden disband propagation to a later slice/phase, or approve a new scoped mechanism change for withdrawal propagation.
+Stop for Jim/maintainer decision on withdrawal propagation. Do not expand Slice 5 in-session. Options to decide in a follow-up plan: keep disband as explicit local withdrawal plus documented propagation limits, defer private/hidden disband propagation to a later slice/phase, or approve a new scoped mechanism change for withdrawal propagation. Any follow-up also needs to update/replace the ignored `named_group_creator_delete_propagates_to_peer` expectation so CI no longer asserts the retired creator-delete behavior.

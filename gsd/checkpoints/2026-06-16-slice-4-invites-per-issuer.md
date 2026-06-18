@@ -481,3 +481,10 @@ PR #5 head verified as `04a93afba2cabeb1627c7c484ad16ca9ba6fcd16`.
   - Mandatory Rust checks rerun after Rust changes.
   - Deterministic invite tests rerun.
   - PR #5 remains the green-of-record source; no PR opened.
+- Final PR #5 status for cleanup head `40f2845`:
+  - PASS: API + GUI Parity Gate, API Coverage Guard, all build matrix jobs including Windows, Cargo Audit, Clippy Lint, Coverage Gate, Documentation, Format Check, Panic Scanner, Property Tests, Validate release metadata.
+  - SKIP: Soak Test.
+  - FAIL accepted under Jim's live startup-timeout-only carve-out:
+    - `Test Suite`: run `27746148021`, job `82084807266`; `x0xd pair-alice-6096 did not become healthy within 90s`; summary `1747/1754 tests run: 1746 passed, 1 failed, 161 skipped`.
+    - `Multi-Agent Integration`: run `27746148191`, job `82084807585`; `x0xd pair-bob-46208 did not become healthy within 90s`; summary `5/24 tests run: 4 passed, 1 failed`.
+  - Classification: both reds match the pre-existing daemon-startup harness flake, are within the `<= 3` isolation bound, and this cleanup touched invite/provenance comments/tests plus duplicate expected-inviter recording only — no startup/networking/harness/CI code.

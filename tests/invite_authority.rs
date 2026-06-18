@@ -3,6 +3,8 @@
 //! These tests keep the non-daemon invite contract gate-runnable. The helper
 //! mirrors the daemon invite handler's role check, metadata snapshotting, and
 //! per-issuer secret tracking without starting a mesh-backed `x0xd`.
+//! Real-daemon coverage lives in
+//! `non_creator_admin_invite_e2e_converges_through_real_daemons`.
 
 use x0x::groups::invite::{SignedInvite, DEFAULT_EXPIRY_SECS};
 use x0x::groups::{GroupInfo, GroupPolicyPreset, GroupRole};

@@ -202,16 +202,18 @@ impl SignedInvite {
         !self.signature.is_empty()
     }
 
-    /// Derive the genesis creator from the invite's embedded base-state
-    /// roster snapshot.
+    /// Derive best-effort historical creator provenance from the invite's
+    /// embedded base-state roster snapshot.
     ///
     /// `inviter` is unsigned routing metadata. Current invite-join handling must
-    /// not treat it as creator provenance; the creator is the initial seeded
-    /// roster entry (`added_by == None`) from the authority's base state.
-    /// Pending/ban-placeholder records can also have no `added_by`, so prefer
-    /// the entry whose `joined_at` matches the authority's `group_created_at`
-    /// when that timestamp is present, then fall back to the earliest such
-    /// base-state entry.
+    /// not treat it as creator provenance. The derived value seeds the display
+    /// `creator` / genesis field only and is never consulted for authority.
+    /// This is not a tamper-evident or exhaustive historical reconstruction:
+    /// unusual roster shapes (for example, a creator re-added with
+    /// `added_by = Some`) may not be represented by the `added_by.is_none()`
+    /// filter. Because creator identity is non-authority metadata, this helper
+    /// intentionally keeps the derivation simple instead of adding tiebreaking
+    /// logic for unusual history.
     ///
     /// # Errors
     ///

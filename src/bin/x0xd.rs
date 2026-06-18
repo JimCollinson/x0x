@@ -18002,8 +18002,6 @@ async fn poll_join_result_until_treekem_ready(
 ) {
     let deadline = tokio::time::Instant::now() + JOIN_RESULT_POLL_TIMEOUT;
     let expected_key = join_result_key(&event_group_id, &member_agent_id);
-    let inviter_hex = hex::encode(inviter.as_bytes());
-    record_expected_join_result_inviter(state.as_ref(), expected_key.clone(), inviter_hex);
     let mut timed_out = true;
     while tokio::time::Instant::now() < deadline {
         if state.treekem_groups.read().await.contains_key(&group_id) {

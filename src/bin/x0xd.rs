@@ -6484,6 +6484,10 @@ async fn publish_group_card_to_discovery_inner(
         // Reseal bumps the commit chain; non-reseal republishes the
         // currently-sealed state (idempotent refresh).
         let commit = if reseal {
+            if info.withdrawn {
+                tracing::warn!(group_id, "refusing to reseal withdrawn group");
+                return None;
+            }
             match info.seal_commit(signing_kp, now_ms) {
                 Ok(c) => Some(c),
                 Err(e) => {
@@ -11037,6 +11041,9 @@ async fn set_group_display_name(
     let Some(info) = groups.get_mut(&id) else {
         return not_found("group not found");
     };
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
+    }
 
     let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     info.set_display_name(&agent_hex, req.name.clone());
@@ -11082,6 +11089,9 @@ async fn add_named_group_member(
         };
         if let Err(e) = require_admin_or_above(info, &actor_hex) {
             return e;
+        }
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
         }
         if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
             drop(named_groups);
@@ -11210,6 +11220,9 @@ async fn add_treekem_named_group_member(
         };
         if let Err(e) = require_admin_or_above(info, &actor_hex) {
             return e;
+        }
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
         }
         if info.has_member(&agent_hex) {
             return (
@@ -11375,6 +11388,9 @@ async fn remove_named_group_member(
 
         if let Err(e) = require_admin_or_above(info, &local_agent_hex) {
             return e;
+        }
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
         }
         if !info.has_member(&agent_id_hex) {
             return not_found("member not found");
@@ -11658,6 +11674,9 @@ async fn remove_treekem_named_group_member(
         if let Err(e) = require_admin_or_above(info, &local_agent_hex) {
             return e;
         }
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
+        }
         if !info.has_member(&agent_id_hex) {
             return (
                 StatusCode::NOT_FOUND,
@@ -11873,6 +11892,9 @@ async fn seal_group_state(
             .unwrap_or(false)
         {
             return forbidden("admin role required");
+        }
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
         }
     }
     let commit = publish_group_card_with_reseal(&state, &id).await;
@@ -12100,6 +12122,13 @@ fn require_admin_or_above(
     }
 }
 
+fn reject_withdrawn_group(
+    info: &x0x::groups::GroupInfo,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    info.withdrawn
+        .then(|| api_error(StatusCode::CONFLICT, "group is withdrawn"))
+}
+
 /// Friendly REST pre-check for the ADR-0016 last-admin invariant.
 ///
 /// Applies the handler's intended roster mutation to a clone of the group
@@ -12135,6 +12164,9 @@ async fn update_named_group(
     };
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
+    }
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
     }
     let name_update = req.name.clone();
     let desc_update = req.description.clone();
@@ -12202,6 +12234,9 @@ async fn update_group_policy(
     };
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
+    }
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
     }
 
     let mut new_policy = info.policy.clone();
@@ -12320,6 +12355,9 @@ async fn update_member_role(
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
     }
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
+    }
 
     // ADR-0016 R2: friendly pre-check — a demotion must not strip the last
     // active admin (legacy Owner counts as Admin).
@@ -12385,6 +12423,9 @@ async fn ban_group_member(
     };
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
+    }
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
     }
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
         drop(groups);
@@ -12541,6 +12582,9 @@ async fn ban_treekem_group_member(
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
             return e;
         }
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
+        }
         // ADR-0016 R2: friendly pre-check before any TreeKEM work begins.
         if let Some(resp) = last_admin_precheck(info, |g| g.ban_member(&agent_id_hex, None)) {
             return resp;
@@ -12682,6 +12726,9 @@ async fn unban_group_member(
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
     }
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
+    }
     if !info.is_banned(&agent_id_hex) {
         return bad_request("member is not banned");
     }
@@ -12767,6 +12814,9 @@ async fn create_join_request(
         let Some(info) = groups.get_mut(&id) else {
             return not_found("group not found");
         };
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
+        }
         if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
             return forbidden("group admission is not request_access");
         }
@@ -12892,6 +12942,9 @@ async fn approve_join_request(
         };
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
             return e;
+        }
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
         }
         if let Some(resp) = treekem_membership_unsupported(info) {
             return resp;
@@ -13065,6 +13118,9 @@ async fn approve_treekem_join_request(
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
             return e;
         }
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
+        }
         let Some(req) = info.join_requests.get(&request_id) else {
             return not_found("request not found");
         };
@@ -13222,6 +13278,9 @@ async fn reject_join_request(
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
             return e;
         }
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
+        }
         let Some(req) = info.join_requests.get_mut(&request_id) else {
             return not_found("request not found");
         };
@@ -13277,6 +13336,9 @@ async fn cancel_join_request(
         let Some(info) = groups.get_mut(&id) else {
             return not_found("group not found");
         };
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
+        }
         let Some(req) = info.join_requests.get_mut(&request_id) else {
             return not_found("request not found");
         };

@@ -44,6 +44,8 @@ The explicit group-ending act is the existing signed terminal withdrawal: `POST 
 
 `GroupDeleted` production emission is retired with the creator-delete branch. The enum and receive/apply arms remain for old-peer and replay compatibility: legacy `GroupDeleted` events with signed terminal commits can still apply, but current disband propagates through the withdrawal commit/card path.
 
+**Current Slice 5 blocker:** final code review found that the existing withdrawal-card propagation path is likely inadequate for Hidden/private groups now that it is the primary disband mechanism. `withdraw_group_state` only seals locally and calls `publish_group_card_to_discovery_inner`; Hidden cards intentionally stay local. This matches the Slice 5 stop-rule: flag as pre-existing and stop, do not invent direct delivery or a metadata-withdrawal mechanism inside Slice 5. Do not present the leave/disband split as PR-ready until Jim/maintainer decides how to handle private/hidden withdrawal propagation.
+
 ## Slice 7 deferred surface backlog
 
 Slice 5 deliberately did **not** perform the full R9 user-surface language sweep. These items are deferred, not forgotten, and must be handled in Slice 7 before PR-ready handoff:

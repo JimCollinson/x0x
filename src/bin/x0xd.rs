@@ -11462,6 +11462,33 @@ fn treekem_leave_disposition(
     }
 }
 
+fn treekem_snapshot_path_for_drop(state: &AppState, group_id: &str) -> Option<std::path::PathBuf> {
+    if group_id.is_empty()
+        || !group_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    Some(state.treekem_dir.join(format!("{group_id}.snap")))
+}
+
+async fn remove_treekem_snapshot_for_group_id(state: &AppState, group_id: &str, reason: &str) {
+    let Some(treekem_snapshot) = treekem_snapshot_path_for_drop(state, group_id) else {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            reason = %reason,
+            "skipping unsafe TreeKEM snapshot id while dropping local group state"
+        );
+        return;
+    };
+    if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(group_id = %LogHexId::group(group_id), reason = %reason, "failed to remove TreeKEM snapshot while dropping local group state: {e}");
+        }
+    }
+}
+
 async fn drop_local_named_group_state(
     state: &AppState,
     id: &str,
@@ -11497,19 +11524,9 @@ async fn drop_local_named_group_state(
             treekem_groups.remove(stable_group_id);
         }
     }
-    let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
-    if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(group_id = %LogHexId::group(&id), reason = %reason, "failed to remove TreeKEM snapshot while dropping local group state: {e}");
-        }
-    }
+    remove_treekem_snapshot_for_group_id(state, id, reason).await;
     if let Some(stable_group_id) = stable_group_id {
-        let treekem_snapshot = state.treekem_dir.join(format!("{stable_group_id}.snap"));
-        if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(group_id = %LogHexId::group(stable_group_id), reason = %reason, "failed to remove TreeKEM snapshot while dropping local group state: {e}");
-            }
-        }
+        remove_treekem_snapshot_for_group_id(state, stable_group_id, reason).await;
     }
     save_named_groups(state).await;
     save_mls_groups(state).await;

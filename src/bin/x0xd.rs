@@ -2681,7 +2681,7 @@ fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
     // verified when the receiver already has a fresh AgentId -> MachineId
     // binding, so keep it as the fallback for peers whose gossip-inbox
     // capability advert has not converged yet. Terminal signed commits (for
-    // example creator delete) are self-authenticating and explicitly re-check
+    // example admin disband) are self-authenticating and explicitly re-check
     // authority on apply, so dropping the raw fallback can strand members after
     // their metadata listener exits.
     let mut config = direct_message_send_config();
@@ -8071,11 +8071,10 @@ async fn apply_named_group_metadata_event_inner(
     // populated asynchronously from gossip announcements. `MemberRemoved`
     // carries a self-authenticating ML-DSA-signed state commit and is still
     // delivery-critical for the removed member itself, which may no longer be
-    // in the metadata-topic eager mesh. `GroupDeleted` is retained here only
-    // for old-peer/replay compatibility: current group-ending disband uses the
-    // state-withdrawal/card path, but legacy direct-delivered delete events
-    // must still be able to apply. The apply arms below re-check authority
-    // from the signed commit (legacy GroupDeleted: AdminOrHigher via
+    // in the metadata-topic eager mesh. `GroupDeleted` is the current disband
+    // propagation event (and remains old-peer/replay compatible), carrying the
+    // signed terminal withdrawal commit. The apply arms below re-check
+    // authority from the signed commit (GroupDeleted: AdminOrHigher via
     // `commit.committed_by`; MemberRemoved: actor/committer consistency plus
     // AdminOrHigher or MemberSelf signed-commit validation). The authenticated
     // DM `sender_hex` is reliable regardless of the cache, so bypassing
@@ -8566,19 +8565,21 @@ async fn apply_named_group_metadata_event_inner(
             let Some(commit) = commit else {
                 return false;
             };
-            // Legacy compatibility: current group-ending disband is the
-            // state-withdrawal/card path, and DELETE /groups/:id now emits
-            // MemberRemoved self-leave only. Older peers/replays may still
-            // deliver GroupDeleted with a signed terminal commit, so apply it
-            // by the commit signer rather than by the transport sender.
-            // `validate_apply` verifies the ML-DSA signature and that
+            // Current disband propagation and legacy delete compatibility both
+            // use GroupDeleted with a signed terminal withdrawal commit. DELETE
+            // /groups/:id now emits MemberRemoved self-leave only. Apply
+            // GroupDeleted by the commit signer rather than by the transport
+            // sender: `validate_apply` verifies the ML-DSA signature and that
             // `commit.committed_by` held an Admin-or-higher role. The advisory
             // `actor` field must name that verified signer.
             if actor != commit.committed_by {
                 return false;
             }
+            if !commit.withdrawn {
+                return false;
+            }
             let current = info.clone();
-            if let Err(e) = apply_stateful_event_to_group(
+            let next = match apply_stateful_event_to_group(
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8587,26 +8588,28 @@ async fn apply_named_group_metadata_event_inner(
                     next.updated_at = commit.committed_at;
                 },
             ) {
-                tracing::debug!(
-                    target: "treekem.trace",
-                    stage = "apply_metadata_event_reject",
-                    reason = "group_deleted_state_commit_apply_failed",
-                    error = %e,
-                    event = event_kind,
-                    group_id = %resolved_group_key,
-                    sender = %sender_hex,
-                );
-                return false;
-            }
-            state.named_groups.write().await.remove(&resolved_group_key);
-            state
-                .group_card_cache
-                .write()
-                .await
-                .remove(&resolved_group_key);
-            state.mls_groups.write().await.remove(&resolved_group_key);
-            save_named_groups(state).await;
-            save_mls_groups(state).await;
+                Ok(next) => next,
+                Err(e) => {
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "apply_metadata_event_reject",
+                        reason = "group_deleted_state_commit_apply_failed",
+                        error = %e,
+                        event = event_kind,
+                        group_id = %resolved_group_key,
+                        sender = %sender_hex,
+                    );
+                    return false;
+                }
+            };
+            let stable_group_id = next.stable_group_id().to_string();
+            drop_local_named_group_state(
+                state,
+                &resolved_group_key,
+                Some(&stable_group_id),
+                "group_deleted",
+            )
+            .await;
             true
         }
         NamedGroupMetadataEvent::PolicyUpdated {
@@ -11459,19 +11462,61 @@ fn treekem_leave_disposition(
     }
 }
 
-async fn drop_local_named_group_state(state: &AppState, id: &str, reason: &str) {
-    state.named_groups.write().await.remove(id);
-    state.group_card_cache.write().await.remove(id);
-    state.mls_groups.write().await.remove(id);
-    state.treekem_groups.write().await.remove(id);
+async fn drop_local_named_group_state(
+    state: &AppState,
+    id: &str,
+    stable_group_id: Option<&str>,
+    reason: &str,
+) {
+    let stable_group_id = stable_group_id.filter(|stable| *stable != id);
+    {
+        let mut groups = state.named_groups.write().await;
+        groups.remove(id);
+        if let Some(stable_group_id) = stable_group_id {
+            groups.remove(stable_group_id);
+        }
+    }
+    {
+        let mut cache = state.group_card_cache.write().await;
+        cache.remove(id);
+        if let Some(stable_group_id) = stable_group_id {
+            cache.remove(stable_group_id);
+        }
+    }
+    {
+        let mut mls_groups = state.mls_groups.write().await;
+        mls_groups.remove(id);
+        if let Some(stable_group_id) = stable_group_id {
+            mls_groups.remove(stable_group_id);
+        }
+    }
+    {
+        let mut treekem_groups = state.treekem_groups.write().await;
+        treekem_groups.remove(id);
+        if let Some(stable_group_id) = stable_group_id {
+            treekem_groups.remove(stable_group_id);
+        }
+    }
     let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
     if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(group_id = %LogHexId::group(&id), reason = %reason, "failed to remove TreeKEM snapshot while dropping local group state: {e}");
         }
     }
+    if let Some(stable_group_id) = stable_group_id {
+        let treekem_snapshot = state.treekem_dir.join(format!("{stable_group_id}.snap"));
+        if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(group_id = %LogHexId::group(stable_group_id), reason = %reason, "failed to remove TreeKEM snapshot while dropping local group state: {e}");
+            }
+        }
+    }
     save_named_groups(state).await;
     save_mls_groups(state).await;
+    stop_named_group_metadata_listener(state, id).await;
+    if let Some(stable_group_id) = stable_group_id {
+        stop_named_group_metadata_listener(state, stable_group_id).await;
+    }
 }
 
 async fn leave_treekem_group(
@@ -11500,7 +11545,13 @@ async fn leave_treekem_group(
     };
     match disposition {
         TreeKemLeaveDisposition::LocalOnlyDrop => {
-            drop_local_named_group_state(&state, &id, "treekem_non_active_leave").await;
+            drop_local_named_group_state(
+                &state,
+                &id,
+                Some(&event_group_id),
+                "treekem_non_active_leave",
+            )
+            .await;
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({ "ok": true, "left": name, "local_only": true })),
@@ -11821,10 +11872,10 @@ async fn seal_group_state(
     )
 }
 
-/// POST /groups/:id/state/withdraw — Phase D.3: seal a terminal
-/// withdrawal commit and publish the withdrawn card. Higher revision
-/// supersedes any prior public card regardless of TTL; peers evict
-/// stale listings on receipt.
+/// POST /groups/:id/state/withdraw — Phase D.3: seal a terminal withdrawal
+/// commit and disband the group. Members receive the signed terminal
+/// `GroupDeleted` event over the metadata topic plus direct delivery; the
+/// withdrawn card still supersedes public discovery listings where applicable.
 ///
 /// Admin or higher only.
 async fn withdraw_group_state(
@@ -11838,7 +11889,9 @@ async fn withdraw_group_state(
         .as_millis() as u64;
     let signing_kp = state.agent.identity().agent_keypair();
 
-    let commit = {
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let membership_guard = membership_lock.lock().await;
+    let (commit, metadata_topic, event_group_id, delivery_roster, event) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
             return not_found("group not found");
@@ -11846,7 +11899,8 @@ async fn withdraw_group_state(
         if let Err(e) = require_admin_or_above(info, &local_hex) {
             return e;
         }
-        match info.seal_withdrawal(signing_kp, now_ms) {
+        let event_revision = info.roster_revision.saturating_add(1);
+        let commit = match info.seal_withdrawal(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -11854,14 +11908,43 @@ async fn withdraw_group_state(
                     format!("withdrawal seal failed: {e}"),
                 );
             }
-        }
+        };
+        let metadata_topic = info.metadata_topic.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        let delivery_roster = info.clone();
+        let event = NamedGroupMetadataEvent::GroupDeleted {
+            group_id: event_group_id.clone(),
+            revision: event_revision,
+            actor: local_hex.clone(),
+            commit: Some(commit.clone()),
+        };
+        (
+            commit,
+            metadata_topic,
+            event_group_id,
+            delivery_roster,
+            event,
+        )
     };
+    drop(membership_guard);
     save_named_groups(&state).await;
 
-    // Publish the withdrawn card (to_group_card now returns Some() for
-    // withdrawn groups regardless of discoverability so peers get the
-    // supersession signal).
+    // Stop our local metadata listener before broadcasting the terminal event
+    // so it cannot race ahead and remove the withdrawn state before the
+    // withdrawn-card supersession path below has read it.
+    stop_named_group_metadata_listener(&state, &id).await;
+    if event_group_id != id {
+        stop_named_group_metadata_listener(&state, &event_group_id).await;
+    }
+
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
+
+    // Refresh the withdrawn-card path for public discovery supersession. Hidden
+    // groups still do not publish public cards, so their disband propagation is
+    // the signed GroupDeleted metadata/direct event above.
     let _ = publish_group_card_to_discovery_inner(&state, &id, false).await;
+    drop_local_named_group_state(&state, &id, Some(&event_group_id), "withdraw_disband").await;
 
     (
         StatusCode::OK,

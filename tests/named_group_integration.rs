@@ -1288,12 +1288,12 @@ async fn named_group_import_rejects_tampered_metadata_topic() {
 }
 
 // ===========================================================================
-// 21. Creator delete propagates to peers
+// 21. Admin disband propagates to peers after creator DELETE stays self-leave
 // ===========================================================================
 
 #[tokio::test]
 #[ignore]
-async fn named_group_creator_delete_propagates_to_peer() {
+async fn named_group_admin_disband_propagates_to_peer_after_creator_delete_409() {
     let pair = pair().await;
     let alice = &pair.alice;
     let bob = &pair.bob;
@@ -1301,7 +1301,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
     let alice_create: Value = alice
         .post(
             "/groups",
-            serde_json::json!({"name":"Authoritative Delete","display_name":"Alice"}),
+            serde_json::json!({"name":"Authoritative Disband","display_name":"Alice"}),
         )
         .await
         .json()
@@ -1321,7 +1321,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
         alice_state["security_binding"]
             .as_str()
             .is_some_and(|binding| binding.starts_with("treekem:")),
-        "creator-delete regression must exercise a private_secure TreeKEM group: {alice_state:?}"
+        "disband propagation regression must exercise a private_secure TreeKEM group: {alice_state:?}"
     );
 
     let invite: Value = alice
@@ -1364,7 +1364,7 @@ async fn named_group_creator_delete_propagates_to_peer() {
     .await;
     assert!(
         alice_sees_bob,
-        "alice never observed bob's invite join before delete"
+        "alice never observed bob's invite join before delete/disband checks"
     );
     let alice_hash = group_state_hash(alice, &group_id)
         .await
@@ -1375,25 +1375,90 @@ async fn named_group_creator_delete_propagates_to_peer() {
     .await;
     assert!(
         bob_caught_up,
-        "bob never applied alice's authoritative member add before delete"
+        "bob never applied alice's authoritative member add before delete/disband checks"
     );
 
-    let delete_resp: Value = alice
-        .delete(&format!("/groups/{group_id}"))
+    let delete_resp = alice.delete(&format!("/groups/{group_id}")).await;
+    assert_eq!(delete_resp.status(), StatusCode::CONFLICT);
+    let delete_body: Value = delete_resp.json().await.unwrap();
+    assert_eq!(
+        delete_body["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin before leaving"),
+        "creator DELETE must remain pure self-leave: {delete_body:?}"
+    );
+    assert!(
+        group_state(alice, &group_id).await.is_some(),
+        "rejected creator DELETE must not remove alice's local group"
+    );
+    assert!(
+        group_state(bob, &bob_group_id).await.is_some(),
+        "rejected creator DELETE must not disband bob's group"
+    );
+
+    let promote: Value = alice
+        .patch(
+            &format!("/groups/{group_id}/members/{bob_agent_id}/role"),
+            serde_json::json!({ "role": "admin" }),
+        )
         .await
         .json()
         .await
         .unwrap();
-    assert_eq!(delete_resp["ok"], true, "delete response: {delete_resp:?}");
+    assert_eq!(promote["ok"], true, "promote response: {promote:?}");
+
+    let promoted_hash = group_state_hash(alice, &group_id)
+        .await
+        .expect("alice state hash after bob promotion");
+    let bob_promoted = wait_until(Duration::from_secs(30), || async {
+        let caught_up =
+            group_state_hash(bob, &bob_group_id).await.as_deref() == Some(promoted_hash.as_str());
+        let members: Value = bob
+            .get(&format!("/groups/{bob_group_id}/members"))
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        let has_admin_role = members["members"]
+            .as_array()
+            .map(|members| {
+                members
+                    .iter()
+                    .any(|m| m["agent_id"] == bob_agent_id && m["role"] == "admin")
+            })
+            .unwrap_or(false);
+        caught_up && has_admin_role
+    })
+    .await;
+    assert!(bob_promoted, "bob never observed his admin promotion");
+
+    let disband: Value = bob
+        .post(
+            &format!("/groups/{bob_group_id}/state/withdraw"),
+            serde_json::json!({}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(disband["ok"], true, "disband response: {disband:?}");
 
     let deleted_seen = wait_until(Duration::from_secs(30), || async {
-        let resp = bob.get(&format!("/groups/{bob_group_id}")).await;
+        let resp = alice.get(&format!("/groups/{group_id}")).await;
         resp.status() == StatusCode::NOT_FOUND
     })
     .await;
     assert!(
         deleted_seen,
-        "bob never observed creator deletion of the space"
+        "alice never observed non-creator admin disband over private metadata/direct propagation"
+    );
+    let bob_local_gone = wait_until(Duration::from_secs(30), || async {
+        let resp = bob.get(&format!("/groups/{bob_group_id}")).await;
+        resp.status() == StatusCode::NOT_FOUND
+    })
+    .await;
+    assert!(
+        bob_local_gone,
+        "disbanding admin did not tear down its own private_secure group"
     );
 }
 

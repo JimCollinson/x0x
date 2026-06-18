@@ -238,6 +238,32 @@ fn gossip_apply(
     Ok(next)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum GroupDeletedEventApplyError {
+    ActorMismatch,
+    NotWithdrawal,
+    Commit(ApplyError),
+}
+
+fn apply_group_deleted_event(
+    replica: &GroupInfo,
+    revision: u64,
+    actor: &str,
+    commit: &GroupStateCommit,
+) -> Result<GroupInfo, GroupDeletedEventApplyError> {
+    if actor != commit.committed_by {
+        return Err(GroupDeletedEventApplyError::ActorMismatch);
+    }
+    if !commit.withdrawn {
+        return Err(GroupDeletedEventApplyError::NotWithdrawal);
+    }
+    gossip_apply(replica, commit, ActionKind::AdminOrHigher, |next| {
+        next.roster_revision = revision.max(next.roster_revision);
+        next.updated_at = commit.committed_at;
+    })
+    .map_err(GroupDeletedEventApplyError::Commit)
+}
+
 fn assert_self_leave_converges(mut authority: GroupInfo, actor: &AgentKeypair) {
     let replica = authority.clone();
     let actor_hex = hex_id(actor);
@@ -547,21 +573,53 @@ fn membership_authority_crafted_last_admin_self_leave_rejected_at_finalize() {
 }
 
 #[test]
-fn membership_authority_non_creator_admin_disbands_withdrawn_commit() {
+fn membership_authority_group_deleted_withdrawal_commit_applies_under_admin_authority() {
     let creator = AgentKeypair::generate().unwrap();
     let admin = AgentKeypair::generate().unwrap();
     let mut authority = group_with_promoted_admin(&creator, &admin);
     let replica = authority.clone();
+    let event_revision = replica.roster_revision.saturating_add(1);
 
     let commit = rest_withdraw_semantics(&mut authority, &admin).unwrap();
 
     assert_eq!(commit.committed_by, hex_id(&admin));
     assert!(authority.withdrawn);
 
-    let next = gossip_apply(&replica, &commit, ActionKind::AdminOrHigher, |_| {})
-        .expect("non-creator admin withdrawal applies through signed admin path");
+    let next = apply_group_deleted_event(&replica, event_revision, &hex_id(&admin), &commit)
+        .expect("GroupDeleted withdrawal applies through signed admin path");
     assert!(next.withdrawn);
     assert_eq!(next.state_hash, authority.state_hash);
+}
+
+#[test]
+fn membership_authority_group_deleted_rejects_non_admin_signer_and_bad_commit() {
+    let creator = AgentKeypair::generate().unwrap();
+    let admin = AgentKeypair::generate().unwrap();
+    let member = AgentKeypair::generate().unwrap();
+    let info = group_with_admin_member_and_target(
+        &creator,
+        &admin,
+        &member,
+        &AgentKeypair::generate().unwrap(),
+    );
+    let event_revision = info.roster_revision.saturating_add(1);
+
+    let mut member_withdrawal = info.clone();
+    member_withdrawal.withdrawn = true;
+    let non_admin_commit = craft_commit(&info, &member_withdrawal, &member, 2_000);
+    assert!(matches!(
+        apply_group_deleted_event(&info, event_revision, &hex_id(&member), &non_admin_commit)
+            .unwrap_err(),
+        GroupDeletedEventApplyError::Commit(ApplyError::Unauthorized { .. })
+    ));
+
+    let mut authority = info.clone();
+    let mut bad_commit = rest_withdraw_semantics(&mut authority, &admin).unwrap();
+    bad_commit.signature = "00".to_string();
+    assert!(matches!(
+        apply_group_deleted_event(&info, event_revision, &hex_id(&admin), &bad_commit).unwrap_err(),
+        GroupDeletedEventApplyError::Commit(ApplyError::InvalidSignature(_))
+    ));
 }
 
 #[test]

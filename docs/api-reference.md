@@ -303,7 +303,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |
 | GET | `/groups/:id/state` | `x0x group state <group_id>` | **Phase D.3**: inspect the signed state-commit chain |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
-| POST | `/groups/:id/state/withdraw` | `x0x group disband <group_id>` | **Phase D.3**: any admin permanently disbands the group by sealing a terminal withdrawal; evicts public card on peers |
+| POST | `/groups/:id/state/withdraw` | `x0x group disband <group_id>` | **Phase D.3**: any admin permanently disbands the group by sealing a signed terminal withdrawal and notifying members with `GroupDeleted` over metadata/direct delivery |
 | POST | `/groups/:id/send` | `x0x group send` | **Phase E**: publish a signed message to a SignedPublic group |
 | GET | `/groups/:id/messages` | `x0x group messages` | **Phase E**: retrieve cached public messages (non-members on Public read) |
 | GET | `/groups/discover/nearby` | `x0x group discover-nearby` | **Phase C.2**: presence-social browse of PublicDirectory groups |
@@ -389,9 +389,13 @@ Each named group maintains a signed commit chain:
   the global discovery topic. Returns the signed `GroupStateCommit`.
 - `POST /groups/:id/state/withdraw` (`x0x group disband`, any admin)
   permanently ends the group by sealing a terminal higher-revision commit with
-  `withdrawn=true`. The signed history remains verifiable, and the withdrawn
-  card propagates the supersession so peers evict stale listings on receipt
-  regardless of TTL.
+  `withdrawn=true`. Members are notified with the unchanged signed
+  `GroupDeleted` metadata event over the group metadata topic plus direct
+  delivery; recipients verify the terminal commit and remove their live local
+  group state. The terminal commit remains signed/verifiable wherever retained.
+  A withdrawn card is also refreshed to supersede public discovery listings on
+  receipt regardless of TTL; Hidden groups rely on the metadata/direct disband
+  event, not public-card discovery.
 
 Cards and commits carry ML-DSA-65 signatures. Peers verify both the
 signature and the chain link (`prev_state_hash`) before accepting; stale

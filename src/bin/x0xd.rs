@@ -11926,28 +11926,22 @@ async fn withdraw_group_state(
             event,
         )
     };
-    // Unlike ordinary membership mutations, disband must broadcast terminal
-    // metadata/direct events before removing the local group. Do not hold the
-    // per-group membership lock across those async network side effects.
-    drop(membership_guard);
     save_named_groups(&state).await;
-
-    // Stop our local metadata listener before broadcasting the terminal event
-    // so it cannot race ahead and remove the withdrawn state before the
-    // withdrawn-card supersession path below has read it.
-    stop_named_group_metadata_listener(&state, &id).await;
-    if event_group_id != id {
-        stop_named_group_metadata_listener(&state, &event_group_id).await;
-    }
-
-    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
 
     // Refresh the withdrawn-card path for public discovery supersession. Hidden
     // groups still do not publish public cards, so their disband propagation is
     // the signed GroupDeleted metadata/direct event above.
     let _ = publish_group_card_to_discovery_inner(&state, &id, false).await;
     drop_local_named_group_state(&state, &id, Some(&event_group_id), "withdraw_disband").await;
+
+    // Keep the per-group membership lock until local live state is gone, so no
+    // concurrent API mutator can author a post-withdrawal commit in the narrow
+    // terminal window. The network-facing GroupDeleted publish/direct-delivery
+    // happens after the lock is released; all required data was captured above.
+    drop(membership_guard);
+
+    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
 
     (
         StatusCode::OK,

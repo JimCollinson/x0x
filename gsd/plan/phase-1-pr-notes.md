@@ -35,3 +35,23 @@ The real three-daemon non-creator-admin invite proof now has both `public_open` 
 ## Pre-existing daemon-startup harness flake
 
 PR #5's remaining red is the pre-existing harness daemon-startup flake: `x0xd pair-alice-… did not become healthy within 90s`. The Slice 4 change set does not touch startup or networking code; the relevant diffs are invite/provenance handling and tests. Flag to David: the likely harness hardening is to spawn test daemons with `--no-hard-coded-bootstrap` (the flag exists and is used by the multi-instance example) so local daemon tests do not try to use the hard-coded bootstrap path.
+
+## Slice 5 — leave/disband split
+
+`DELETE /groups/:id` is now pure self-leave for every rank. Creator identity is no longer a leave/delete authority switch: creators, admins, legacy `owner` entries, and plain members all leave by self-removal, with the last active admin blocked by the ADR-0016 §3 `before leaving` error. TreeKEM creator self-leave routes through the same TreeKEM leave path, including the friendly last-admin pre-check before TreeKEM seal work.
+
+The explicit group-ending act is the existing signed terminal withdrawal: `POST /groups/:id/state/withdraw`, surfaced primarily as `x0x group disband <group_id>`. The old `x0x group state-withdraw <group_id>` spelling remains a hidden/deprecated CLI alias for compatibility. No wire, commit, storage, signing, hashing, role serialization, or withdrawal format changed.
+
+`GroupDeleted` production emission is retired with the creator-delete branch. The enum and receive/apply arms remain for old-peer and replay compatibility: legacy `GroupDeleted` events with signed terminal commits can still apply, but current disband propagates through the withdrawal commit/card path.
+
+## Slice 7 deferred surface backlog
+
+Slice 5 deliberately did **not** perform the full R9 user-surface language sweep. These items are deferred, not forgotten, and must be handled in Slice 7 before PR-ready handoff:
+
+- `src/gui/x0x-gui.html`: update owner-gated state controls and user-facing `Withdraw` language to any-admin disband language.
+- `tests/gui_named_group_parity.rs`: update GUI expectations if labels/data hooks change.
+- `docs/api.md`: update `DELETE /groups/:id`, `/state/withdraw`, `state-withdraw`, and creator-authored member rows.
+- `docs/primers/groups.md`: update `owner` and `withdraw / hide` wording.
+- `docs/api-reference.md`: finish adjacent stale rows outside Slice 5 scope, especially `Creator-authored member add/removal` and state-chain owner/admin wording.
+- `README.md`, proof reports, and design notes: classify remaining `owner`, `creator-authored`, `withdraw`, `delete group`, and `Leave or delete` occurrences as intended legacy/internal vocabulary or stale user-facing text.
+- Broader R9 grep before PR: search docs/GUI/API/CLI for `owner`, `creator-authored`, `withdraw`, `delete group`, `Leave or delete`, and `state-withdraw`; fix stale user-facing text or record intentional legacy/internal uses.

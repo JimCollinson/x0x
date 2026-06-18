@@ -8503,12 +8503,12 @@ async fn apply_named_group_metadata_event_inner(
                     .write()
                     .await
                     .remove(&resolved_group_key);
-                let treekem_snapshot = state.treekem_dir.join(format!("{resolved_group_key}.snap"));
-                if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to remove TreeKEM snapshot after self removal: {e}");
-                    }
-                }
+                remove_treekem_snapshot_for_group_id(
+                    state,
+                    &resolved_group_key,
+                    "member_removed_self",
+                )
+                .await;
                 save_named_groups(state).await;
                 save_mls_groups(state).await;
                 return true;
@@ -8752,12 +8752,12 @@ async fn apply_named_group_metadata_event_inner(
                     .write()
                     .await
                     .remove(&resolved_group_key);
-                let treekem_snapshot = state.treekem_dir.join(format!("{resolved_group_key}.snap"));
-                if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to remove TreeKEM snapshot after ban: {e}");
-                    }
-                }
+                remove_treekem_snapshot_for_group_id(
+                    state,
+                    &resolved_group_key,
+                    "member_banned_self",
+                )
+                .await;
             } else if let Some((commit_b64, epoch)) = treekem_payload {
                 use base64::Engine as _;
                 let commit_bytes = match BASE64.decode(commit_b64) {
@@ -11462,7 +11462,7 @@ fn treekem_leave_disposition(
     }
 }
 
-fn treekem_snapshot_path_for_drop(state: &AppState, group_id: &str) -> Option<std::path::PathBuf> {
+fn treekem_snapshot_file_name_for_drop(group_id: &str) -> Option<String> {
     if group_id.is_empty()
         || !group_id
             .bytes()
@@ -11470,7 +11470,11 @@ fn treekem_snapshot_path_for_drop(state: &AppState, group_id: &str) -> Option<st
     {
         return None;
     }
-    Some(state.treekem_dir.join(format!("{group_id}.snap")))
+    Some(format!("{group_id}.snap"))
+}
+
+fn treekem_snapshot_path_for_drop(state: &AppState, group_id: &str) -> Option<std::path::PathBuf> {
+    treekem_snapshot_file_name_for_drop(group_id).map(|name| state.treekem_dir.join(name))
 }
 
 async fn remove_treekem_snapshot_for_group_id(state: &AppState, group_id: &str, reason: &str) {
@@ -11601,12 +11605,7 @@ async fn leave_treekem_group(
     state.group_card_cache.write().await.remove(&id);
     state.mls_groups.write().await.remove(&id);
     state.treekem_groups.write().await.remove(&id);
-    let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
-    if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(group_id = %LogHexId::group(&id), "failed to remove TreeKEM snapshot after leave: {e}");
-        }
-    }
+    remove_treekem_snapshot_for_group_id(&state, &id, "treekem_leave").await;
     save_named_groups(&state).await;
     save_mls_groups(&state).await;
 
@@ -12042,12 +12041,7 @@ async fn leave_group(
     // nothing behind locally. No-op for GSS groups: no in-memory entry, and the
     // snapshot file does not exist (NotFound is ignored).
     state.treekem_groups.write().await.remove(&id);
-    let treekem_snapshot = state.treekem_dir.join(format!("{id}.snap"));
-    if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(group_id = %LogHexId::group(&id), "failed to remove TreeKEM snapshot on delete: {e}");
-        }
-    }
+    remove_treekem_snapshot_for_group_id(&state, &id, "leave_group").await;
     save_named_groups(&state).await;
     save_mls_groups(&state).await;
     stop_named_group_metadata_listener(&state, &id).await;
@@ -19798,6 +19792,26 @@ mod tests {
         }
         assert_eq!(names, vec![std::ffi::OsString::from("named_groups.json")]);
         Ok(())
+    }
+
+    #[test]
+    fn treekem_snapshot_drop_file_name_rejects_path_traversal_ids() {
+        assert_eq!(
+            treekem_snapshot_file_name_for_drop(&"ab".repeat(16)),
+            Some(format!("{}.snap", "ab".repeat(16)))
+        );
+        assert_eq!(
+            treekem_snapshot_file_name_for_drop("group-1_ok").as_deref(),
+            Some("group-1_ok.snap")
+        );
+
+        for unsafe_id in ["", "../outside", "a/b", "/absolute", "a\\b", "ümlaut"] {
+            assert_eq!(
+                treekem_snapshot_file_name_for_drop(unsafe_id),
+                None,
+                "unsafe id should not become a snapshot filename: {unsafe_id:?}"
+            );
+        }
     }
 
     #[test]

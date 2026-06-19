@@ -128,12 +128,25 @@ Deferred by Jim on 2026-06-18; Slice 5 intentionally did not expand into the ful
 
 Slice 5 implementation has strong local evidence at `f5cbe48`, but it is **not accepted/done**. Code review found a real HIGH durable-terminality gap that cannot be resolved without deciding whether Slice 5 now includes persistent withdrawn tombstones / terminality memory.
 
+### 2026-06-19 update — keyless withdrawn shell attempt
+
+- Build worktree local head: `939ab8c fix(adr-0016-phase-1): retain withdrawn disband shell`.
+- Build branch status: local commit only; **not pushed** because code review failed.
+- Implemented approved direction: retain withdrawn `GroupInfo` shell, wipe local crypto material, guard stale-card reanimation, update focused docs/CLI help, and update tests from removed-record semantics to withdrawn-shell semantics.
+- Local evidence at `939ab8c`:
+  - `cargo fmt --all` — PASS
+  - `cargo clippy --all-features --all-targets -- -D warnings` — PASS
+  - `cargo check --workspace --all-targets` — PASS
+  - `cargo nextest run --all-features -E 'test(leave) or test(disband) or test(withdraw)'` — PASS, 23/23
+  - `cargo nextest run --all-features --bin x0xd -E 'test(withdrawn_group_record_guard_matches_stable_id_for_stale_card_imports) or test(withdrawn_group_card_marks_existing_stub_without_regressing_newer_stub)'` — PASS, 2/2
+  - `cargo nextest run --all-features --test membership_authority --test parity_cli` — PASS, 29/29
+  - `cargo nextest run --all-features --no-fail-fast --test api_manifest --test parity_cli --test api_coverage --test gui_smoke --test gui_named_group_parity` — PASS, 42/42
+  - Ignored private-secure proof still failed at startup before assertions with known carve-out line: `x0xd pair-alice-787 did not become healthy within 90s`.
+- Independent code review result: **issues_found**; Slice 5 still not done.
+  - HIGH: post-withdraw TreeKEM events can still be queued before terminality rejection (`src/bin/x0xd.rs:8241-8264`, `7698-7724`, `7759-7793`). Fix class: short-circuit withdrawn groups before TreeKEM queue path, except explicitly allowed duplicate terminal-withdrawal handling.
+  - HIGH: withdrawn card import can wipe a live group without validating card authority against the roster (`src/groups/directory.rs:162-164`, `src/bin/x0xd.rs:13932-13954`, `src/bin/x0xd.rs:644-666`). Fix class: for existing local groups, do not mutate/wipe from a card alone unless authority/chain proof is validated; keep stale non-withdrawn reanimation guard intact.
+  - MEDIUM: alias records are not all marked withdrawn (`src/bin/x0xd.rs:11660-11668`, `12241-12265`, `12431-12435`). Fix class: ensure every local alias record for the same stable group is marked `withdrawn=true`, not merely key-cleared.
+
 ## Recommended next step
 
-Stop for Jim/maintainer decision:
-
-1. Expand Slice 5 to add durable withdrawn tombstones / terminality memory and update docs/tests accordingly; or
-2. Keep tombstones deferred and explicitly risk-accept that old non-withdrawn cards can recreate local stubs after local disband/drop until a later slice; or
-3. Redesign disband teardown semantics so a withdrawn local tombstone is retained while APIs still treat the live group as gone.
-
-Do not call Slice 5 done, and do not open a PR, until this decision is made and the code-review HIGH is resolved or explicitly accepted.
+Remediate the `939ab8c` code-review findings before pushing the build branch: block withdrawn groups before TreeKEM queuing/catchup, prevent card-only withdrawn imports from wiping live groups without authority/chain validation, and mark all same-group aliases withdrawn. Do not call Slice 5 done, and do not open a PR, until code review/verifier/adversarial/Craft/clean-context gates pass or Jim explicitly accepts/defers a finding.

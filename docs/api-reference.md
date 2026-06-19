@@ -312,6 +312,22 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | DELETE | `/groups/discover/subscribe/:kind/:shard` | `x0x group discover-unsubscribe` | **Phase C.2**: unsubscribe from a shard |
 | DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave the group by self-removing, for any rank. The last admin is blocked; promote another admin first or use `x0x group disband` |
 
+### Leaving vs disbanding a group
+
+`x0x group leave` (`DELETE /groups/:id`) is self-removal: **I'm out; the
+group lives on**. Any rank may leave, but the last admin receives `409` and must
+promote another admin first (or disband instead). Local secure material is wiped
+on leave.
+
+`x0x group disband` (`POST /groups/:id/state/withdraw`) is admin-only and
+irreversible: **group over for everyone, permanently**. It seals the unchanged
+signed terminal `GroupDeleted` commit over metadata/direct delivery; the
+withdrawn public card supersedes discovery. After disband, each recipient keeps
+only a withdrawn keyless metadata shell: MLS/TreeKEM/GSS key material is wiped,
+the terminal record remains to block stale-card reanimation, and all authoring
+is rejected. Delivery is best-effort to online/reachable peers; offline peers are
+not guaranteed to receive the disband event.
+
 ### Phase C.2 — distributed shard discovery
 
 x0x indexes `PublicDirectory` groups across **tag / name / exact-id
@@ -391,8 +407,9 @@ Each named group maintains a signed commit chain:
   permanently ends the group by sealing a terminal higher-revision commit with
   `withdrawn=true`. Members are notified with the unchanged signed
   `GroupDeleted` metadata event over the group metadata topic plus direct
-  delivery; recipients verify the terminal commit and remove their live local
-  group state. The terminal commit remains signed/verifiable wherever retained.
+  delivery; recipients verify the terminal commit, retain the withdrawn metadata
+  shell, and wipe local MLS/TreeKEM/GSS key material. The terminal commit remains
+  signed/verifiable in that retained record.
   A withdrawn card is also refreshed to supersede public discovery listings on
   receipt regardless of TTL; Hidden groups rely on the metadata/direct disband
   event, not public-card discovery.

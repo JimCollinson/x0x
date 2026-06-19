@@ -1442,23 +1442,66 @@ async fn named_group_admin_disband_propagates_to_peer_after_creator_delete_409()
         .unwrap();
     assert_eq!(disband["ok"], true, "disband response: {disband:?}");
 
-    let deleted_seen = wait_until(Duration::from_secs(30), || async {
-        let resp = alice.get(&format!("/groups/{group_id}")).await;
-        resp.status() == StatusCode::NOT_FOUND
-    })
-    .await;
-    assert!(
-        deleted_seen,
-        "alice never observed non-creator admin disband over private metadata/direct propagation"
+    let bob_withdrawn = group_state(bob, &bob_group_id)
+        .await
+        .expect("disbanding admin should retain terminal state");
+    assert_eq!(
+        bob_withdrawn["withdrawn"], true,
+        "bob state: {bob_withdrawn:?}"
     );
-    let bob_local_gone = wait_until(Duration::from_secs(30), || async {
-        let resp = bob.get(&format!("/groups/{bob_group_id}")).await;
-        resp.status() == StatusCode::NOT_FOUND
+    let bob_encrypt = bob
+        .post(
+            &format!("/groups/{bob_group_id}/secure/encrypt"),
+            serde_json::json!({ "payload_b64": "aGk=" }),
+        )
+        .await;
+    assert_eq!(
+        bob_encrypt.status(),
+        StatusCode::CONFLICT,
+        "disbander authoring must be rejected after withdrawal"
+    );
+    assert!(
+        !tokio::fs::try_exists(
+            bob.data_dir()
+                .join("treekem")
+                .join(format!("{bob_group_id}.snap"))
+        )
+        .await
+        .unwrap_or(false),
+        "disbanding admin TreeKEM snapshot should be wiped"
+    );
+
+    let withdrawn_seen = wait_until(Duration::from_secs(30), || async {
+        group_state(alice, &group_id)
+            .await
+            .is_some_and(|state| state["withdrawn"] == true)
     })
     .await;
     assert!(
-        bob_local_gone,
-        "disbanding admin did not tear down its own private_secure group"
+        withdrawn_seen,
+        "alice never observed non-creator admin disband as retained withdrawn shell"
+    );
+    let alice_encrypt = alice
+        .post(
+            &format!("/groups/{group_id}/secure/encrypt"),
+            serde_json::json!({ "payload_b64": "aGk=" }),
+        )
+        .await;
+    assert_eq!(
+        alice_encrypt.status(),
+        StatusCode::CONFLICT,
+        "recipient authoring must be rejected after withdrawal"
+    );
+    assert!(
+        !tokio::fs::try_exists(
+            alice
+                .data_dir()
+                .join("treekem")
+                .join(format!("{group_id}.snap"))
+        )
+        .await
+        .unwrap_or(false),
+        "recipient TreeKEM snapshot should be wiped after GroupDeleted"
     );
 }
 

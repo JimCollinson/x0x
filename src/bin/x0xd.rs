@@ -663,6 +663,7 @@ fn apply_withdrawn_group_card_to_group_info(
     }
     info.prev_state_hash = card.prev_state_hash.clone();
     info.withdrawn = true;
+    clear_group_info_key_material(info);
     if info
         .genesis
         .as_ref()
@@ -6049,6 +6050,26 @@ fn named_group_metadata_event_kind(event: &NamedGroupMetadataEvent) -> &'static 
     }
 }
 
+fn named_group_metadata_event_group_id(event: &NamedGroupMetadataEvent) -> &str {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded { group_id, .. }
+        | NamedGroupMetadataEvent::MemberRemoved { group_id, .. }
+        | NamedGroupMetadataEvent::GroupDeleted { group_id, .. }
+        | NamedGroupMetadataEvent::PolicyUpdated { group_id, .. }
+        | NamedGroupMetadataEvent::MemberRoleUpdated { group_id, .. }
+        | NamedGroupMetadataEvent::MemberBanned { group_id, .. }
+        | NamedGroupMetadataEvent::MemberUnbanned { group_id, .. }
+        | NamedGroupMetadataEvent::JoinRequestCreated { group_id, .. }
+        | NamedGroupMetadataEvent::JoinRequestApproved { group_id, .. }
+        | NamedGroupMetadataEvent::JoinRequestRejected { group_id, .. }
+        | NamedGroupMetadataEvent::JoinRequestCancelled { group_id, .. }
+        | NamedGroupMetadataEvent::GroupCardPublished { group_id, .. }
+        | NamedGroupMetadataEvent::GroupMetadataUpdated { group_id, .. }
+        | NamedGroupMetadataEvent::MemberJoined { group_id, .. }
+        | NamedGroupMetadataEvent::SecureShareDelivered { group_id, .. } => group_id,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WelcomeBlobMessage {
@@ -6654,6 +6675,18 @@ async fn spawn_global_discovery_listener(state: Arc<AppState>) {
                             continue;
                         }
 
+                        let local_group_withdrawn = {
+                            let groups = state.named_groups.read().await;
+                            has_withdrawn_group_record(&groups, &card.group_id)
+                        };
+                        if local_group_withdrawn {
+                            tracing::debug!(
+                                group_id = %card.group_id,
+                                "D.3: dropped stale non-withdrawn card for withdrawn group"
+                            );
+                            continue;
+                        }
+
                         // Only accept cards that are allowed on a public
                         // discovery surface. Hidden and ListedToContacts must
                         // never be cached from the global discovery topic.
@@ -6923,6 +6956,17 @@ async fn handle_directory_message(
                 );
                 return;
             }
+            let local_group_withdrawn = {
+                let groups = state.named_groups.read().await;
+                has_withdrawn_group_record(&groups, &card.group_id)
+            };
+            if !card.withdrawn && local_group_withdrawn {
+                tracing::debug!(
+                    group_id = %card.group_id,
+                    "C.2: dropped stale non-withdrawn card for withdrawn group"
+                );
+                return;
+            }
             let accepted = state
                 .directory_cache
                 .write()
@@ -6932,9 +6976,12 @@ async fn handle_directory_message(
                 // Also update the legacy bridge cache so existing
                 // /groups/discover responses continue to reflect shard
                 // discoveries until D.4 deprecates that path.
-                if !card.withdrawn
-                    && card.policy_summary.discoverability
-                        != x0x::groups::GroupDiscoverability::Hidden
+                if card.withdrawn {
+                    let mut cache = state.group_card_cache.write().await;
+                    prune_expired_group_cards(&mut cache, now_millis_u64());
+                    remove_group_card_if_not_stale(&mut cache, &card);
+                } else if card.policy_summary.discoverability
+                    != x0x::groups::GroupDiscoverability::Hidden
                 {
                     let mut cache = state.group_card_cache.write().await;
                     prune_expired_group_cards(&mut cache, now_millis_u64());
@@ -7136,6 +7183,17 @@ async fn spawn_listed_to_contacts_listener(state: Arc<AppState>) {
                                 "C.2/LTC: evicted withdrawn card from contact cache"
                             );
                         }
+                        continue;
+                    }
+                    let local_group_withdrawn = {
+                        let groups = state.named_groups.read().await;
+                        has_withdrawn_group_record(&groups, &card.group_id)
+                    };
+                    if local_group_withdrawn {
+                        tracing::debug!(
+                            group_id = %card.group_id,
+                            "C.2/LTC: dropped stale non-withdrawn card for withdrawn group"
+                        );
                         continue;
                     }
                     let mut cache = state.group_card_cache.write().await;
@@ -8606,14 +8664,12 @@ async fn apply_named_group_metadata_event_inner(
                     return false;
                 }
             };
-            let stable_group_id = next.stable_group_id().to_string();
-            drop_local_named_group_state(
-                state,
-                &resolved_group_key,
-                Some(&stable_group_id),
-                "group_deleted",
-            )
-            .await;
+            // Keep the signed terminal record as a keyless withdrawn shell.
+            // ADR-0012's "leave nothing behind" is interpreted as wiping MLS,
+            // TreeKEM snapshots/queues and GSS shared_secret material; the
+            // retained GroupInfo is the guard that blocks stale-card imports
+            // from recreating a live authoring-capable group.
+            retain_withdrawn_group_shell(state, &resolved_group_key, next, "group_deleted").await;
             true
         }
         NamedGroupMetadataEvent::PolicyUpdated {
@@ -9201,6 +9257,9 @@ async fn apply_named_group_metadata_event_inner(
             false
         }
         NamedGroupMetadataEvent::GroupCardPublished { card, .. } => {
+            if info.withdrawn && !card.withdrawn {
+                return false;
+            }
             let sender_is_admin = info
                 .caller_role(&sender_hex)
                 .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
@@ -9280,6 +9339,13 @@ async fn apply_named_group_metadata_event_inner(
             // performance optimisation, not a security boundary.
             let self_hex = hex::encode(state.agent.agent_id().as_bytes());
             if recipient != self_hex {
+                return false;
+            }
+            if info.withdrawn {
+                tracing::debug!(
+                    group_id = %ev_group_id,
+                    "ignoring SecureShareDelivered for withdrawn group"
+                );
                 return false;
             }
             // Only accept from an active admin+.
@@ -9707,7 +9773,13 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
 
     let metadata_topic = {
         let groups = state.named_groups.read().await;
-        groups.get(group_id).map(|g| g.metadata_topic.clone())
+        groups.get(group_id).and_then(|g| {
+            if g.withdrawn {
+                None
+            } else {
+                Some(g.metadata_topic.clone())
+            }
+        })
     };
     let Some(metadata_topic) = metadata_topic else {
         return;
@@ -9769,7 +9841,9 @@ async fn ensure_named_group_listeners(state: Arc<AppState>, group_id: &str) {
     let public_topic_key = {
         let groups = state.named_groups.read().await;
         groups.get(group_id).and_then(|info| {
-            if info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted {
+            if info.withdrawn
+                || info.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted
+            {
                 None
             } else {
                 Some(info.stable_group_id().to_string())
@@ -10156,6 +10230,9 @@ async fn send_group_public_message(
         let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return resp;
+        }
         if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
             return bad_request("group is not SignedPublic — use /groups/:id/secure/encrypt");
         }
@@ -10436,16 +10513,22 @@ async fn ingest_public_message(
                     info.policy.clone(),
                     info.members_v2.clone(),
                     info.stable_group_id().to_string(),
+                    info.withdrawn,
                 )
             })
     };
-    let Some((policy, members, stable_id)) = snapshot else {
+    let Some((policy, members, stable_id, withdrawn)) = snapshot else {
         // Unknown group — count under the stable id we were given as the
         // logging key. Useful for spotting messages that arrived before the
         // local daemon learned about the group.
         state.groups_diagnostics.record_other_drop(group_id_for_log);
         return;
     };
+    if withdrawn {
+        state.groups_diagnostics.record_other_drop(&stable_id);
+        tracing::debug!(group_id = %group_id_for_log, "E: dropped public message for withdrawn group");
+        return;
+    }
     let ctx = x0x::groups::PublicIngestContext {
         group_id: &stable_id,
         policy: &policy,
@@ -10535,6 +10618,20 @@ async fn spawn_global_public_message_listener(state: Arc<AppState>) {
 /// message published after group creation/join cannot race ahead of the local
 /// listener. The spawned task owns only the receive loop.
 async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
+    {
+        let groups = state.named_groups.read().await;
+        if groups
+            .get(&group_id)
+            .or_else(|| {
+                groups
+                    .values()
+                    .find(|info| info.stable_group_id() == group_id.as_str())
+            })
+            .is_some_and(|info| info.withdrawn)
+        {
+            return;
+        }
+    }
     {
         let tasks = state.public_message_tasks.read().await;
         if tasks.contains_key(&group_id) {
@@ -10788,6 +10885,15 @@ async fn join_group_via_invite(
 
     let agent_id = state.agent.agent_id();
     let group_id_hex = invite.group_id.clone();
+    let invite_stable_group_id = invite.stable_group_id.as_deref().unwrap_or(&group_id_hex);
+    {
+        let groups = state.named_groups.read().await;
+        if has_withdrawn_group_record(&groups, &group_id_hex)
+            || has_withdrawn_group_record(&groups, invite_stable_group_id)
+        {
+            return api_error(StatusCode::CONFLICT, "group is withdrawn");
+        }
+    }
     let inviter = match parse_agent_id_hex(&invite.inviter) {
         Ok(id) => id,
         Err(e) => {
@@ -11519,6 +11625,175 @@ async fn remove_treekem_snapshot_for_group_id(state: &AppState, group_id: &str, 
     }
 }
 
+fn group_id_matches_alias(candidate: &str, id: &str, stable_group_id: Option<&str>) -> bool {
+    candidate == id || stable_group_id.is_some_and(|stable| candidate == stable)
+}
+
+fn join_result_key_matches_group_alias(key: &str, id: &str, stable_group_id: Option<&str>) -> bool {
+    key.split_once(':')
+        .map(|(group_id, _)| group_id_matches_alias(group_id, id, stable_group_id))
+        .unwrap_or(false)
+}
+
+fn has_withdrawn_group_record(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> bool {
+    groups.get(group_id).is_some_and(|info| info.withdrawn)
+        || groups.values().any(|info| {
+            info.withdrawn && (info.stable_group_id() == group_id || info.mls_group_id == group_id)
+        })
+}
+
+fn clear_group_info_key_material(info: &mut x0x::groups::GroupInfo) {
+    info.shared_secret = None;
+}
+
+async fn wipe_local_group_crypto_material(
+    state: &AppState,
+    id: &str,
+    stable_group_id: Option<&str>,
+    reason: &str,
+) {
+    let stable_group_id = stable_group_id.filter(|stable| *stable != id);
+    {
+        let mut groups = state.named_groups.write().await;
+        if let Some(info) = groups.get_mut(id) {
+            clear_group_info_key_material(info);
+        }
+        if let Some(stable_group_id) = stable_group_id {
+            if let Some(info) = groups.get_mut(stable_group_id) {
+                clear_group_info_key_material(info);
+            }
+        }
+    }
+    {
+        let mut cache = state.group_card_cache.write().await;
+        cache.remove(id);
+        if let Some(stable_group_id) = stable_group_id {
+            cache.remove(stable_group_id);
+        }
+    }
+    {
+        let mut mls_groups = state.mls_groups.write().await;
+        mls_groups.remove(id);
+        if let Some(stable_group_id) = stable_group_id {
+            mls_groups.remove(stable_group_id);
+        }
+    }
+    {
+        let mut treekem_groups = state.treekem_groups.write().await;
+        treekem_groups.remove(id);
+        if let Some(stable_group_id) = stable_group_id {
+            treekem_groups.remove(stable_group_id);
+        }
+    }
+    {
+        let mut pending = state.treekem_pending_events.write().await;
+        pending.remove(id);
+        if let Some(stable_group_id) = stable_group_id {
+            pending.remove(stable_group_id);
+        }
+    }
+    {
+        let mut event_log = state.treekem_event_log.write().await;
+        event_log.remove(id);
+        if let Some(stable_group_id) = stable_group_id {
+            event_log.remove(stable_group_id);
+        }
+    }
+    {
+        let mut catchup = state.treekem_catchup_throttle.write().await;
+        catchup.remove(id);
+        if let Some(stable_group_id) = stable_group_id {
+            catchup.remove(stable_group_id);
+        }
+    }
+    {
+        let mut join_results = state.pending_join_results.write().await;
+        join_results.retain(|key, pending| {
+            !join_result_key_matches_group_alias(key, id, stable_group_id)
+                && !group_id_matches_alias(
+                    named_group_metadata_event_group_id(&pending.event),
+                    id,
+                    stable_group_id,
+                )
+        });
+    }
+    if let Ok(mut expected) = state.expected_join_result_inviters.lock() {
+        expected.retain(|key, _| !join_result_key_matches_group_alias(key, id, stable_group_id));
+    }
+
+    let mut welcome_ids = Vec::new();
+    {
+        let mut welcomes = state.pending_welcomes.write().await;
+        welcomes.retain(|welcome_id, pending| {
+            let drop = group_id_matches_alias(&pending.group_id, id, stable_group_id);
+            if drop {
+                welcome_ids.push(welcome_id.clone());
+            }
+            !drop
+        });
+    }
+    {
+        let mut receives = state.pending_welcome_receives.write().await;
+        receives.retain(|welcome_id, pending| {
+            let drop = group_id_matches_alias(&pending.group_id, id, stable_group_id);
+            if drop {
+                welcome_ids.push(welcome_id.clone());
+            }
+            !drop
+        });
+    }
+    if !welcome_ids.is_empty() {
+        let mut waiters = state.pending_welcome_waiters.write().await;
+        let mut acks = state.pending_welcome_acks.write().await;
+        for welcome_id in welcome_ids {
+            waiters.remove(&welcome_id);
+            acks.remove(&welcome_id);
+        }
+    }
+
+    remove_treekem_snapshot_for_group_id(state, id, reason).await;
+    if let Some(stable_group_id) = stable_group_id {
+        remove_treekem_snapshot_for_group_id(state, stable_group_id, reason).await;
+    }
+}
+
+async fn remove_directory_cache_entries_for_group_info(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+) {
+    let stable_group_id = info.stable_group_id().to_string();
+    let shards = x0x::groups::shards_for_public(&info.tags, &info.name, &stable_group_id);
+    let mut cache = state.directory_cache.write().await;
+    for (kind, shard, _) in shards {
+        cache.remove(kind, shard, &stable_group_id);
+    }
+}
+
+async fn retain_withdrawn_group_shell(
+    state: &AppState,
+    group_id: &str,
+    mut info: x0x::groups::GroupInfo,
+    reason: &str,
+) {
+    let stable_group_id = info.stable_group_id().to_string();
+    clear_group_info_key_material(&mut info);
+    {
+        let mut groups = state.named_groups.write().await;
+        groups.insert(group_id.to_string(), info.clone());
+        if stable_group_id != group_id && groups.contains_key(&stable_group_id) {
+            groups.insert(stable_group_id.clone(), info.clone());
+        }
+    }
+    wipe_local_group_crypto_material(state, group_id, Some(&stable_group_id), reason).await;
+    remove_directory_cache_entries_for_group_info(state, &info).await;
+    refresh_group_card_cache_from_info(state, group_id, &info).await;
+    save_named_groups(state).await;
+    save_mls_groups(state).await;
+}
+
 async fn drop_local_named_group_state(
     state: &AppState,
     id: &str,
@@ -11963,6 +12238,11 @@ async fn withdraw_group_state(
                 );
             }
         };
+        // Disband retains a keyless withdrawn shell: ADR-0012's "leave
+        // nothing behind" means no MLS/TreeKEM/GSS key material survives, not
+        // that the terminal metadata record is deleted. Keeping this record is
+        // the stale-card reanimation guard for future imports.
+        clear_group_info_key_material(info);
         let metadata_topic = info.metadata_topic.clone();
         let event_group_id = info.stable_group_id().to_string();
         let delivery_roster = info.clone();
@@ -11981,17 +12261,24 @@ async fn withdraw_group_state(
         )
     };
     save_named_groups(&state).await;
+    wipe_local_group_crypto_material(&state, &id, Some(&event_group_id), "withdraw_disband").await;
+    save_named_groups(&state).await;
 
-    // Refresh the withdrawn-card path for public discovery supersession. Hidden
-    // groups still do not publish public cards, so their disband propagation is
-    // the signed GroupDeleted metadata/direct event above.
-    let _ = publish_group_card_to_discovery_inner(&state, &id, false).await;
-    drop_local_named_group_state(&state, &id, Some(&event_group_id), "withdraw_disband").await;
+    // Refresh the withdrawn-card path for public discovery supersession after
+    // stale local cards are gone. Hidden groups still do not publish public
+    // cards, so their disband propagation is the signed GroupDeleted
+    // metadata/direct event above.
+    maybe_publish_group_card_after_state_change(&state, &id).await;
+    stop_named_group_metadata_listener(&state, &id).await;
+    if event_group_id != id {
+        stop_named_group_metadata_listener(&state, &event_group_id).await;
+    }
 
-    // Keep the per-group membership lock until local live state is gone, so no
-    // concurrent API mutator can author a post-withdrawal commit in the narrow
-    // terminal window. The network-facing GroupDeleted publish/direct-delivery
-    // happens after the lock is released; all required data was captured above.
+    // Keep the per-group membership lock until local key material is gone and
+    // the retained record is visibly withdrawn, so no concurrent API mutator can
+    // author a post-withdrawal commit in the narrow terminal window. The
+    // network-facing GroupDeleted publish/direct-delivery happens after the lock
+    // is released; all required data was captured above.
     drop(membership_guard);
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -13654,12 +13941,35 @@ async fn import_group_card(
         drop(cache);
 
         let mut groups = state.named_groups.write().await;
-        let marked_withdrawn = groups
-            .get_mut(&group_id)
+        let local_group_key = groups.get(&group_id).map(|_| group_id.clone()).or_else(|| {
+            groups
+                .iter()
+                .find(|(_, info)| info.stable_group_id() == group_id)
+                .map(|(key, _)| key.clone())
+        });
+        let marked_withdrawn = local_group_key
+            .as_ref()
+            .and_then(|key| groups.get_mut(key))
             .map(|info| apply_withdrawn_group_card_to_group_info(info, &card))
             .unwrap_or(false);
         drop(groups);
         if marked_withdrawn {
+            wipe_local_group_crypto_material(
+                &state,
+                local_group_key.as_deref().unwrap_or(&group_id),
+                Some(&group_id),
+                "withdrawn_card_import",
+            )
+            .await;
+            let refresh_target = {
+                let groups = state.named_groups.read().await;
+                let key = local_group_key.as_deref().unwrap_or(&group_id);
+                groups.get(key).cloned().map(|info| (key.to_string(), info))
+            };
+            if let Some((key, info)) = refresh_target {
+                remove_directory_cache_entries_for_group_info(&state, &info).await;
+                refresh_group_card_cache_from_info(&state, &key, &info).await;
+            }
             save_named_groups(&state).await;
         }
         return (
@@ -13681,7 +13991,7 @@ async fn import_group_card(
 
     {
         let groups = state.named_groups.read().await;
-        if groups.get(&group_id).is_some_and(|info| info.withdrawn) {
+        if has_withdrawn_group_record(&groups, &group_id) {
             return api_error(StatusCode::CONFLICT, "group is withdrawn");
         }
     }
@@ -13980,6 +14290,9 @@ async fn secure_group_encrypt(
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
+    }
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
     }
@@ -14069,6 +14382,9 @@ async fn secure_group_decrypt(
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
+    }
     if !info.has_active_member(&caller_hex) && !info.is_banned(&caller_hex) {
         // Removed/never-member callers can't decrypt.
         return forbidden("not a member");
@@ -14196,6 +14512,9 @@ async fn secure_group_reseal(
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
+    }
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
     }
@@ -14286,6 +14605,12 @@ async fn secure_open_envelope_adversarial(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenEnvelopeRequest>,
 ) -> impl IntoResponse {
+    {
+        let groups = state.named_groups.read().await;
+        if has_withdrawn_group_record(&groups, &req.group_id) {
+            return api_error(StatusCode::CONFLICT, "group is withdrawn");
+        }
+    }
     use base64::Engine as _;
     let kem_ct = match BASE64.decode(&req.kem_ciphertext_b64) {
         Ok(b) => b,
@@ -17495,6 +17820,9 @@ async fn restore_treekem_groups(
     let mut restored = HashMap::new();
     let agent_id = agent.agent_id();
     for (group_id_hex, info) in named_groups {
+        if info.withdrawn {
+            continue;
+        }
         if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
             continue;
         }
@@ -19824,6 +20152,7 @@ mod tests {
         info.state_revision = 1;
         info.updated_at = 1_000;
         info.withdrawn = false;
+        info.shared_secret = Some(vec![9; 32]);
 
         let mut withdrawal = sample_group_card("same", 2, 2_000);
         withdrawal.withdrawn = true;
@@ -19835,6 +20164,7 @@ mod tests {
         assert!(info.withdrawn);
         assert_eq!(info.state_revision, 2);
         assert_eq!(info.state_hash, "state-2");
+        assert_eq!(info.shared_secret, None);
 
         let mut newer_info = info.clone();
         newer_info.withdrawn = false;
@@ -19847,6 +20177,34 @@ mod tests {
         ));
         assert!(!newer_info.withdrawn);
         assert_eq!(newer_info.state_revision, 3);
+    }
+
+    #[test]
+    fn withdrawn_group_record_guard_matches_stable_id_for_stale_card_imports() {
+        let mut groups = HashMap::new();
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "withdrawn".to_string(),
+            String::new(),
+            AgentId([2; 32]),
+            "local-mls-id".to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "stable-card-id".to_string(),
+            "02".repeat(32),
+            info.created_at,
+            String::new(),
+        ));
+        info.withdrawn = true;
+        groups.insert("local-mls-id".to_string(), info);
+
+        assert!(has_withdrawn_group_record(&groups, "local-mls-id"));
+        assert!(has_withdrawn_group_record(&groups, "stable-card-id"));
+        assert!(join_result_key_matches_group_alias(
+            "stable-card-id:member",
+            "local-mls-id",
+            Some("stable-card-id")
+        ));
     }
 
     #[tokio::test]

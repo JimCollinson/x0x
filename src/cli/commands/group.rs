@@ -143,7 +143,7 @@ pub async fn set_name(client: &DaemonClient, group_id: &str, name: &str) -> Resu
     Ok(())
 }
 
-/// `x0x group leave` — DELETE /groups/:id.
+/// `x0x group leave` — DELETE /groups/:id (self-removal; group continues).
 pub async fn leave(client: &DaemonClient, group_id: &str) -> Result<()> {
     client.run_delete(&format!("/groups/{group_id}")).await
 }
@@ -428,7 +428,7 @@ pub async fn state_seal(client: &DaemonClient, group_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `x0x group disband` — POST /groups/:id/state/withdraw.
+/// `x0x group disband` — POST /groups/:id/state/withdraw (irreversible terminal withdrawal).
 pub async fn disband(client: &DaemonClient, group_id: &str) -> Result<()> {
     post_state_withdraw(client, group_id).await
 }

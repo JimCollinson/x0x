@@ -588,6 +588,9 @@ fn membership_authority_group_deleted_withdrawal_commit_applies_under_admin_auth
     let next = apply_group_deleted_event(&replica, event_revision, &hex_id(&admin), &commit)
         .expect("GroupDeleted withdrawal applies through signed admin path");
     assert!(next.withdrawn);
+    assert_eq!(next.mls_group_id, replica.mls_group_id);
+    assert_eq!(next.stable_group_id(), replica.stable_group_id());
+    assert_eq!(next.members_v2, replica.members_v2);
     assert_eq!(next.state_hash, authority.state_hash);
 }
 

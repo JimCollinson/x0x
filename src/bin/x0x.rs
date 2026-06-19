@@ -795,7 +795,7 @@ enum GroupSub {
         /// Display name.
         name: String,
     },
-    /// Leave a group.
+    /// Leave this member/daemon; the group continues (last admin is blocked).
     Leave {
         /// Group ID.
         group_id: String,
@@ -955,7 +955,7 @@ enum GroupSub {
         /// Group ID.
         group_id: String,
     },
-    /// Disband a group by sealing a terminal withdrawal commit.
+    /// Irreversibly disband for everyone; retains a withdrawn keyless shell.
     #[command(alias = "state-withdraw")]
     Disband {
         /// Group ID.

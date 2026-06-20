@@ -489,7 +489,8 @@ struct AppState {
     /// without blocking other groups (and without holding the map lock across
     /// disk IO). Snapshots persist under [`Self::treekem_dir`].
     treekem_groups: RwLock<HashMap<String, Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>>>,
-    /// Directory holding `<group_id>.snap` TreeKEM snapshots (mode 0600).
+    /// Directory holding `<group_id>.snap` snapshots and `<group_id>.journal`
+    /// TreeKEM persistence journals (mode 0600).
     treekem_dir: PathBuf,
     /// Active WebSocket sessions.
     ws_sessions: RwLock<HashMap<String, WsSession>>,
@@ -8631,7 +8632,7 @@ async fn apply_named_group_metadata_event_inner(
                     .write()
                     .await
                     .remove(&resolved_group_key);
-                remove_treekem_snapshot_for_group_id(
+                remove_treekem_persistence_for_group_id(
                     state,
                     &resolved_group_key,
                     "member_removed_self",
@@ -8878,7 +8879,7 @@ async fn apply_named_group_metadata_event_inner(
                     .write()
                     .await
                     .remove(&resolved_group_key);
-                remove_treekem_snapshot_for_group_id(
+                remove_treekem_persistence_for_group_id(
                     state,
                     &resolved_group_key,
                     "member_banned_self",
@@ -11663,7 +11664,7 @@ fn treekem_leave_disposition(
     }
 }
 
-fn treekem_snapshot_file_name_for_drop(group_id: &str) -> Option<String> {
+fn treekem_persistence_file_name_for_drop(group_id: &str, extension: &str) -> Option<String> {
     if group_id.is_empty()
         || !group_id
             .bytes()
@@ -11671,27 +11672,80 @@ fn treekem_snapshot_file_name_for_drop(group_id: &str) -> Option<String> {
     {
         return None;
     }
-    Some(format!("{group_id}.snap"))
+    Some(format!("{group_id}.{extension}"))
+}
+
+fn treekem_snapshot_file_name_for_drop(group_id: &str) -> Option<String> {
+    treekem_persistence_file_name_for_drop(group_id, "snap")
+}
+
+fn treekem_journal_file_name_for_drop(group_id: &str) -> Option<String> {
+    treekem_persistence_file_name_for_drop(group_id, "journal")
+}
+
+fn treekem_snapshot_path_for_drop_in_dir(
+    treekem_dir: &FsPath,
+    group_id: &str,
+) -> Option<std::path::PathBuf> {
+    treekem_snapshot_file_name_for_drop(group_id).map(|name| treekem_dir.join(name))
+}
+
+fn treekem_journal_path_for_drop_in_dir(
+    treekem_dir: &FsPath,
+    group_id: &str,
+) -> Option<std::path::PathBuf> {
+    treekem_journal_file_name_for_drop(group_id).map(|name| treekem_dir.join(name))
 }
 
 fn treekem_snapshot_path_for_drop(state: &AppState, group_id: &str) -> Option<std::path::PathBuf> {
-    treekem_snapshot_file_name_for_drop(group_id).map(|name| state.treekem_dir.join(name))
+    treekem_snapshot_path_for_drop_in_dir(&state.treekem_dir, group_id)
 }
 
-async fn remove_treekem_snapshot_for_group_id(state: &AppState, group_id: &str, reason: &str) {
-    let Some(treekem_snapshot) = treekem_snapshot_path_for_drop(state, group_id) else {
+fn treekem_journal_path_for_drop(state: &AppState, group_id: &str) -> Option<std::path::PathBuf> {
+    treekem_journal_path_for_drop_in_dir(&state.treekem_dir, group_id)
+}
+
+async fn remove_treekem_persistence_file(
+    path: &FsPath,
+    group_id: &str,
+    reason: &str,
+    file_kind: &str,
+) {
+    if let Err(e) = tokio::fs::remove_file(path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(group_id = %LogHexId::group(group_id), reason = %reason, file_kind, "failed to remove TreeKEM persistence file while dropping local group state: {e}");
+        }
+    }
+}
+
+async fn remove_treekem_persistence_for_group_id_in_dir(
+    treekem_dir: &FsPath,
+    group_id: &str,
+    reason: &str,
+) {
+    let Some(treekem_snapshot) = treekem_snapshot_path_for_drop_in_dir(treekem_dir, group_id)
+    else {
         tracing::warn!(
             group_id = %LogHexId::group(group_id),
             reason = %reason,
-            "skipping unsafe TreeKEM snapshot id while dropping local group state"
+            "skipping unsafe TreeKEM persistence id while dropping local group state"
         );
         return;
     };
-    if let Err(e) = tokio::fs::remove_file(&treekem_snapshot).await {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(group_id = %LogHexId::group(group_id), reason = %reason, "failed to remove TreeKEM snapshot while dropping local group state: {e}");
-        }
-    }
+    let Some(treekem_journal) = treekem_journal_path_for_drop_in_dir(treekem_dir, group_id) else {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            reason = %reason,
+            "skipping unsafe TreeKEM persistence id while dropping local group state"
+        );
+        return;
+    };
+    remove_treekem_persistence_file(&treekem_snapshot, group_id, reason, "snapshot").await;
+    remove_treekem_persistence_file(&treekem_journal, group_id, reason, "journal").await;
+}
+
+async fn remove_treekem_persistence_for_group_id(state: &AppState, group_id: &str, reason: &str) {
+    remove_treekem_persistence_for_group_id_in_dir(&state.treekem_dir, group_id, reason).await;
 }
 
 fn collect_same_stable_group_aliases(
@@ -11799,11 +11853,15 @@ async fn local_group_has_protected_crypto_material(
         }
     }
     for alias in aliases {
-        let Some(path) = treekem_snapshot_path_for_drop(state, alias) else {
-            continue;
-        };
-        if tokio::fs::try_exists(path).await.unwrap_or(false) {
-            return true;
+        if let Some(path) = treekem_snapshot_path_for_drop(state, alias) {
+            if tokio::fs::try_exists(path).await.unwrap_or(false) {
+                return true;
+            }
+        }
+        if let Some(path) = treekem_journal_path_for_drop(state, alias) {
+            if tokio::fs::try_exists(path).await.unwrap_or(false) {
+                return true;
+            }
         }
     }
     false
@@ -11928,7 +11986,7 @@ async fn wipe_local_group_crypto_material(
     }
 
     for alias in &aliases {
-        remove_treekem_snapshot_for_group_id(state, alias, reason).await;
+        remove_treekem_persistence_for_group_id(state, alias, reason).await;
     }
 }
 
@@ -12005,9 +12063,9 @@ async fn drop_local_named_group_state(
             treekem_groups.remove(stable_group_id);
         }
     }
-    remove_treekem_snapshot_for_group_id(state, id, reason).await;
+    remove_treekem_persistence_for_group_id(state, id, reason).await;
     if let Some(stable_group_id) = stable_group_id {
-        remove_treekem_snapshot_for_group_id(state, stable_group_id, reason).await;
+        remove_treekem_persistence_for_group_id(state, stable_group_id, reason).await;
     }
     save_named_groups(state).await;
     save_mls_groups(state).await;
@@ -12085,7 +12143,7 @@ async fn leave_treekem_group(
     state.group_card_cache.write().await.remove(&id);
     state.mls_groups.write().await.remove(&id);
     state.treekem_groups.write().await.remove(&id);
-    remove_treekem_snapshot_for_group_id(&state, &id, "treekem_leave").await;
+    remove_treekem_persistence_for_group_id(&state, &id, "treekem_leave").await;
     save_named_groups(&state).await;
     save_mls_groups(&state).await;
 
@@ -12540,12 +12598,13 @@ async fn leave_group(
     prune_expired_group_cards(&mut cache, now_millis_u64());
     cache.remove(&id);
     state.mls_groups.write().await.remove(&id);
-    // ADR-0012: drop the live TreeKEM group and wipe its at-rest snapshot
-    // (which contains private key material) so a left secure group leaves
-    // nothing behind locally. No-op for GSS groups: no in-memory entry, and the
-    // snapshot file does not exist (NotFound is ignored).
+    // ADR-0012: drop the live TreeKEM group and wipe at-rest TreeKEM
+    // persistence (snapshot plus replay journal, both containing private key
+    // material) so a left secure group leaves nothing behind locally. No-op for
+    // GSS groups: no in-memory entry, and the persistence files do not exist
+    // (NotFound is ignored).
     state.treekem_groups.write().await.remove(&id);
-    remove_treekem_snapshot_for_group_id(&state, &id, "leave_group").await;
+    remove_treekem_persistence_for_group_id(&state, &id, "leave_group").await;
     save_named_groups(&state).await;
     save_mls_groups(&state).await;
     stop_named_group_metadata_listener(&state, &id).await;
@@ -17812,6 +17871,9 @@ fn encode_treekem_snapshot_envelope(
     info: &x0x::groups::GroupInfo,
     group: &x0x::mls::TreeKemMlsGroup,
 ) -> anyhow::Result<Vec<u8>> {
+    if info.withdrawn {
+        anyhow::bail!("refusing to encode TreeKEM snapshot for withdrawn group");
+    }
     let snapshot = group
         .to_snapshot_bytes()
         .map_err(|e| anyhow::anyhow!("treekem snapshot encode: {e}"))?;
@@ -17874,6 +17936,7 @@ async fn persist_treekem_snapshot_bound(
     group_id_hex: &str,
     group: &x0x::mls::TreeKemMlsGroup,
 ) -> anyhow::Result<()> {
+    ensure_treekem_persistence_allowed(state, group_id_hex, "withdrawn_snapshot_persist").await?;
     let info = {
         let groups = state.named_groups.read().await;
         groups
@@ -17882,7 +17945,24 @@ async fn persist_treekem_snapshot_bound(
             .ok_or_else(|| anyhow::anyhow!("named group missing for TreeKEM snapshot"))?
     };
     let bytes = encode_treekem_snapshot_envelope(&info, group)?;
-    persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, bytes).await
+    persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, bytes).await?;
+    ensure_treekem_persistence_allowed(state, group_id_hex, "withdrawn_snapshot_persist").await
+}
+
+async fn ensure_treekem_persistence_allowed(
+    state: &AppState,
+    group_id_hex: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let withdrawn = {
+        let groups = state.named_groups.read().await;
+        has_withdrawn_group_record(&groups, group_id_hex)
+    };
+    if withdrawn {
+        remove_treekem_persistence_for_group_id(state, group_id_hex, reason).await;
+        anyhow::bail!("refusing to persist TreeKEM snapshot for withdrawn group");
+    }
+    Ok(())
 }
 
 /// Persist a supplied named-group state and matching TreeKEM snapshot with a
@@ -17893,6 +17973,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     info: x0x::groups::GroupInfo,
     group: &x0x::mls::TreeKemMlsGroup,
 ) -> anyhow::Result<()> {
+    ensure_treekem_persistence_allowed(state, group_id_hex, "withdrawn_atomic_persist").await?;
     let named_groups_json = {
         let groups = state.named_groups.read().await;
         let mut next_groups = groups.clone();
@@ -17968,6 +18049,31 @@ async fn recover_treekem_named_journals(
             tracing::warn!(path = %path.display(), version = journal.version, "ignoring unsupported TreeKEM journal version");
             continue;
         }
+        let named_groups: HashMap<String, x0x::groups::GroupInfo> =
+            serde_json::from_str(&journal.named_groups_json).map_err(|e| {
+                anyhow::anyhow!(
+                    "decode named groups JSON in TreeKEM journal {}: {e}",
+                    path.display()
+                )
+            })?;
+        if has_withdrawn_group_record(&named_groups, &journal.group_id_hex) {
+            remove_treekem_persistence_for_group_id_in_dir(
+                treekem_dir,
+                &journal.group_id_hex,
+                "withdrawn_journal_replay",
+            )
+            .await;
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(anyhow::anyhow!(
+                        "remove withdrawn TreeKEM journal {}: {e}",
+                        path.display()
+                    ));
+                }
+            }
+            tracing::warn!(group_id = %LogHexId::group(&journal.group_id_hex), "discarded TreeKEM/named-group persistence journal for withdrawn group");
+            continue;
+        }
         persist_treekem_snapshot_bytes(
             treekem_dir,
             &journal.group_id_hex,
@@ -18000,6 +18106,12 @@ async fn restore_treekem_groups(
     let agent_id = agent.agent_id();
     for (group_id_hex, info) in named_groups {
         if info.withdrawn {
+            remove_treekem_persistence_for_group_id_in_dir(
+                treekem_dir,
+                group_id_hex,
+                "withdrawn_restore",
+            )
+            .await;
             continue;
         }
         if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
@@ -20572,8 +20684,16 @@ mod tests {
             Some(format!("{}.snap", "ab".repeat(16)))
         );
         assert_eq!(
+            treekem_journal_file_name_for_drop(&"ab".repeat(16)),
+            Some(format!("{}.journal", "ab".repeat(16)))
+        );
+        assert_eq!(
             treekem_snapshot_file_name_for_drop("group-1_ok").as_deref(),
             Some("group-1_ok.snap")
+        );
+        assert_eq!(
+            treekem_journal_file_name_for_drop("group-1_ok").as_deref(),
+            Some("group-1_ok.journal")
         );
 
         for unsafe_id in ["", "../outside", "a/b", "/absolute", "a\\b", "ümlaut"] {
@@ -20582,7 +20702,56 @@ mod tests {
                 None,
                 "unsafe id should not become a snapshot filename: {unsafe_id:?}"
             );
+            assert_eq!(
+                treekem_journal_file_name_for_drop(unsafe_id),
+                None,
+                "unsafe id should not become a journal filename: {unsafe_id:?}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn treekem_persistence_drop_removes_snapshot_and_journal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let group_id = "ab".repeat(16);
+        let snapshot_path = treekem_snapshot_path(dir.path(), &group_id);
+        let journal_path = treekem_journal_path(dir.path(), &group_id);
+        tokio::fs::write(&snapshot_path, b"snapshot").await?;
+        tokio::fs::write(&journal_path, b"journal").await?;
+
+        remove_treekem_persistence_for_group_id_in_dir(dir.path(), &group_id, "test").await;
+
+        assert!(!snapshot_path.exists(), "snapshot material must be wiped");
+        assert!(!journal_path.exists(), "journal material must be wiped");
+        Ok(())
+    }
+
+    fn sample_treekem_group_info(group_id: &str, withdrawn: bool) -> x0x::groups::GroupInfo {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            AgentId([9; 32]),
+            group_id.to_string(),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.state_revision = 1;
+        info.state_hash = "state".to_string();
+        info.security_binding = Some("treekem:epoch=1".to_string());
+        info.withdrawn = withdrawn;
+        info
+    }
+
+    fn sample_treekem_snapshot_envelope() -> Result<Vec<u8>> {
+        let mut bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
+        bytes.extend(postcard::to_stdvec(&TreeKemSnapshotEnvelope {
+            version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
+            state_revision: 1,
+            state_hash: "state".to_string(),
+            security_binding: Some("treekem:epoch=1".to_string()),
+            snapshot: b"snapshot".to_vec(),
+        })?);
+        Ok(bytes)
     }
 
     #[test]
@@ -20611,27 +20780,42 @@ mod tests {
         assert!(!treekem_snapshot_envelope_matches_info(&envelope, &info));
     }
 
+    #[test]
+    fn treekem_snapshot_envelope_rejects_withdrawn_group_info() -> Result<()> {
+        let group_id = "ab".repeat(16);
+        let info = sample_treekem_group_info(&group_id, true);
+        let group = x0x::mls::TreeKemMlsGroup::create(
+            group_id.as_bytes().to_vec(),
+            AgentId([9; 32]),
+            &[7; 32],
+        )?;
+
+        let err =
+            encode_treekem_snapshot_envelope(&info, &group).expect_err("withdrawn group rejected");
+
+        assert!(
+            err.to_string().contains("withdrawn"),
+            "unexpected error: {err}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn treekem_journal_replay_writes_snapshot_and_named_groups() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let treekem_dir = dir.path().join("treekem");
         tokio::fs::create_dir_all(&treekem_dir).await?;
         let named_path = dir.path().join("named_groups.json");
-        let snapshot_envelope = {
-            let mut bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
-            bytes.extend(postcard::to_stdvec(&TreeKemSnapshotEnvelope {
-                version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
-                state_revision: 1,
-                state_hash: "state".to_string(),
-                security_binding: Some("treekem:epoch=1".to_string()),
-                snapshot: b"snapshot".to_vec(),
-            })?);
-            bytes
-        };
+        let snapshot_envelope = sample_treekem_snapshot_envelope()?;
+        let group_id = "ab".repeat(16);
+        let named_groups_json = serde_json::to_string_pretty(&HashMap::from([(
+            group_id.clone(),
+            sample_treekem_group_info(&group_id, false),
+        )]))?;
         let journal = TreeKemNamedPersistJournal {
             version: TREEKEM_NAMED_JOURNAL_VERSION,
-            group_id_hex: "ab".repeat(16),
-            named_groups_json: "{\"group\":true}".to_string(),
+            group_id_hex: group_id,
+            named_groups_json: named_groups_json.clone(),
             snapshot_envelope: snapshot_envelope.clone(),
         };
         let journal_path = treekem_journal_path(&treekem_dir, &journal.group_id_hex);
@@ -20641,13 +20825,53 @@ mod tests {
 
         assert_eq!(
             tokio::fs::read_to_string(&named_path).await?,
-            "{\"group\":true}"
+            named_groups_json
         );
         assert_eq!(
             tokio::fs::read(treekem_snapshot_path(&treekem_dir, &journal.group_id_hex)).await?,
             snapshot_envelope
         );
         assert!(!journal_path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn treekem_journal_replay_discards_withdrawn_group_material() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let treekem_dir = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem_dir).await?;
+        let named_path = dir.path().join("named_groups.json");
+        let snapshot_envelope = sample_treekem_snapshot_envelope()?;
+        let group_id = "ab".repeat(16);
+        let named_groups_json = serde_json::to_string_pretty(&HashMap::from([(
+            group_id.clone(),
+            sample_treekem_group_info(&group_id, true),
+        )]))?;
+        let journal = TreeKemNamedPersistJournal {
+            version: TREEKEM_NAMED_JOURNAL_VERSION,
+            group_id_hex: group_id.clone(),
+            named_groups_json,
+            snapshot_envelope,
+        };
+        let snapshot_path = treekem_snapshot_path(&treekem_dir, &group_id);
+        tokio::fs::write(&snapshot_path, b"stale-snapshot").await?;
+        let journal_path = treekem_journal_path(&treekem_dir, &group_id);
+        x0x::storage::write_private_bytes(&journal_path, postcard::to_stdvec(&journal)?).await?;
+
+        recover_treekem_named_journals(&named_path, &treekem_dir).await?;
+
+        assert!(
+            !named_path.exists(),
+            "withdrawn journal must not replay named groups"
+        );
+        assert!(
+            !snapshot_path.exists(),
+            "withdrawn journal must wipe snapshot material"
+        );
+        assert!(
+            !journal_path.exists(),
+            "withdrawn journal must wipe journal material"
+        );
         Ok(())
     }
 

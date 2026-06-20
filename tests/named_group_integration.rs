@@ -437,16 +437,92 @@ async fn named_group_generate_invite() {
 // ===========================================================================
 
 /// Since both alice and bob share a single daemon in this test suite,
-/// we test the join flow by: (a) creating a group, (b) generating an invite,
-/// (c) leaving the group, and (d) joining back via the invite link.
+/// we test the join flow by: (a) creating a group, (b) proving sole-admin
+/// self-leave is rejected, (c) installing a backup admin, (d) generating an
+/// invite, (e) leaving as a non-sole-admin, and (f) joining back via the invite.
 /// This exercises the full invite/join codepath on a single daemon.
 #[tokio::test]
 #[ignore]
 async fn named_group_join_via_invite() {
     let d = daemon().await;
-    let (group_id, _) = create_group(&d, "Join Test Group", "", Some("Alice")).await;
+    // This single-daemon rejoin path needs a local roster backup admin. Use a
+    // public_open (GSS) group because direct add-by-agent_id is valid there;
+    // private_secure TreeKEM groups require the target's KeyPackage instead.
+    let create_r: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Join Test Group",
+            "description": "",
+            "display_name": "Alice",
+            "preset": "public_open"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let group_id = create_r["group_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !group_id.is_empty(),
+        "create public_open group: {create_r:?}"
+    );
 
-    // Generate invite
+    // DELETE is pure self-leave; while Alice is the only admin it must be
+    // rejected rather than implicitly ending the group.
+    let sole_admin_leave = authed_client(&d)
+        .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sole_admin_leave.status(), StatusCode::CONFLICT);
+    let sole_admin_leave_r: Value = sole_admin_leave.json().await.unwrap();
+    assert_eq!(
+        sole_admin_leave_r["ok"], false,
+        "sole-admin leave response: {sole_admin_leave_r:?}"
+    );
+    assert_eq!(
+        sole_admin_leave_r["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin before leaving"),
+        "sole-admin leave response: {sole_admin_leave_r:?}"
+    );
+
+    let backup_admin = fake_agent_id(0x44);
+    let add_admin_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/members")))
+        .json(&serde_json::json!({
+            "agent_id": backup_admin,
+            "display_name": "Backup Admin"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        add_admin_r["ok"], true,
+        "add admin response: {add_admin_r:?}"
+    );
+
+    let promote_admin: Value = authed_client(&d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{backup_admin}/role")))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        promote_admin["ok"], true,
+        "promote admin response: {promote_admin:?}"
+    );
+
+    // Generate invite before the successful non-sole-admin self-leave.
     let invite_resp: Value = authed_client(&d)
         .post(d.url(&format!("/groups/{group_id}/invite")))
         .json(&serde_json::json!({"expiry_secs": 3600}))
@@ -456,15 +532,21 @@ async fn named_group_join_via_invite() {
         .json()
         .await
         .unwrap();
+    assert_eq!(
+        invite_resp["ok"], true,
+        "create invite response: {invite_resp:?}"
+    );
     let invite_link = invite_resp["invite_link"].as_str().unwrap().to_string();
 
-    // Leave the group first so we can rejoin
-    let leave_r = authed_client(&d)
+    // Alice can leave once another active admin remains in the roster.
+    let leave_resp = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
         .unwrap();
-    assert_eq!(leave_r.status(), StatusCode::OK);
+    assert_eq!(leave_resp.status(), StatusCode::OK);
+    let leave_r: Value = leave_resp.json().await.unwrap();
+    assert_eq!(leave_r["ok"], true, "leave response: {leave_r:?}");
 
     // Join via invite
     let join_r: Value = authed_client(&d)

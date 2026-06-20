@@ -562,30 +562,55 @@ async fn named_group_leave() {
     let d = daemon().await;
     let (group_id, _) = create_group(&d, "Leave Group", "", None).await;
 
-    // Leave
-    let r: Value = authed_client(&d)
+    // DELETE is pure self-leave. A sole-admin self-leave is rejected rather
+    // than implicitly ending the group.
+    let leave_resp = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leave_resp.status(), StatusCode::CONFLICT);
+    let r: Value = leave_resp.json().await.unwrap();
+
+    assert_eq!(r["ok"], false, "sole-admin leave response: {r:?}");
+    assert_eq!(
+        r["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin before leaving"),
+        "sole-admin leave response: {r:?}"
+    );
+
+    // Verify the live group remains accessible after the rejected self-leave.
+    let info_r = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(info_r.status(), StatusCode::OK);
+    let info: Value = info_r.json().await.unwrap();
+    assert_eq!(info["ok"], true, "group after rejected leave: {info:?}");
+    assert_eq!(info["name"], "Leave Group");
+
+    // Ending the group is explicit disband/withdraw and retains a withdrawn shell.
+    let disband_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/state/withdraw")))
+        .json(&serde_json::json!({}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
+    assert_eq!(disband_r["ok"], true, "disband response: {disband_r:?}");
 
-    assert_eq!(r["ok"], true, "leave response: {r:?}");
-    assert_eq!(r["left"], "Leave Group");
-
-    // Verify group is gone
-    let info_r = authed_client(&d)
-        .get(d.url(&format!("/groups/{group_id}")))
+    let state_r: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/state")))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    assert_eq!(
-        info_r.status(),
-        StatusCode::NOT_FOUND,
-        "group should not exist after leaving"
-    );
+    assert_eq!(state_r["withdrawn"], true, "withdrawn state: {state_r:?}");
 }
 
 // ===========================================================================
@@ -624,7 +649,59 @@ async fn named_group_rejoin_after_leave() {
         "create public_open group: {create_r:?}"
     );
 
-    // Generate invite before leaving
+    // DELETE is pure self-leave. A sole-admin self-leave is rejected before the
+    // roster changes, so make that behavior explicit before setting up the
+    // non-sole-admin leave path exercised by the rejoin flow.
+    let sole_admin_leave = authed_client(&d)
+        .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sole_admin_leave.status(), StatusCode::CONFLICT);
+    let sole_admin_leave_r: Value = sole_admin_leave.json().await.unwrap();
+    assert_eq!(
+        sole_admin_leave_r["ok"], false,
+        "sole-admin leave response: {sole_admin_leave_r:?}"
+    );
+    assert_eq!(
+        sole_admin_leave_r["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin before leaving"),
+        "sole-admin leave response: {sole_admin_leave_r:?}"
+    );
+
+    let backup_admin = fake_agent_id(0x43);
+    let add_admin_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/members")))
+        .json(&serde_json::json!({
+            "agent_id": backup_admin,
+            "display_name": "Backup Admin"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        add_admin_r["ok"], true,
+        "add admin response: {add_admin_r:?}"
+    );
+
+    let promote_admin: Value = authed_client(&d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{backup_admin}/role")))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        promote_admin["ok"], true,
+        "promote admin response: {promote_admin:?}"
+    );
+
+    // Generate invite before the successful non-sole-admin leave.
     let invite_resp: Value = authed_client(&d)
         .post(d.url(&format!("/groups/{group_id}/invite")))
         .json(&serde_json::json!({"expiry_secs": 3600}))
@@ -636,7 +713,7 @@ async fn named_group_rejoin_after_leave() {
         .unwrap();
     let invite_link = invite_resp["invite_link"].as_str().unwrap().to_string();
 
-    // Leave
+    // Leave now succeeds because another active admin remains in the roster.
     let leave_r: Value = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()

@@ -6070,6 +6070,16 @@ fn named_group_metadata_event_group_id(event: &NamedGroupMetadataEvent) -> &str 
     }
 }
 
+fn withdrawn_group_allows_metadata_event(event: &NamedGroupMetadataEvent) -> bool {
+    matches!(
+        event,
+        NamedGroupMetadataEvent::GroupDeleted {
+            commit: Some(commit),
+            ..
+        } if commit.withdrawn
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WelcomeBlobMessage {
@@ -7635,6 +7645,9 @@ fn authorized_treekem_membership_event_for_queue(
     event: &NamedGroupMetadataEvent,
     sender_hex: &str,
 ) -> bool {
+    if info.withdrawn {
+        return false;
+    }
     match event {
         NamedGroupMetadataEvent::MemberAdded {
             actor,
@@ -7695,6 +7708,9 @@ fn treekem_state_frontier_gap_reason(
     local_agent_hex: &str,
     local_epoch: Option<u64>,
 ) -> Option<String> {
+    if info.withdrawn {
+        return None;
+    }
     if info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
         return None;
     }
@@ -7739,6 +7755,12 @@ async fn remember_treekem_membership_event(state: &AppState, event: &NamedGroupM
     let Some(frontier) = treekem_membership_event_frontier(event) else {
         return;
     };
+    {
+        let groups = state.named_groups.read().await;
+        if has_withdrawn_group_record(&groups, frontier.group_id) {
+            return;
+        }
+    }
     let mut logs = state.treekem_event_log.write().await;
     let log = logs.entry(frontier.group_id.to_string()).or_default();
     if let Some(key) = treekem_membership_event_key(event) {
@@ -7763,6 +7785,18 @@ async fn queue_treekem_membership_event(
     sender: AgentId,
     reason: &str,
 ) {
+    {
+        let groups = state.named_groups.read().await;
+        if has_withdrawn_group_record(&groups, group_id) {
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "queue_treekem_membership_event_reject",
+                reason = "withdrawn_group",
+                group_id = %LogHexId::group(&group_id),
+            );
+            return;
+        }
+    }
     let queued = PendingTreeKemMetadataEvent {
         event: event.clone(),
         sender,
@@ -7808,6 +7842,9 @@ async fn request_treekem_catchup_for_gap(
         let Some(info) = groups.get(group_id) else {
             return;
         };
+        if info.withdrawn {
+            return;
+        }
         (
             info.state_revision,
             info.secret_epoch,
@@ -7939,6 +7976,9 @@ async fn handle_treekem_catchup_request(
                 .iter()
                 .find(|(_, info)| info.stable_group_id() == request.group_id)
         }) {
+            if info.withdrawn {
+                return;
+            }
             let mut keys = vec![
                 request.group_id.clone(),
                 key.clone(),
@@ -8088,16 +8128,31 @@ async fn request_treekem_catchup_page(state: &Arc<AppState>, group_id: &str, pee
 /// [`AppState::group_membership_locks`] for why membership applies must be
 /// serialized per group.
 async fn group_membership_lock(state: &AppState, group_key: &str) -> Arc<Mutex<()>> {
+    let lock_key = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_key)
+            .map(|info| info.stable_group_id().to_string())
+            .or_else(|| {
+                groups
+                    .values()
+                    .find(|info| {
+                        info.stable_group_id() == group_key || info.mls_group_id == group_key
+                    })
+                    .map(|info| info.stable_group_id().to_string())
+            })
+            .unwrap_or_else(|| group_key.to_string())
+    };
     {
         let locks = state.group_membership_locks.read().await;
-        if let Some(lock) = locks.get(group_key) {
+        if let Some(lock) = locks.get(&lock_key) {
             return Arc::clone(lock);
         }
     }
     let mut locks = state.group_membership_locks.write().await;
     Arc::clone(
         locks
-            .entry(group_key.to_string())
+            .entry(lock_key)
             .or_insert_with(|| Arc::new(Mutex::new(()))),
     )
 }
@@ -8219,6 +8274,17 @@ async fn apply_named_group_metadata_event_inner(
         };
         info
     };
+    if info.withdrawn && !withdrawn_group_allows_metadata_event(&event) {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "apply_metadata_event_reject",
+            reason = "withdrawn_group",
+            event = event_kind,
+            group_id = %resolved_group_key,
+            sender = %sender_hex,
+        );
+        return false;
+    }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
         && treekem_metadata_event_requires_phase3(&event)
@@ -10351,6 +10417,9 @@ async fn get_group_public_messages(
     let (read_access, confidentiality, is_member, stable_id) = {
         let groups = state.named_groups.read().await;
         if let Some(info) = groups.get(&id) {
+            if let Some(resp) = reject_withdrawn_group(info) {
+                return resp;
+            }
             (
                 info.policy.read_access,
                 info.policy.confidentiality,
@@ -11625,13 +11694,49 @@ async fn remove_treekem_snapshot_for_group_id(state: &AppState, group_id: &str, 
     }
 }
 
-fn group_id_matches_alias(candidate: &str, id: &str, stable_group_id: Option<&str>) -> bool {
-    candidate == id || stable_group_id.is_some_and(|stable| candidate == stable)
+fn collect_same_stable_group_aliases(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    id: &str,
+    stable_group_id: Option<&str>,
+) -> HashSet<String> {
+    let mut stable_ids = HashSet::new();
+    if let Some(stable_group_id) = stable_group_id.filter(|stable| !stable.is_empty()) {
+        stable_ids.insert(stable_group_id.to_string());
+    }
+    if let Some(info) = groups.get(id) {
+        stable_ids.insert(info.stable_group_id().to_string());
+    }
+    for info in groups.values() {
+        let matches_requested_id = info.stable_group_id() == id || info.mls_group_id == id;
+        let matches_requested_stable = stable_group_id
+            .is_some_and(|stable| info.stable_group_id() == stable || info.mls_group_id == stable);
+        if matches_requested_id || matches_requested_stable {
+            stable_ids.insert(info.stable_group_id().to_string());
+        }
+    }
+
+    let mut aliases = HashSet::new();
+    aliases.insert(id.to_string());
+    if let Some(stable_group_id) = stable_group_id.filter(|stable| !stable.is_empty()) {
+        aliases.insert(stable_group_id.to_string());
+    }
+    for (key, info) in groups {
+        if stable_ids.contains(info.stable_group_id()) {
+            aliases.insert(key.clone());
+            aliases.insert(info.mls_group_id.clone());
+            aliases.insert(info.stable_group_id().to_string());
+        }
+    }
+    aliases
 }
 
-fn join_result_key_matches_group_alias(key: &str, id: &str, stable_group_id: Option<&str>) -> bool {
+fn group_id_matches_any_alias(candidate: &str, aliases: &HashSet<String>) -> bool {
+    aliases.contains(candidate)
+}
+
+fn join_result_key_matches_any_group_alias(key: &str, aliases: &HashSet<String>) -> bool {
     key.split_once(':')
-        .map(|(group_id, _)| group_id_matches_alias(group_id, id, stable_group_id))
+        .map(|(group_id, _)| group_id_matches_any_alias(group_id, aliases))
         .unwrap_or(false)
 }
 
@@ -11649,86 +11754,154 @@ fn clear_group_info_key_material(info: &mut x0x::groups::GroupInfo) {
     info.shared_secret = None;
 }
 
+fn withdrawn_card_authority_is_active_admin(
+    info: &x0x::groups::GroupInfo,
+    card: &x0x::groups::GroupCard,
+) -> bool {
+    info.caller_role(&card.authority_agent_id)
+        .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+}
+
+fn withdrawn_card_can_terminally_mark_local_group(
+    info: &x0x::groups::GroupInfo,
+    card: &x0x::groups::GroupCard,
+    protects_keyed_local_group: bool,
+) -> bool {
+    card.withdrawn
+        && group_card_supersedes_group_info(card, info)
+        && (!protects_keyed_local_group || withdrawn_card_authority_is_active_admin(info, card))
+}
+
+async fn local_group_has_protected_crypto_material(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    aliases: &HashSet<String>,
+) -> bool {
+    if info.withdrawn {
+        return false;
+    }
+    if info.shared_secret.is_some() {
+        return true;
+    }
+    {
+        let mls_groups = state.mls_groups.read().await;
+        if aliases.iter().any(|alias| mls_groups.contains_key(alias)) {
+            return true;
+        }
+    }
+    {
+        let treekem_groups = state.treekem_groups.read().await;
+        if aliases
+            .iter()
+            .any(|alias| treekem_groups.contains_key(alias))
+        {
+            return true;
+        }
+    }
+    for alias in aliases {
+        let Some(path) = treekem_snapshot_path_for_drop(state, alias) else {
+            continue;
+        };
+        if tokio::fs::try_exists(path).await.unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
 async fn wipe_local_group_crypto_material(
     state: &AppState,
     id: &str,
     stable_group_id: Option<&str>,
     reason: &str,
 ) {
-    let stable_group_id = stable_group_id.filter(|stable| *stable != id);
-    {
+    let aliases = {
         let mut groups = state.named_groups.write().await;
-        if let Some(info) = groups.get_mut(id) {
-            clear_group_info_key_material(info);
-        }
-        if let Some(stable_group_id) = stable_group_id {
-            if let Some(info) = groups.get_mut(stable_group_id) {
+        let aliases = collect_same_stable_group_aliases(&groups, id, stable_group_id);
+        for alias in &aliases {
+            if let Some(info) = groups.get_mut(alias) {
                 clear_group_info_key_material(info);
             }
         }
-    }
+        aliases
+    };
     {
         let mut cache = state.group_card_cache.write().await;
-        cache.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            cache.remove(stable_group_id);
+        for alias in &aliases {
+            cache.remove(alias);
         }
     }
     {
         let mut mls_groups = state.mls_groups.write().await;
-        mls_groups.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            mls_groups.remove(stable_group_id);
+        for alias in &aliases {
+            mls_groups.remove(alias);
         }
     }
     {
         let mut treekem_groups = state.treekem_groups.write().await;
-        treekem_groups.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            treekem_groups.remove(stable_group_id);
+        for alias in &aliases {
+            treekem_groups.remove(alias);
         }
     }
     {
         let mut pending = state.treekem_pending_events.write().await;
-        pending.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            pending.remove(stable_group_id);
+        for alias in &aliases {
+            pending.remove(alias);
         }
     }
     {
         let mut event_log = state.treekem_event_log.write().await;
-        event_log.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            event_log.remove(stable_group_id);
+        for alias in &aliases {
+            event_log.remove(alias);
         }
     }
     {
         let mut catchup = state.treekem_catchup_throttle.write().await;
-        catchup.remove(id);
-        if let Some(stable_group_id) = stable_group_id {
-            catchup.remove(stable_group_id);
+        for alias in &aliases {
+            catchup.remove(alias);
+        }
+    }
+    {
+        let mut messages = state.public_messages.write().await;
+        for alias in &aliases {
+            messages.remove(alias);
+        }
+    }
+    {
+        let mut tasks = state.group_metadata_tasks.write().await;
+        for alias in &aliases {
+            if let Some(handle) = tasks.remove(alias) {
+                handle.abort();
+            }
+        }
+    }
+    {
+        let mut tasks = state.public_message_tasks.write().await;
+        for alias in &aliases {
+            if let Some(handle) = tasks.remove(alias) {
+                handle.abort();
+            }
         }
     }
     {
         let mut join_results = state.pending_join_results.write().await;
         join_results.retain(|key, pending| {
-            !join_result_key_matches_group_alias(key, id, stable_group_id)
-                && !group_id_matches_alias(
+            !join_result_key_matches_any_group_alias(key, &aliases)
+                && !group_id_matches_any_alias(
                     named_group_metadata_event_group_id(&pending.event),
-                    id,
-                    stable_group_id,
+                    &aliases,
                 )
         });
     }
     if let Ok(mut expected) = state.expected_join_result_inviters.lock() {
-        expected.retain(|key, _| !join_result_key_matches_group_alias(key, id, stable_group_id));
+        expected.retain(|key, _| !join_result_key_matches_any_group_alias(key, &aliases));
     }
 
     let mut welcome_ids = Vec::new();
     {
         let mut welcomes = state.pending_welcomes.write().await;
         welcomes.retain(|welcome_id, pending| {
-            let drop = group_id_matches_alias(&pending.group_id, id, stable_group_id);
+            let drop = group_id_matches_any_alias(&pending.group_id, &aliases);
             if drop {
                 welcome_ids.push(welcome_id.clone());
             }
@@ -11738,7 +11911,7 @@ async fn wipe_local_group_crypto_material(
     {
         let mut receives = state.pending_welcome_receives.write().await;
         receives.retain(|welcome_id, pending| {
-            let drop = group_id_matches_alias(&pending.group_id, id, stable_group_id);
+            let drop = group_id_matches_any_alias(&pending.group_id, &aliases);
             if drop {
                 welcome_ids.push(welcome_id.clone());
             }
@@ -11754,9 +11927,8 @@ async fn wipe_local_group_crypto_material(
         }
     }
 
-    remove_treekem_snapshot_for_group_id(state, id, reason).await;
-    if let Some(stable_group_id) = stable_group_id {
-        remove_treekem_snapshot_for_group_id(state, stable_group_id, reason).await;
+    for alias in &aliases {
+        remove_treekem_snapshot_for_group_id(state, alias, reason).await;
     }
 }
 
@@ -11779,12 +11951,16 @@ async fn retain_withdrawn_group_shell(
     reason: &str,
 ) {
     let stable_group_id = info.stable_group_id().to_string();
+    info.withdrawn = true;
     clear_group_info_key_material(&mut info);
     {
         let mut groups = state.named_groups.write().await;
-        groups.insert(group_id.to_string(), info.clone());
-        if stable_group_id != group_id && groups.contains_key(&stable_group_id) {
-            groups.insert(stable_group_id.clone(), info.clone());
+        let mut aliases =
+            collect_same_stable_group_aliases(&groups, group_id, Some(&stable_group_id));
+        aliases.insert(group_id.to_string());
+        aliases.insert(stable_group_id.clone());
+        for alias in aliases {
+            groups.insert(alias, info.clone());
         }
     }
     wipe_local_group_crypto_material(state, group_id, Some(&stable_group_id), reason).await;
@@ -12217,7 +12393,7 @@ async fn withdraw_group_state(
 
     let membership_lock = group_membership_lock(&state, &id).await;
     let membership_guard = membership_lock.lock().await;
-    let (commit, metadata_topic, event_group_id, delivery_roster, event) = {
+    let (commit, metadata_topic, event_group_id, delivery_roster, event, terminal_info) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
             return not_found("group not found");
@@ -12246,6 +12422,7 @@ async fn withdraw_group_state(
         let metadata_topic = info.metadata_topic.clone();
         let event_group_id = info.stable_group_id().to_string();
         let delivery_roster = info.clone();
+        let terminal_info = info.clone();
         let event = NamedGroupMetadataEvent::GroupDeleted {
             group_id: event_group_id.clone(),
             revision: event_revision,
@@ -12258,11 +12435,10 @@ async fn withdraw_group_state(
             event_group_id,
             delivery_roster,
             event,
+            terminal_info,
         )
     };
-    save_named_groups(&state).await;
-    wipe_local_group_crypto_material(&state, &id, Some(&event_group_id), "withdraw_disband").await;
-    save_named_groups(&state).await;
+    retain_withdrawn_group_shell(&state, &id, terminal_info, "withdraw_disband").await;
 
     // Refresh the withdrawn-card path for public discovery supersession after
     // stale local cards are gone. Hidden groups still do not publish public
@@ -13940,37 +14116,40 @@ async fn import_group_card(
         remove_group_card_if_not_stale(&mut cache, &card);
         drop(cache);
 
-        let mut groups = state.named_groups.write().await;
-        let local_group_key = groups.get(&group_id).map(|_| group_id.clone()).or_else(|| {
-            groups
-                .iter()
-                .find(|(_, info)| info.stable_group_id() == group_id)
-                .map(|(key, _)| key.clone())
-        });
-        let marked_withdrawn = local_group_key
-            .as_ref()
-            .and_then(|key| groups.get_mut(key))
-            .map(|info| apply_withdrawn_group_card_to_group_info(info, &card))
-            .unwrap_or(false);
-        drop(groups);
-        if marked_withdrawn {
-            wipe_local_group_crypto_material(
-                &state,
-                local_group_key.as_deref().unwrap_or(&group_id),
-                Some(&group_id),
-                "withdrawn_card_import",
-            )
-            .await;
-            let refresh_target = {
-                let groups = state.named_groups.read().await;
-                let key = local_group_key.as_deref().unwrap_or(&group_id);
-                groups.get(key).cloned().map(|info| (key.to_string(), info))
-            };
-            if let Some((key, info)) = refresh_target {
-                remove_directory_cache_entries_for_group_info(&state, &info).await;
-                refresh_group_card_cache_from_info(&state, &key, &info).await;
+        let local = {
+            let groups = state.named_groups.read().await;
+            let local_group_key = groups.get(&group_id).map(|_| group_id.clone()).or_else(|| {
+                groups
+                    .iter()
+                    .find(|(_, info)| info.stable_group_id() == group_id)
+                    .map(|(key, _)| key.clone())
+            });
+            local_group_key.and_then(|key| {
+                groups.get(&key).cloned().map(|info| {
+                    let aliases = collect_same_stable_group_aliases(&groups, &key, Some(&group_id));
+                    (key, info, aliases)
+                })
+            })
+        };
+        if let Some((key, info, aliases)) = local {
+            let protects_keyed_local_group =
+                local_group_has_protected_crypto_material(state.as_ref(), &info, &aliases).await;
+            if withdrawn_card_can_terminally_mark_local_group(
+                &info,
+                &card,
+                protects_keyed_local_group,
+            ) {
+                let mut next = info;
+                if apply_withdrawn_group_card_to_group_info(&mut next, &card) {
+                    retain_withdrawn_group_shell(&state, &key, next, "withdrawn_card_import").await;
+                }
+            } else if protects_keyed_local_group && group_card_supersedes_group_info(&card, &info) {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&group_id),
+                    authority = %LogHexId::agent(&card.authority_agent_id),
+                    "ignored withdrawn card for live keyed group from non-admin authority"
+                );
             }
-            save_named_groups(&state).await;
         }
         return (
             StatusCode::OK,
@@ -20200,11 +20379,157 @@ mod tests {
 
         assert!(has_withdrawn_group_record(&groups, "local-mls-id"));
         assert!(has_withdrawn_group_record(&groups, "stable-card-id"));
-        assert!(join_result_key_matches_group_alias(
+        let aliases =
+            collect_same_stable_group_aliases(&groups, "local-mls-id", Some("stable-card-id"));
+        assert!(join_result_key_matches_any_group_alias(
             "stable-card-id:member",
-            "local-mls-id",
-            Some("stable-card-id")
+            &aliases,
         ));
+    }
+
+    #[test]
+    fn same_stable_group_aliases_include_all_local_records() {
+        let stable_id = "stable-card-id";
+        let mut groups = HashMap::new();
+        for (key, mls_id) in [
+            ("local-mls-id", "local-mls-id"),
+            (stable_id, "local-mls-id"),
+            ("legacy-alias", "legacy-mls-id"),
+        ] {
+            let mut info = x0x::groups::GroupInfo::with_policy(
+                key.to_string(),
+                String::new(),
+                AgentId([2; 32]),
+                mls_id.to_string(),
+                x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+            );
+            info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+                stable_id.to_string(),
+                "02".repeat(32),
+                info.created_at,
+                String::new(),
+            ));
+            info.shared_secret = Some(vec![7; 32]);
+            groups.insert(key.to_string(), info);
+        }
+        let mut other = x0x::groups::GroupInfo::with_policy(
+            "other".to_string(),
+            String::new(),
+            AgentId([3; 32]),
+            "other-mls".to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        other.shared_secret = Some(vec![8; 32]);
+        groups.insert("other".to_string(), other);
+
+        let aliases = collect_same_stable_group_aliases(&groups, "local-mls-id", Some(stable_id));
+        for expected in ["local-mls-id", stable_id, "legacy-alias", "legacy-mls-id"] {
+            assert!(aliases.contains(expected), "missing alias {expected}");
+        }
+        assert!(!aliases.contains("other"));
+
+        for alias in &aliases {
+            if let Some(info) = groups.get_mut(alias) {
+                info.withdrawn = true;
+                clear_group_info_key_material(info);
+            }
+        }
+        for key in ["local-mls-id", stable_id, "legacy-alias"] {
+            let info = groups.get(key).expect("same-stable record retained");
+            assert!(info.withdrawn, "alias {key} not marked withdrawn");
+            assert_eq!(info.shared_secret, None, "alias {key} kept key material");
+        }
+        let other = groups.get("other").expect("other group retained");
+        assert!(!other.withdrawn);
+        assert!(other.shared_secret.is_some());
+    }
+
+    #[test]
+    fn withdrawn_card_non_admin_cannot_terminally_mark_keyed_live_group() {
+        let creator = x0x::identity::AgentKeypair::generate().expect("creator keypair");
+        let outsider = x0x::identity::AgentKeypair::generate().expect("outsider keypair");
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "live".to_string(),
+            String::new(),
+            creator.agent_id(),
+            "aa".repeat(16),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        info.state_revision = 1;
+        info.updated_at = 1_000;
+        info.shared_secret = Some(vec![9; 32]);
+
+        let mut card = sample_group_card(info.stable_group_id(), 2, 2_000);
+        card.withdrawn = true;
+        card.authority_agent_id = hex::encode(outsider.agent_id().as_bytes());
+
+        assert!(!withdrawn_card_can_terminally_mark_local_group(
+            &info, &card, true,
+        ));
+        assert!(!withdrawn_card_authority_is_active_admin(&info, &card));
+    }
+
+    #[test]
+    fn withdrawn_card_admin_can_terminally_mark_and_clear_keyed_live_group() {
+        let creator = x0x::identity::AgentKeypair::generate().expect("creator keypair");
+        let admin = x0x::identity::AgentKeypair::generate().expect("admin keypair");
+        let creator_hex = hex::encode(creator.agent_id().as_bytes());
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "live".to_string(),
+            String::new(),
+            creator.agent_id(),
+            "aa".repeat(16),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        info.add_member(
+            admin_hex.clone(),
+            x0x::groups::GroupRole::Admin,
+            Some(creator_hex),
+            None,
+        );
+        info.state_revision = 1;
+        info.updated_at = 1_000;
+        info.shared_secret = Some(vec![9; 32]);
+
+        let mut card = sample_group_card(info.stable_group_id(), 2, 2_000);
+        card.withdrawn = true;
+        card.authority_agent_id = admin_hex;
+
+        assert!(withdrawn_card_can_terminally_mark_local_group(
+            &info, &card, true,
+        ));
+        assert!(apply_withdrawn_group_card_to_group_info(&mut info, &card));
+        assert!(info.withdrawn);
+        assert_eq!(info.shared_secret, None);
+    }
+
+    #[test]
+    fn withdrawn_card_can_supersede_keyless_discovery_stub_without_roster_admin() {
+        let creator = x0x::identity::AgentKeypair::generate().expect("creator keypair");
+        let outsider = x0x::identity::AgentKeypair::generate().expect("outsider keypair");
+        let mut stub = x0x::groups::GroupInfo::with_policy(
+            "stub".to_string(),
+            String::new(),
+            creator.agent_id(),
+            "aa".repeat(16),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        stub.state_revision = 1;
+        stub.updated_at = 1_000;
+        stub.shared_secret = None;
+        stub.members_v2.clear();
+
+        let mut card = sample_group_card(stub.stable_group_id(), 2, 2_000);
+        card.withdrawn = true;
+        card.authority_agent_id = hex::encode(outsider.agent_id().as_bytes());
+
+        assert!(withdrawn_card_can_terminally_mark_local_group(
+            &stub, &card, false,
+        ));
+        assert!(apply_withdrawn_group_card_to_group_info(&mut stub, &card));
+        assert!(stub.withdrawn);
+        assert_eq!(stub.shared_secret, None);
     }
 
     #[tokio::test]
@@ -20459,6 +20784,51 @@ mod tests {
             &admin_remove_with_treekem,
             &creator_hex
         ));
+    }
+
+    #[test]
+    fn withdrawn_treekem_group_never_queues_frontier_gap_events() {
+        let creator = AgentId([0x11; 32]);
+        let creator_hex = hex::encode(creator.as_bytes());
+        let member_hex = "22".repeat(32);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            creator,
+            "aa".repeat(16),
+            x0x::groups::GroupPolicy::default(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.withdrawn = true;
+        info.state_revision = 1;
+        info.roster_revision = 1;
+        info.security_binding = Some("treekem:epoch=1".to_string());
+        info.recompute_state_hash();
+        let group_id = info.stable_group_id().to_string();
+        let event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: group_id.clone(),
+            revision: 3,
+            actor: creator_hex.clone(),
+            agent_id: member_hex,
+            display_name: None,
+            treekem_commit_b64: Some("Yw==".to_string()),
+            treekem_welcome_b64: Some("dw==".to_string()),
+            welcome_ref: None,
+            treekem_epoch: Some(3),
+            commit: Some(fake_group_state_commit(&group_id, 3, &creator_hex)),
+        };
+
+        assert_eq!(
+            treekem_state_frontier_gap_reason(&info, &event, &creator_hex, Some(1)),
+            None,
+            "withdrawn groups must short-circuit before TreeKEM queue/catch-up"
+        );
+        assert!(!authorized_treekem_membership_event_for_queue(
+            &info,
+            &event,
+            &creator_hex,
+        ));
+        assert!(!withdrawn_group_allows_metadata_event(&event));
     }
 
     #[test]

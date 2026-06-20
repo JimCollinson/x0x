@@ -392,6 +392,7 @@ cached history:
 - `read_access == Public` — open to any caller with a valid API token.
 - `read_access == MembersOnly` — requires active membership.
 - `MlsEncrypted` — returns 400 (encrypted history belongs elsewhere).
+- Withdrawn groups return 409 and do not restart public-message listeners.
 
 ### Phase D.3 — state-commit chain
 
@@ -413,6 +414,11 @@ Each named group maintains a signed commit chain:
   A withdrawn card is also refreshed to supersede public discovery listings on
   receipt regardless of TTL; Hidden groups rely on the metadata/direct disband
   event, not public-card discovery.
+  Explicit `POST /groups/cards/import` keeps passive discovery/listed/shard
+  withdrawal handling cache-only, but a withdrawn card may terminally mark and
+  wipe an existing live/keyed local group only when `authority_agent_id` is an
+  active Admin-or-higher in the local roster. Non-admin withdrawn cards can still
+  supersede discovery stubs/listings that have no local key material to protect.
 
 Cards and commits carry ML-DSA-65 signatures. Peers verify both the
 signature and the chain link (`prev_state_hash`) before accepting; stale

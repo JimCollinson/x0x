@@ -8,6 +8,8 @@
 use reqwest::StatusCode;
 use serde_json::Value;
 use std::time::Duration;
+use x0x::groups::GroupCard;
+use x0x::identity::AgentKeypair;
 
 #[path = "harness/src/cluster.rs"]
 mod cluster;
@@ -61,6 +63,65 @@ async fn create_group(
 
 fn fake_agent_id(fill: u8) -> String {
     hex::encode([fill; 32])
+}
+
+fn agent_hex(kp: &AgentKeypair) -> String {
+    hex::encode(kp.agent_id().as_bytes())
+}
+
+fn withdrawn_card_from(card: Value, signer: &AgentKeypair) -> Value {
+    let mut card: GroupCard = serde_json::from_value(card).expect("group card json");
+    card.withdrawn = true;
+    card.revision = card.revision.saturating_add(10);
+    card.prev_state_hash = Some(card.state_hash.clone());
+    card.state_hash = format!("withdrawn-test-{}", card.revision);
+    card.issued_at = card.issued_at.saturating_add(10_000);
+    card.updated_at = card.issued_at;
+    card.expires_at = card.issued_at.saturating_add(60_000);
+    card.sign(signer).expect("sign withdrawn test card");
+    serde_json::to_value(card).expect("withdrawn card json")
+}
+
+fn signed_test_card(
+    group_id: &str,
+    owner: &AgentKeypair,
+    signer: &AgentKeypair,
+    revision: u64,
+    withdrawn: bool,
+) -> Value {
+    let now = 10_000 + revision;
+    let owner_hex = agent_hex(owner);
+    let policy = x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy();
+    let mut card = GroupCard {
+        group_id: group_id.to_string(),
+        name: format!("Stub {group_id}"),
+        description: "test stub".to_string(),
+        avatar_url: None,
+        banner_url: None,
+        tags: vec!["withdraw-test".to_string()],
+        policy_summary: (&policy).into(),
+        owner_agent_id: owner_hex,
+        admin_count: 1,
+        member_count: 1,
+        created_at: now,
+        updated_at: now,
+        request_access_enabled: true,
+        metadata_topic: Some(format!(
+            "x0x.group.{}.meta",
+            &group_id[..16.min(group_id.len())]
+        )),
+        revision,
+        state_hash: format!("stub-state-{revision}"),
+        prev_state_hash: (revision > 1).then(|| format!("stub-state-{}", revision - 1)),
+        issued_at: now,
+        expires_at: now + 60_000,
+        authority_agent_id: String::new(),
+        authority_public_key: String::new(),
+        withdrawn,
+        signature: String::new(),
+    };
+    card.sign(signer).expect("sign test card");
+    serde_json::to_value(card).expect("test card json")
 }
 
 async fn wait_until<F, Fut>(timeout: Duration, mut check: F) -> bool
@@ -1285,6 +1346,180 @@ async fn named_group_import_rejects_tampered_metadata_topic() {
         .contains("invalid signed card"));
 
     let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn withdrawn_card_from_non_admin_does_not_terminate_live_keyed_group() {
+    let d = daemon().await;
+    let create: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Non-admin withdrawn card guard",
+            "description": "live keyed group must survive",
+            "preset": "public_request_secure"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(create["ok"], true, "create response: {create:?}");
+    let group_id = create["group_id"].as_str().unwrap().to_string();
+    let card: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/cards/{group_id}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let outsider = AgentKeypair::generate().unwrap();
+    let withdrawn = withdrawn_card_from(card, &outsider);
+
+    let import = authed_client(&d)
+        .post(d.url("/groups/cards/import"))
+        .json(&withdrawn)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(import.status(), StatusCode::OK);
+
+    let state: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/state")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["withdrawn"], false, "state after import: {state:?}");
+
+    let named_groups: Value = serde_json::from_str(
+        &tokio::fs::read_to_string(d.data_dir().join("named_groups.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        named_groups[group_id.as_str()]["shared_secret"].is_array(),
+        "non-admin withdrawn card must not wipe GSS secret: {named_groups:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn withdrawn_card_from_roster_admin_terminates_and_wipes_live_keyed_group() {
+    let d = daemon().await;
+    let admin = AgentKeypair::generate().unwrap();
+    let admin_hex = agent_hex(&admin);
+    let create: Value = authed_client(&d)
+        .post(d.url("/groups"))
+        .json(&serde_json::json!({
+            "name": "Admin withdrawn card guard",
+            "description": "live keyed group should terminate",
+            "preset": "public_request_secure"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(create["ok"], true, "create response: {create:?}");
+    let group_id = create["group_id"].as_str().unwrap().to_string();
+
+    let add: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/members")))
+        .json(&serde_json::json!({ "agent_id": admin_hex, "display_name": "Card Admin" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(add["ok"], true, "add response: {add:?}");
+    let promote = authed_client(&d)
+        .patch(d.url(&format!("/groups/{group_id}/members/{admin_hex}/role")))
+        .json(&serde_json::json!({ "role": "admin" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(promote.status(), StatusCode::OK);
+
+    let card: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/cards/{group_id}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let withdrawn = withdrawn_card_from(card, &admin);
+    let import = authed_client(&d)
+        .post(d.url("/groups/cards/import"))
+        .json(&withdrawn)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(import.status(), StatusCode::OK);
+
+    let state: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/state")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["withdrawn"], true, "state after import: {state:?}");
+    let named_groups: Value = serde_json::from_str(
+        &tokio::fs::read_to_string(d.data_dir().join("named_groups.json"))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        named_groups[group_id.as_str()]["shared_secret"].is_null(),
+        "authorized withdrawn card must wipe GSS secret: {named_groups:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn withdrawn_card_supersedes_keyless_discovery_stub() {
+    let d = daemon().await;
+    let owner = AgentKeypair::generate().unwrap();
+    let outsider = AgentKeypair::generate().unwrap();
+    let group_id = "cafe".repeat(16);
+    let live_card = signed_test_card(&group_id, &owner, &owner, 1, false);
+    let import_live = authed_client(&d)
+        .post(d.url("/groups/cards/import"))
+        .json(&live_card)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(import_live.status(), StatusCode::OK);
+
+    let withdrawn_card = signed_test_card(&group_id, &owner, &outsider, 2, true);
+    let import_withdrawn = authed_client(&d)
+        .post(d.url("/groups/cards/import"))
+        .json(&withdrawn_card)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(import_withdrawn.status(), StatusCode::OK);
+
+    let state: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/state")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state["withdrawn"], true, "stub state: {state:?}");
 }
 
 // ===========================================================================

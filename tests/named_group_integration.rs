@@ -983,7 +983,7 @@ async fn named_group_create_minimal() {
 }
 
 // ===========================================================================
-// 17. Full lifecycle: create -> invite -> leave -> join -> display-name -> leave
+// 17. Full lifecycle: create -> invite/list -> display-name -> leave rejection -> disband
 // ===========================================================================
 
 #[tokio::test]
@@ -1020,6 +1020,7 @@ async fn named_group_full_lifecycle() {
         .unwrap();
     assert_eq!(invite_r["ok"], true);
     let invite_link = invite_r["invite_link"].as_str().unwrap().to_string();
+    assert!(!invite_link.is_empty(), "invite link should be returned");
 
     // Step 4: Appears in list
     let list_r: Value = authed_client(&d)
@@ -1034,33 +1035,7 @@ async fn named_group_full_lifecycle() {
     let found = groups.iter().any(|g| g["group_id"] == group_id);
     assert!(found, "group should appear in list");
 
-    // Step 5: Leave
-    let leave_r: Value = authed_client(&d)
-        .delete(d.url(&format!("/groups/{group_id}")))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(leave_r["ok"], true);
-
-    // Step 6: Rejoin via invite
-    let join_r: Value = authed_client(&d)
-        .post(d.url("/groups/join"))
-        .json(&serde_json::json!({
-            "invite": invite_link,
-            "display_name": "Rejoined"
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(join_r["ok"], true);
-
-    // Step 7: Update display name
+    // Step 5: Update display name
     let dn_r: Value = authed_client(&d)
         .put(d.url(&format!("/groups/{group_id}/display-name")))
         .json(&serde_json::json!({"name": "Final Name"}))
@@ -1072,8 +1047,8 @@ async fn named_group_full_lifecycle() {
         .unwrap();
     assert_eq!(dn_r["ok"], true);
 
-    // Step 8: Verify final state
-    let final_info: Value = authed_client(&d)
+    // Step 6: Verify display name via group info
+    let updated_info: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
@@ -1081,29 +1056,61 @@ async fn named_group_full_lifecycle() {
         .json()
         .await
         .unwrap();
-    assert_eq!(final_info["ok"], true);
-    let members = final_info["members"].as_array().unwrap();
+    assert_eq!(updated_info["ok"], true);
+    let members = updated_info["members"].as_array().unwrap();
     let has_final = members.iter().any(|m| m["display_name"] == "Final Name");
     assert!(has_final, "'Final Name' not in members: {members:?}");
 
-    // Step 9: Final leave (cleanup)
-    let final_leave: Value = authed_client(&d)
+    // Step 7: DELETE is now pure self-leave; sole-admin leave is rejected.
+    let leave_resp = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(leave_resp.status(), StatusCode::CONFLICT);
+    let leave_r: Value = leave_resp.json().await.unwrap();
+    assert_eq!(
+        leave_r["ok"], false,
+        "sole-admin leave response: {leave_r:?}"
+    );
+    assert_eq!(
+        leave_r["error"].as_str(),
+        Some("a group must always have at least one admin; make another member an admin before leaving"),
+        "sole-admin leave response: {leave_r:?}"
+    );
+
+    // Step 8: Explicit disband/withdraw succeeds and retains a terminal shell.
+    let disband_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{group_id}/state/withdraw")))
+        .json(&serde_json::json!({}))
         .send()
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
-    assert_eq!(final_leave["ok"], true);
+    assert_eq!(disband_r["ok"], true, "disband response: {disband_r:?}");
 
-    // Step 10: Confirm gone
-    let gone = authed_client(&d)
+    let shell_resp = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
         .unwrap();
-    assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    assert_eq!(shell_resp.status(), StatusCode::OK);
+    let shell_info: Value = shell_resp.json().await.unwrap();
+    assert_eq!(shell_info["ok"], true, "withdrawn shell: {shell_info:?}");
+    assert_eq!(shell_info["group_id"], group_id);
+
+    let state_r: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}/state")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(state_r["ok"], true, "withdrawn state: {state_r:?}");
+    assert_eq!(state_r["withdrawn"], true, "withdrawn state: {state_r:?}");
 }
 
 // ===========================================================================

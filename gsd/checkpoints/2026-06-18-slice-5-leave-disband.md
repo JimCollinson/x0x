@@ -175,3 +175,32 @@ Slice 5 implementation has strong local evidence at `f5cbe48`, but it is **not a
 ## Recommended next step
 
 Remediate the `a9907b0` code-review findings before pushing the build branch: prevent in-flight TreeKEM encrypt/decrypt from recreating snapshots after terminality, and wipe/refuse TreeKEM persistence journals for withdrawn groups. Do not call Slice 5 done, and do not open a PR, until code review/verifier/adversarial/Craft/clean-context gates pass or Jim explicitly accepts/defers a finding.
+
+### 2026-06-20 update — at-rest TreeKEM persistence remediation
+
+- Build worktree local head: `9f7922c fix(adr-0016-phase-1): block withdrawn treekem persistence`.
+- Build branch status: local commits `939ab8c` + `a9907b0` + `9f7922c`; **not pushed** because code review still failed.
+- Remediation implemented locally:
+  - terminal TreeKEM cleanup removes both `<group_id>.snap` and `<group_id>.journal` across same-stable-group aliases;
+  - snapshot encoding rejects withdrawn `GroupInfo`;
+  - bound snapshot persistence refuses durable withdrawn groups and removes stale snapshot/journal material;
+  - journal replay discards journals whose embedded payload is withdrawn;
+  - startup restore wipes snapshot/journal material for durable withdrawn records;
+  - local protected-crypto detection now treats `.journal` as at-rest TreeKEM material.
+- Local evidence at `9f7922c`:
+  - `cargo fmt --all` — PASS
+  - `cargo clippy --all-features --all-targets -- -D warnings` — PASS
+  - `cargo check --workspace --all-targets` — PASS
+  - `cargo test --all-features --bin x0xd treekem` — PASS, 22/22
+  - `cargo nextest run --all-features -E 'test(leave) or test(disband) or test(withdraw)'` — PASS, 23/23
+  - `cargo nextest run --all-features --test membership_authority --test parity_cli` — PASS, 29/29
+  - `cargo nextest run --all-features --no-fail-fast --test api_manifest --test parity_cli --test api_coverage --test gui_smoke --test gui_named_group_parity` — PASS, 42/42
+  - `git diff --check HEAD~1..HEAD` — PASS
+- Independent code review result after `9f7922c`: **issues_found**; Slice 5 still not done.
+  - Previous HIGH resolved: in-flight TreeKEM encrypt/decrypt can no longer recreate `.snap` after terminality because bound persistence checks durable withdrawn state and removes stale material.
+  - Previous MEDIUM partially resolved: terminal wipe removes journals and replay discards withdrawn journal payloads.
+  - Remaining MEDIUM: startup journal recovery can still replay a stale **non-withdrawn** journal over an already-durable withdrawn `named_groups.json`, because `recover_treekem_named_journals` consults only the journal payload before writing snapshot/named-group state. If current durable state has a withdrawn record for the journal group or alias, recovery must delete the journal/snapshot and skip replay. Add regression: existing withdrawn `named_groups.json` + stale non-withdrawn journal must not resurrect live/keyed state.
+
+## Recommended next step (2026-06-20)
+
+Remediate the remaining code-review finding before verifier/adversarial/Craft/clean-context: make journal recovery respect current durable withdrawn state before replaying stale non-withdrawn journals, and add the missing regression test. Do not push the build branch or call Slice 5 done until code review passes.

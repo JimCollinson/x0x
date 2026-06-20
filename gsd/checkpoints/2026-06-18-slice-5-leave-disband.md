@@ -147,6 +147,31 @@ Slice 5 implementation has strong local evidence at `f5cbe48`, but it is **not a
   - HIGH: withdrawn card import can wipe a live group without validating card authority against the roster (`src/groups/directory.rs:162-164`, `src/bin/x0xd.rs:13932-13954`, `src/bin/x0xd.rs:644-666`). Fix class: for existing local groups, do not mutate/wipe from a card alone unless authority/chain proof is validated; keep stale non-withdrawn reanimation guard intact.
   - MEDIUM: alias records are not all marked withdrawn (`src/bin/x0xd.rs:11660-11668`, `12241-12265`, `12431-12435`). Fix class: ensure every local alias record for the same stable group is marked `withdrawn=true`, not merely key-cleared.
 
+### 2026-06-19 update — fix pass review blockers
+
+- Build worktree local head: `a9907b0 fix(adr-0016-phase-1): harden withdrawn shell terminality`.
+- Build branch status: local commits `939ab8c` + `a9907b0`; **not pushed** because code review still failed.
+- Fix pass addressed the previous three findings locally:
+  - central withdrawn metadata-event gate before TreeKEM queue/catchup;
+  - withdrawn-card import protects live/keyed groups with local roster-admin authority while still allowing keyless discovery stubs to supersede;
+  - same-stable-group aliases are collected and marked withdrawn/keyless.
+- Data-plane scope assumption recorded for future slices: file transfer, KV-store, and task-list writes are not named-group-bound today; if a future slice binds them to named groups, withdrawal terminality must be revisited for those surfaces.
+- Local evidence at `a9907b0`:
+  - `cargo fmt --all` — PASS
+  - `cargo clippy --all-features --all-targets -- -D warnings` — PASS
+  - `cargo check --workspace --all-targets` — PASS
+  - `cargo nextest run --all-features -E 'test(leave) or test(disband) or test(withdraw)'` — PASS, 23/23
+  - `cargo test --all-features --bin x0xd withdrawn_card` — PASS, 3/3
+  - `cargo test --all-features --bin x0xd withdrawn_treekem_group_never_queues_frontier_gap_events` — PASS, 1/1
+  - `cargo test --all-features --bin x0xd same_stable_group_aliases_include_all_local_records` — PASS, 1/1
+  - `cargo nextest run --all-features --test membership_authority --test parity_cli` — PASS, 29/29
+  - `cargo nextest run --all-features --no-fail-fast --test api_manifest --test parity_cli --test api_coverage --test gui_smoke --test gui_named_group_parity` — PASS, 42/42
+  - `cargo nextest run --all-features --test named_group_integration -E 'test(withdrawn_card_from_non_admin_does_not_terminate_live_keyed_group) or test(withdrawn_card_from_roster_admin_terminates_and_wipes_live_keyed_group) or test(withdrawn_card_supersedes_keyless_discovery_stub)' --run-ignored ignored-only` — PASS, 3/3
+  - Ignored private-secure proof still failed at startup before assertions with known carve-out line: `x0xd pair-alice-38315 did not become healthy within 90s`.
+- Independent code review result after `a9907b0`: **issues_found**; Slice 5 still not done.
+  - HIGH: TreeKEM snapshot can be re-created after terminality by in-flight secure encrypt/decrypt. Review evidence: `secure_group_encrypt` checks withdrawn then drops `named_groups` before `treekem_group_encrypt`; `treekem_group_encrypt`/decrypt can hold an `Arc` and persist a snapshot after disband; `persist_treekem_snapshot_bound` does not reject withdrawn groups. Fix class: serialize TreeKEM encrypt/decrypt snapshot persistence with terminality, or make snapshot persistence fail/remove if `GroupInfo.withdrawn`.
+  - MEDIUM: TreeKEM persistence journals are not wiped on terminality. Review evidence: journals store `snapshot_envelope`, live as `<group_id>.journal`, terminal wipe removes only snapshots, and startup replays journals before loading `named_groups`. Fix class: terminal wipe should remove `.journal` for all aliases, and/or recovery must refuse journals for withdrawn/current terminal groups.
+
 ## Recommended next step
 
-Remediate the `939ab8c` code-review findings before pushing the build branch: block withdrawn groups before TreeKEM queuing/catchup, prevent card-only withdrawn imports from wiping live groups without authority/chain validation, and mark all same-group aliases withdrawn. Do not call Slice 5 done, and do not open a PR, until code review/verifier/adversarial/Craft/clean-context gates pass or Jim explicitly accepts/defers a finding.
+Remediate the `a9907b0` code-review findings before pushing the build branch: prevent in-flight TreeKEM encrypt/decrypt from recreating snapshots after terminality, and wipe/refuse TreeKEM persistence journals for withdrawn groups. Do not call Slice 5 done, and do not open a PR, until code review/verifier/adversarial/Craft/clean-context gates pass or Jim explicitly accepts/defers a finding.

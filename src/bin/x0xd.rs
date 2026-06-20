@@ -18106,15 +18106,13 @@ async fn recover_treekem_named_journals(
         let durable_named_groups: Option<HashMap<String, x0x::groups::GroupInfo>> =
             match tokio::fs::read_to_string(named_groups_path).await {
                 Ok(json) => {
-                    let mut groups: HashMap<String, x0x::groups::GroupInfo> = serde_json::from_str(
-                        &json,
-                    )
-                    .with_context(|| {
-                        format!(
+                    let mut groups: HashMap<String, x0x::groups::GroupInfo> =
+                        serde_json::from_str(&json).with_context(|| {
+                            format!(
                             "failed to parse named groups file {} before TreeKEM journal replay",
                             named_groups_path.display()
                         )
-                    })?;
+                        })?;
                     for info in groups.values_mut() {
                         info.migrate_from_v1();
                     }

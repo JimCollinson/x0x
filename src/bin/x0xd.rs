@@ -11804,6 +11804,35 @@ fn has_withdrawn_group_record(
         })
 }
 
+fn has_withdrawn_group_record_for_journal_replay(
+    durable_groups: &HashMap<String, x0x::groups::GroupInfo>,
+    journal_group_id: &str,
+    journal_groups: &HashMap<String, x0x::groups::GroupInfo>,
+) -> bool {
+    let mut aliases = collect_same_stable_group_aliases(durable_groups, journal_group_id, None);
+    aliases.insert(journal_group_id.to_string());
+
+    let journal_infos = journal_groups.iter().filter(|(key, info)| {
+        key.as_str() == journal_group_id
+            || info.stable_group_id() == journal_group_id
+            || info.mls_group_id == journal_group_id
+    });
+    for (key, info) in journal_infos {
+        aliases.insert(key.clone());
+        aliases.insert(info.mls_group_id.clone());
+        aliases.insert(info.stable_group_id().to_string());
+        aliases.extend(collect_same_stable_group_aliases(
+            durable_groups,
+            journal_group_id,
+            Some(info.stable_group_id()),
+        ));
+    }
+
+    aliases
+        .iter()
+        .any(|alias| has_withdrawn_group_record(durable_groups, alias))
+}
+
 fn clear_group_info_key_material(info: &mut x0x::groups::GroupInfo) {
     info.shared_secret = None;
 }
@@ -18074,6 +18103,57 @@ async fn recover_treekem_named_journals(
             tracing::warn!(group_id = %LogHexId::group(&journal.group_id_hex), "discarded TreeKEM/named-group persistence journal for withdrawn group");
             continue;
         }
+        let durable_named_groups: Option<HashMap<String, x0x::groups::GroupInfo>> =
+            match tokio::fs::read_to_string(named_groups_path).await {
+                Ok(json) => {
+                    let mut groups: HashMap<String, x0x::groups::GroupInfo> = serde_json::from_str(
+                        &json,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to parse named groups file {} before TreeKEM journal replay",
+                            named_groups_path.display()
+                        )
+                    })?;
+                    for info in groups.values_mut() {
+                        info.migrate_from_v1();
+                    }
+                    Some(groups)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "failed to read named groups file {} before TreeKEM journal replay",
+                            named_groups_path.display()
+                        )
+                    });
+                }
+            };
+        if durable_named_groups.as_ref().is_some_and(|groups| {
+            has_withdrawn_group_record_for_journal_replay(
+                groups,
+                &journal.group_id_hex,
+                &named_groups,
+            )
+        }) {
+            remove_treekem_persistence_for_group_id_in_dir(
+                treekem_dir,
+                &journal.group_id_hex,
+                "withdrawn_durable_journal_replay",
+            )
+            .await;
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(anyhow::anyhow!(
+                        "remove durable-withdrawn TreeKEM journal {}: {e}",
+                        path.display()
+                    ));
+                }
+            }
+            tracing::warn!(group_id = %LogHexId::group(&journal.group_id_hex), "discarded TreeKEM/named-group persistence journal because durable named groups contain a withdrawn record");
+            continue;
+        }
         persist_treekem_snapshot_bytes(
             treekem_dir,
             &journal.group_id_hex,
@@ -20832,6 +20912,62 @@ mod tests {
             snapshot_envelope
         );
         assert!(!journal_path.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn treekem_journal_replay_preserves_durable_withdrawn_alias() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let treekem_dir = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem_dir).await?;
+        let named_path = dir.path().join("named_groups.json");
+        let snapshot_envelope = sample_treekem_snapshot_envelope()?;
+        let group_id = "ab".repeat(16);
+        let alias_mls_id = "cd".repeat(16);
+
+        let mut withdrawn_alias = sample_treekem_group_info(&alias_mls_id, true);
+        withdrawn_alias.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            group_id.clone(),
+            "02".repeat(32),
+            withdrawn_alias.created_at,
+            String::new(),
+        ));
+        let durable_named_groups_json = serde_json::to_string_pretty(&HashMap::from([(
+            "withdrawn-alias".to_string(),
+            withdrawn_alias,
+        )]))?;
+        tokio::fs::write(&named_path, &durable_named_groups_json).await?;
+
+        let journal_named_groups_json = serde_json::to_string_pretty(&HashMap::from([(
+            group_id.clone(),
+            sample_treekem_group_info(&group_id, false),
+        )]))?;
+        let journal = TreeKemNamedPersistJournal {
+            version: TREEKEM_NAMED_JOURNAL_VERSION,
+            group_id_hex: group_id.clone(),
+            named_groups_json: journal_named_groups_json,
+            snapshot_envelope,
+        };
+        let snapshot_path = treekem_snapshot_path(&treekem_dir, &group_id);
+        tokio::fs::write(&snapshot_path, b"stale-snapshot").await?;
+        let journal_path = treekem_journal_path(&treekem_dir, &group_id);
+        x0x::storage::write_private_bytes(&journal_path, postcard::to_stdvec(&journal)?).await?;
+
+        recover_treekem_named_journals(&named_path, &treekem_dir).await?;
+
+        assert_eq!(
+            tokio::fs::read_to_string(&named_path).await?,
+            durable_named_groups_json,
+            "durable withdrawn named-groups file must not be replaced"
+        );
+        assert!(
+            !snapshot_path.exists(),
+            "durable withdrawal must wipe stale snapshot material"
+        );
+        assert!(
+            !journal_path.exists(),
+            "durable withdrawal must wipe stale journal material"
+        );
         Ok(())
     }
 

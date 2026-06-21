@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.26.0] - 2026-06-21
+
+### Added
+
+- **Embeddable in-process server: `x0x::server::serve()` / `ServerHandle` ([#110](https://github.com/saorsa-labs/x0x/issues/110), proposed by @josh-clsn).** The daemon's entire axum router + SSE hub + serving-side background tasks were factored out of the `x0xd` binary into the library at `src/server/`, so a host process (e.g. an Android/iOS app that can't reliably supervise a child `x0xd`) can run the HTTP/SSE surface in-process. `serve(config)` / `serve_with_options(config, options)` return a non-blocking `ServerHandle { local_addr(), shutdown(&self), wait(), shutdown_and_wait(), cancellation_token() }`; the bin is now a thin wrapper and the HTTP/SSE surface is byte-identical (verified by a 19-test characterization oracle, the full nextest suite, a live 6-node testnet, and a line-multiset diff of the relocation). `DaemonConfig` is the public input, with a new `identity_dir` so a host supplies its own storage paths — no `~/.x0x` fallback is reachable on the embed path. The public `serve()` disables self-update install/restart by default (an embedded library must never replace or restart the host app); the daemon binary opts back in. CLI-only flows (`--doctor`/`--check`/`--check-updates`, arg parsing, logging) stay in the bin.
+
+- **Deterministic shutdown teardown ([#116](https://github.com/saorsa-labs/x0x/issues/116)).** `ServerHandle::shutdown_and_wait()` now stops every owned background task before returning: the server-owned listeners, the gossip runtime, and the QUIC `NetworkNode` (a real `NetworkNode::shutdown()` deadlock was fixed along the way), plus the previously-unstopped `Agent`-internal loops (identity / network-event / direct / lifecycle listeners, presence broadcast-peer refresh, heartbeat, discovery reaper), the presence beacons (wrapper *and* `PresenceManager`), the capability-advert and DM-inbox services, via a `CancellationToken` + a closed task registry. A listener that a still-bootstrapping `join_network` would otherwise start after shutdown is refused (TOCTOU-free). No steady-state behavior change.
+
+- **Force-cancel in-flight exec sessions on shutdown ([#118](https://github.com/saorsa-labs/x0x/issues/118)).** `ExecService::shutdown()` now force-cancels per-request exec handlers and `SIGKILL`s their child processes (out-of-band PID kill + `kill_on_drop` backstop, with a re-snapshot on the grace timeout and reap-time PID clearing so a recycled PID is never signalled), completing the deterministic-teardown story for embedders.
+
+### Changed
+
+- **Bumped `ant-quic` 0.27.26 → 0.27.27.** Picks up the endpoint UDP-socket release on shutdown ([ant-quic#196](https://github.com/saorsa-labs/ant-quic/issues/196)), so an in-process embedder can stop and restart x0x on the **same fixed QUIC port** (proven by the in-process restart tests). Resolver-unified with `saorsa-gossip`'s `ant-quic` requirement — no `saorsa-gossip` re-release needed.
+
 ## [v0.25.0] - 2026-06-19
 
 ### Added

@@ -11837,22 +11837,12 @@ fn clear_group_info_key_material(info: &mut x0x::groups::GroupInfo) {
     info.shared_secret = None;
 }
 
-fn withdrawn_card_authority_is_active_admin(
-    info: &x0x::groups::GroupInfo,
-    card: &x0x::groups::GroupCard,
-) -> bool {
-    info.caller_role(&card.authority_agent_id)
-        .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
-}
-
 fn withdrawn_card_can_terminally_mark_local_group(
     info: &x0x::groups::GroupInfo,
     card: &x0x::groups::GroupCard,
     protects_keyed_local_group: bool,
 ) -> bool {
-    card.withdrawn
-        && group_card_supersedes_group_info(card, info)
-        && (!protects_keyed_local_group || withdrawn_card_authority_is_active_admin(info, card))
+    card.withdrawn && group_card_supersedes_group_info(card, info) && !protects_keyed_local_group
 }
 
 async fn local_group_has_protected_crypto_material(
@@ -11860,11 +11850,18 @@ async fn local_group_has_protected_crypto_material(
     info: &x0x::groups::GroupInfo,
     aliases: &HashSet<String>,
 ) -> bool {
-    if info.withdrawn {
-        return false;
-    }
-    if info.shared_secret.is_some() {
+    if !info.withdrawn && info.shared_secret.is_some() {
         return true;
+    }
+    {
+        let groups = state.named_groups.read().await;
+        if aliases.iter().any(|alias| {
+            groups.get(alias).is_some_and(|alias_info| {
+                !alias_info.withdrawn && alias_info.shared_secret.is_some()
+            })
+        }) {
+            return true;
+        }
     }
     {
         let mls_groups = state.mls_groups.read().await;
@@ -12697,6 +12694,146 @@ fn reject_withdrawn_group(
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
     info.withdrawn
         .then(|| api_error(StatusCode::CONFLICT, "group is withdrawn"))
+}
+
+#[cfg(test)]
+static POST_CRYPTO_FORCED_WITHDRAWN_GROUPS: std::sync::LazyLock<StdMutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+#[cfg(test)]
+fn post_crypto_forced_withdrawn_for_test(group_id: &str, stable_group_id: Option<&str>) -> bool {
+    let forced = POST_CRYPTO_FORCED_WITHDRAWN_GROUPS
+        .lock()
+        .expect("post-crypto forced-withdrawn test hook poisoned");
+    forced.contains(group_id)
+        || stable_group_id
+            .filter(|stable| !stable.is_empty())
+            .is_some_and(|stable| forced.contains(stable))
+}
+
+#[cfg(test)]
+async fn maybe_force_post_crypto_withdrawn_group_for_test(
+    state: &AppState,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+) {
+    if !post_crypto_forced_withdrawn_for_test(group_id, stable_group_id) {
+        return;
+    }
+
+    let mut groups = state.named_groups.write().await;
+    let mut aliases = collect_same_stable_group_aliases(&groups, group_id, stable_group_id);
+    aliases.insert(group_id.to_string());
+    if let Some(stable) = stable_group_id.filter(|stable| !stable.is_empty()) {
+        aliases.insert(stable.to_string());
+    }
+    for alias in aliases {
+        if let Some(info) = groups.get_mut(&alias) {
+            info.withdrawn = true;
+            clear_group_info_key_material(info);
+        }
+    }
+}
+
+fn post_crypto_withdrawn_group_conflict(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let selected_withdrawn = groups.get(group_id).is_some_and(|info| info.withdrawn);
+    let selected_missing = !groups.contains_key(group_id);
+    let stable_group_withdrawn = stable_group_id
+        .filter(|stable| !stable.is_empty())
+        .is_some_and(|stable| {
+            if groups.contains_key(stable) {
+                groups.get(stable).is_some_and(|info| info.withdrawn) && selected_missing
+            } else {
+                selected_missing && has_withdrawn_group_record(groups, stable)
+            }
+        });
+    (selected_withdrawn || stable_group_withdrawn)
+        .then(|| api_error(StatusCode::CONFLICT, "group is withdrawn"))
+}
+
+fn active_same_stable_keyed_alias_exists(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> bool {
+    collect_same_stable_group_aliases(groups, group_id, Some(group_id))
+        .iter()
+        .any(|alias| {
+            groups
+                .get(alias)
+                .is_some_and(|info| !info.withdrawn && info.shared_secret.is_some())
+        })
+}
+
+fn open_envelope_withdrawn_group_conflict(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    (has_withdrawn_group_record(groups, group_id)
+        && !active_same_stable_keyed_alias_exists(groups, group_id))
+    .then(|| api_error(StatusCode::CONFLICT, "group is withdrawn"))
+}
+
+async fn reject_withdrawn_group_record_after_crypto(
+    state: &AppState,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    #[cfg(test)]
+    maybe_force_post_crypto_withdrawn_group_for_test(state, group_id, stable_group_id).await;
+
+    let groups = state.named_groups.read().await;
+    post_crypto_withdrawn_group_conflict(&groups, group_id, stable_group_id)
+}
+
+fn secure_group_effect_response_after_terminality_recheck_from_groups(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+    effect: serde_json::Value,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if let Some(resp) = post_crypto_withdrawn_group_conflict(groups, group_id, stable_group_id) {
+        resp
+    } else {
+        (StatusCode::OK, Json(effect))
+    }
+}
+
+async fn secure_group_effect_response_after_terminality_recheck(
+    state: &AppState,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+    effect: serde_json::Value,
+) -> (StatusCode, Json<serde_json::Value>) {
+    #[cfg(test)]
+    maybe_force_post_crypto_withdrawn_group_for_test(state, group_id, stable_group_id).await;
+
+    let groups = state.named_groups.read().await;
+    secure_group_effect_response_after_terminality_recheck_from_groups(
+        &groups,
+        group_id,
+        stable_group_id,
+        effect,
+    )
+}
+
+async fn open_envelope_effect_response_after_terminality_recheck(
+    state: &AppState,
+    group_id: &str,
+    effect: serde_json::Value,
+) -> (StatusCode, Json<serde_json::Value>) {
+    #[cfg(test)]
+    maybe_force_post_crypto_withdrawn_group_for_test(state, group_id, Some(group_id)).await;
+
+    let groups = state.named_groups.read().await;
+    if let Some(resp) = open_envelope_withdrawn_group_conflict(&groups, group_id) {
+        resp
+    } else {
+        (StatusCode::OK, Json(effect))
+    }
 }
 
 /// Friendly REST pre-check for the ADR-0016 last-admin invariant.
@@ -14235,7 +14372,7 @@ async fn import_group_card(
                 tracing::warn!(
                     group_id = %LogHexId::group(&group_id),
                     authority = %LogHexId::agent(&card.authority_agent_id),
-                    "ignored withdrawn card for live keyed group from non-admin authority"
+                    "ignored withdrawn card for live keyed group; signed withdrawal commit required"
                 );
             }
         }
@@ -14436,6 +14573,7 @@ fn treekem_metadata_event_requires_phase3(_event: &NamedGroupMetadataEvent) -> b
 async fn treekem_group_encrypt(
     state: &AppState,
     group_id_hex: &str,
+    stable_group_id: Option<&str>,
     payload_b64: &str,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
@@ -14472,6 +14610,11 @@ async fn treekem_group_encrypt(
     // not, so a persist failure fails the request.
     if let Err(e) = persist_treekem_snapshot_bound(state, group_id_hex, &guard).await {
         tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot after encrypt: {e}");
+        if let Some(resp) =
+            reject_withdrawn_group_record_after_crypto(state, group_id_hex, stable_group_id).await
+        {
+            return resp;
+        }
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to persist secure group state",
@@ -14479,15 +14622,18 @@ async fn treekem_group_encrypt(
     }
     let epoch = guard.epoch();
     drop(guard);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
+    secure_group_effect_response_after_terminality_recheck(
+        state,
+        group_id_hex,
+        stable_group_id,
+        serde_json::json!({
             "ok": true,
             "ciphertext_b64": BASE64.encode(&ciphertext),
             "secret_epoch": epoch,
             "secure_plane": "treekem",
-        })),
+        }),
     )
+    .await
 }
 
 /// Decrypt a real-TreeKEM `ApplicationCiphertext` (ADR-0012). The per-sender
@@ -14497,6 +14643,7 @@ async fn treekem_group_encrypt(
 async fn treekem_group_decrypt(
     state: &AppState,
     group_id_hex: &str,
+    stable_group_id: Option<&str>,
     ciphertext_b64: &str,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
@@ -14533,25 +14680,33 @@ async fn treekem_group_decrypt(
     // problem in logs.
     if let Err(e) = persist_treekem_snapshot_bound(state, group_id_hex, &guard).await {
         tracing::error!(group_id = %group_id_hex, "failed to persist TreeKEM snapshot after decrypt: {e}");
+        if let Some(resp) =
+            reject_withdrawn_group_record_after_crypto(state, group_id_hex, stable_group_id).await
+        {
+            return resp;
+        }
     }
     let epoch = guard.epoch();
     drop(guard);
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
+    secure_group_effect_response_after_terminality_recheck(
+        state,
+        group_id_hex,
+        stable_group_id,
+        serde_json::json!({
             "ok": true,
             "payload_b64": BASE64.encode(&plaintext),
             "secret_epoch": epoch,
             "secure_plane": "treekem",
-        })),
+        }),
     )
+    .await
 }
 
 async fn secure_group_encrypt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<SecureEncryptRequest>,
-) -> impl IntoResponse {
+) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
@@ -14569,8 +14724,15 @@ async fn secure_group_encrypt(
     // ADR-0012: real-TreeKEM groups encrypt via the live group's ratchet, not
     // the GSS shared secret. Dispatch on the group's plane.
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        let stable_group_id = info.stable_group_id().to_string();
         drop(groups);
-        return treekem_group_encrypt(state.as_ref(), &id, &req.payload_b64).await;
+        return treekem_group_encrypt(
+            state.as_ref(),
+            &id,
+            Some(&stable_group_id),
+            &req.payload_b64,
+        )
+        .await;
     }
     let Some(key) = info.secure_message_key() else {
         return api_error(
@@ -14621,15 +14783,18 @@ async fn secure_group_encrypt(
         }
     };
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
+    secure_group_effect_response_after_terminality_recheck(
+        state.as_ref(),
+        &id,
+        Some(&group_id_clone),
+        serde_json::json!({
             "ok": true,
             "ciphertext_b64": BASE64.encode(&ciphertext),
             "nonce_b64": BASE64.encode(nonce_bytes),
             "secret_epoch": epoch,
-        })),
+        }),
     )
+    .await
 }
 
 /// POST /groups/:id/secure/decrypt — AEAD-decrypt content using the group's
@@ -14643,7 +14808,7 @@ async fn secure_group_decrypt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<SecureDecryptRequest>,
-) -> impl IntoResponse {
+) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
@@ -14660,8 +14825,15 @@ async fn secure_group_decrypt(
     // removed member's leaf is gone from the live group, so decryption of a
     // post-removal epoch fails there — that is the FS/PCS guarantee.
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
+        let stable_group_id = info.stable_group_id().to_string();
         drop(groups);
-        return treekem_group_decrypt(state.as_ref(), &id, &req.ciphertext_b64).await;
+        return treekem_group_decrypt(
+            state.as_ref(),
+            &id,
+            Some(&stable_group_id),
+            &req.ciphertext_b64,
+        )
+        .await;
     }
     let Some(local_secret) = info.shared_secret.clone() else {
         return api_error(StatusCode::FAILED_DEPENDENCY, "no shared secret available");
@@ -14723,14 +14895,19 @@ async fn secure_group_decrypt(
             aad: aad.as_bytes(),
         },
     ) {
-        Ok(plaintext) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "payload_b64": BASE64.encode(&plaintext),
-                "secret_epoch": req.secret_epoch,
-            })),
-        ),
+        Ok(plaintext) => {
+            secure_group_effect_response_after_terminality_recheck(
+                state.as_ref(),
+                &id,
+                Some(&group_id_clone),
+                serde_json::json!({
+                    "ok": true,
+                    "payload_b64": BASE64.encode(&plaintext),
+                    "secret_epoch": req.secret_epoch,
+                }),
+            )
+            .await
+        }
         Err(_) => forbidden("decryption failed"),
     }
 }
@@ -14773,7 +14950,7 @@ async fn secure_group_reseal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<ResealRequest>,
-) -> impl IntoResponse {
+) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     let Some(info) = groups.get(&id) else {
@@ -14837,9 +15014,11 @@ async fn secure_group_reseal(
             }
         };
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
+    secure_group_effect_response_after_terminality_recheck(
+        state.as_ref(),
+        &id,
+        Some(&group_id_wire),
+        serde_json::json!({
             "ok": true,
             "group_id": group_id_wire,
             "recipient": req.recipient,
@@ -14847,8 +15026,9 @@ async fn secure_group_reseal(
             "kem_ciphertext_b64": BASE64.encode(&kem_ct),
             "aead_nonce_b64": BASE64.encode(aead_nonce),
             "aead_ciphertext_b64": BASE64.encode(&aead_ct),
-        })),
+        }),
     )
+    .await
 }
 
 /// POST /groups/secure/open-envelope — ADVERSARIAL TEST endpoint.
@@ -14871,11 +15051,11 @@ struct OpenEnvelopeRequest {
 async fn secure_open_envelope_adversarial(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenEnvelopeRequest>,
-) -> impl IntoResponse {
+) -> (StatusCode, Json<serde_json::Value>) {
     {
         let groups = state.named_groups.read().await;
-        if has_withdrawn_group_record(&groups, &req.group_id) {
-            return api_error(StatusCode::CONFLICT, "group is withdrawn");
+        if let Some(resp) = open_envelope_withdrawn_group_conflict(&groups, &req.group_id) {
+            return resp;
         }
     }
     use base64::Engine as _;
@@ -14910,14 +15090,18 @@ async fn secure_open_envelope_adversarial(
         &nonce_bytes,
         &aead_ct,
     ) {
-        Ok(secret) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "opened": true,
-                "secret_b64": BASE64.encode(secret),
-            })),
-        ),
+        Ok(secret) => {
+            open_envelope_effect_response_after_terminality_recheck(
+                state.as_ref(),
+                &req.group_id,
+                serde_json::json!({
+                    "ok": true,
+                    "opened": true,
+                    "secret_b64": BASE64.encode(secret),
+                }),
+            )
+            .await
+        }
         Err(_) => (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -16111,7 +16295,7 @@ async fn mls_encrypt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<MlsEncryptRequest>,
-) -> impl IntoResponse {
+) -> (StatusCode, Json<serde_json::Value>) {
     let plaintext = match decode_base64_payload(&req.payload) {
         Ok(p) => p,
         Err(resp) => return resp,
@@ -16128,14 +16312,20 @@ async fn mls_encrypt(
     };
 
     match cipher.encrypt(&plaintext, &[], epoch) {
-        Ok(ciphertext) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok(ciphertext) => {
+            drop(groups);
+            secure_group_effect_response_after_terminality_recheck(
+                state.as_ref(),
+                &id,
+                Some(&id),
+                serde_json::json!({
                 "ok": true,
                 "ciphertext": BASE64.encode(&ciphertext),
                 "epoch": epoch
-            })),
-        ),
+                }),
+            )
+            .await
+        }
         Err(e) => {
             tracing::error!("mls_encrypt failed: {e}");
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "encryption failed")
@@ -16148,7 +16338,7 @@ async fn mls_decrypt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Json(req): Json<MlsDecryptRequest>,
-) -> impl IntoResponse {
+) -> (StatusCode, Json<serde_json::Value>) {
     let ciphertext = match decode_base64_payload(&req.ciphertext) {
         Ok(c) => c,
         Err(resp) => return resp,
@@ -16165,13 +16355,19 @@ async fn mls_decrypt(
     };
 
     match cipher.decrypt(&ciphertext, &[], req.epoch) {
-        Ok(plaintext) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
+        Ok(plaintext) => {
+            drop(groups);
+            secure_group_effect_response_after_terminality_recheck(
+                state.as_ref(),
+                &id,
+                Some(&id),
+                serde_json::json!({
                 "ok": true,
                 "payload": BASE64.encode(&plaintext)
-            })),
-        ),
+                }),
+            )
+            .await
+        }
         Err(e) => {
             tracing::error!("mls_decrypt failed: {e}");
             api_error(StatusCode::INTERNAL_SERVER_ERROR, "decryption failed")
@@ -20577,6 +20773,740 @@ mod tests {
         ));
     }
 
+    fn secure_post_crypto_recheck_group(
+        group_id: &str,
+        stable_group_id: &str,
+        secure_plane: x0x::mls::SecureGroupPlane,
+        withdrawn: bool,
+    ) -> x0x::groups::GroupInfo {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            AgentId([2; 32]),
+            group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.to_string(),
+            "02".repeat(32),
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = secure_plane;
+        info.secret_epoch = 7;
+        info.shared_secret = (!withdrawn).then(|| vec![9; 32]);
+        info.withdrawn = withdrawn;
+        info
+    }
+
+    fn assert_post_crypto_lost_race_drops_secure_effect(
+        secure_plane: x0x::mls::SecureGroupPlane,
+        effect: serde_json::Value,
+        proof_field: &str,
+    ) {
+        let group_id = "local-mls-id";
+        let stable_group_id = "stable-card-id";
+        let mut groups = HashMap::from([(
+            group_id.to_string(),
+            secure_post_crypto_recheck_group(group_id, stable_group_id, secure_plane, false),
+        )]);
+
+        let (status, body) = secure_group_effect_response_after_terminality_recheck_from_groups(
+            &groups,
+            group_id,
+            Some(stable_group_id),
+            effect.clone(),
+        );
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.0.get(proof_field).is_some(),
+            "active group should return the computed secure effect field {proof_field}"
+        );
+
+        groups.insert(
+            group_id.to_string(),
+            secure_post_crypto_recheck_group(group_id, stable_group_id, secure_plane, true),
+        );
+        let (status, body) = secure_group_effect_response_after_terminality_recheck_from_groups(
+            &groups,
+            group_id,
+            Some(stable_group_id),
+            effect,
+        );
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0["ok"].as_bool(), Some(false));
+        assert_eq!(body.0["error"].as_str(), Some("group is withdrawn"));
+        for field in [
+            "payload_b64",
+            "ciphertext_b64",
+            "nonce_b64",
+            "secret_b64",
+            "kem_ciphertext_b64",
+            "aead_nonce_b64",
+            "aead_ciphertext_b64",
+        ] {
+            assert!(
+                body.0.get(field).is_none(),
+                "withdrawn conflict must not leak secure effect field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn treekem_decrypt_lost_race_drops_plaintext() {
+        assert_post_crypto_lost_race_drops_secure_effect(
+            x0x::mls::SecureGroupPlane::TreeKem,
+            serde_json::json!({
+                "ok": true,
+                "payload_b64": "c2VjcmV0",
+                "secret_epoch": 7,
+                "secure_plane": "treekem",
+            }),
+            "payload_b64",
+        );
+    }
+
+    #[test]
+    fn gss_decrypt_lost_race_drops_plaintext() {
+        assert_post_crypto_lost_race_drops_secure_effect(
+            x0x::mls::SecureGroupPlane::Gss,
+            serde_json::json!({
+                "ok": true,
+                "payload_b64": "c2VjcmV0",
+                "secret_epoch": 7,
+            }),
+            "payload_b64",
+        );
+    }
+
+    #[test]
+    fn treekem_encrypt_lost_race_drops_ciphertext() {
+        assert_post_crypto_lost_race_drops_secure_effect(
+            x0x::mls::SecureGroupPlane::TreeKem,
+            serde_json::json!({
+                "ok": true,
+                "ciphertext_b64": "Y2lwaGVydGV4dA==",
+                "secret_epoch": 7,
+                "secure_plane": "treekem",
+            }),
+            "ciphertext_b64",
+        );
+    }
+
+    #[test]
+    fn gss_encrypt_lost_race_drops_ciphertext() {
+        assert_post_crypto_lost_race_drops_secure_effect(
+            x0x::mls::SecureGroupPlane::Gss,
+            serde_json::json!({
+                "ok": true,
+                "ciphertext_b64": "Y2lwaGVydGV4dA==",
+                "nonce_b64": "bm9uY2U=",
+                "secret_epoch": 7,
+            }),
+            "ciphertext_b64",
+        );
+    }
+
+    #[test]
+    fn gss_reseal_lost_race_drops_secret_envelope() {
+        assert_post_crypto_lost_race_drops_secure_effect(
+            x0x::mls::SecureGroupPlane::Gss,
+            serde_json::json!({
+                "ok": true,
+                "group_id": "stable-card-id",
+                "recipient": "aa",
+                "secret_epoch": 7,
+                "kem_ciphertext_b64": "a2Vt",
+                "aead_nonce_b64": "bm9uY2U=",
+                "aead_ciphertext_b64": "YWVhZA==",
+            }),
+            "kem_ciphertext_b64",
+        );
+    }
+
+    #[test]
+    fn open_envelope_lost_race_drops_opened_secret() {
+        assert_post_crypto_lost_race_drops_secure_effect(
+            x0x::mls::SecureGroupPlane::Gss,
+            serde_json::json!({
+                "ok": true,
+                "opened": true,
+                "secret_b64": "c2VjcmV0",
+            }),
+            "secret_b64",
+        );
+    }
+
+    struct PostCryptoForcedWithdrawal {
+        ids: Vec<String>,
+    }
+
+    impl Drop for PostCryptoForcedWithdrawal {
+        fn drop(&mut self) {
+            let mut forced = POST_CRYPTO_FORCED_WITHDRAWN_GROUPS
+                .lock()
+                .expect("post-crypto forced-withdrawn test hook poisoned");
+            for id in &self.ids {
+                forced.remove(id);
+            }
+        }
+    }
+
+    fn force_post_crypto_withdrawn_ids(ids: &[&str]) -> PostCryptoForcedWithdrawal {
+        let ids = ids.iter().map(|id| (*id).to_string()).collect::<Vec<_>>();
+        let mut forced = POST_CRYPTO_FORCED_WITHDRAWN_GROUPS
+            .lock()
+            .expect("post-crypto forced-withdrawn test hook poisoned");
+        for id in &ids {
+            forced.insert(id.clone());
+        }
+        PostCryptoForcedWithdrawal { ids }
+    }
+
+    async fn secure_endpoint_test_state() -> Result<(Arc<AppState>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path();
+        let treekem_dir = data_dir.join("treekem");
+        tokio::fs::create_dir_all(&treekem_dir).await?;
+
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .build()
+                .await?,
+        );
+        let contacts = Arc::clone(agent.contacts());
+        agent.set_contacts(Arc::clone(&contacts));
+
+        let (broadcast_tx, _) = broadcast::channel::<SseEvent>(16);
+        let (shutdown_tx, _) = mpsc::channel::<()>(1);
+        let (shutdown_notify, _) = watch::channel(false);
+        let (_exec_dm_tx, exec_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1);
+        let exec_policy = x0x::exec::ExecPolicy::Disabled {
+            path: data_dir.join("exec-acl.toml"),
+            reason: "test".to_string(),
+            loaded_at_unix_ms: 0,
+        };
+        let exec_service =
+            x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
+
+        let state = Arc::new(AppState {
+            agent,
+            subscriptions: RwLock::new(HashMap::new()),
+            task_lists: RwLock::new(HashMap::new()),
+            kv_stores: RwLock::new(HashMap::new()),
+            named_groups: RwLock::new(HashMap::new()),
+            named_groups_path: data_dir.join("named_groups.json"),
+            group_metadata_tasks: RwLock::new(HashMap::new()),
+            group_card_cache: RwLock::new(HashMap::new()),
+            directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),
+            directory_subscriptions: RwLock::new(x0x::groups::SubscriptionSet::default()),
+            directory_subscriptions_path: data_dir.join("directory-subscriptions.json"),
+            directory_tasks: RwLock::new(HashMap::new()),
+            directory_digest_interval_secs: DIRECTORY_DIGEST_INTERVAL_SECS,
+            directory_resubscribe_jitter_ms: DIRECTORY_RESUBSCRIBE_JITTER_MS,
+            public_messages: RwLock::new(HashMap::new()),
+            public_message_tasks: RwLock::new(HashMap::new()),
+            agent_kem_keypair: Arc::new(x0x::groups::kem_envelope::AgentKemKeypair::generate()?),
+            contacts,
+            mls_groups: RwLock::new(HashMap::new()),
+            mls_groups_path: data_dir.join("mls_groups.bin"),
+            pending_join_results: RwLock::new(HashMap::new()),
+            expected_join_result_inviters: StdMutex::new(HashMap::new()),
+            pending_welcomes: RwLock::new(HashMap::new()),
+            pending_welcome_receives: RwLock::new(HashMap::new()),
+            pending_welcome_waiters: RwLock::new(HashMap::new()),
+            pending_welcome_acks: RwLock::new(HashMap::new()),
+            treekem_pending_events: RwLock::new(HashMap::new()),
+            treekem_event_log: RwLock::new(HashMap::new()),
+            treekem_catchup_throttle: RwLock::new(HashMap::new()),
+            group_membership_locks: RwLock::new(HashMap::new()),
+            treekem_groups: RwLock::new(HashMap::new()),
+            treekem_dir,
+            ws_sessions: RwLock::new(HashMap::new()),
+            ws_topics: RwLock::new(HashMap::new()),
+            api_address: "127.0.0.1:0".parse().expect("valid test API address"),
+            start_time: Instant::now(),
+            broadcast_tx,
+            file_transfers: RwLock::new(HashMap::new()),
+            receive_hashers: RwLock::new(HashMap::new()),
+            pending_file_chunks: RwLock::new(HashMap::new()),
+            file_chunk_acks: RwLock::new(HashMap::new()),
+            transfers_dir: data_dir.join("transfers"),
+            shutdown_tx,
+            shutdown_notify,
+            update_config: DaemonUpdateConfig::default(),
+            upgrade_check_cache: Mutex::new(None),
+            upgrade_apply_lock: Arc::new(Mutex::new(())),
+            api_token: "test-token".to_string(),
+            exec_service,
+            groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
+        });
+        Ok((state, dir))
+    }
+
+    fn secure_endpoint_group_for_agent(
+        agent_id: AgentId,
+        group_id: &str,
+        stable_group_id: &str,
+        secure_plane: x0x::mls::SecureGroupPlane,
+    ) -> x0x::groups::GroupInfo {
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            agent_id,
+            group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.to_string(),
+            hex::encode(agent_id.as_bytes()),
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = secure_plane;
+        info.secret_epoch = 7;
+        info.shared_secret = Some(vec![9; 32]);
+        info
+    }
+
+    async fn install_secure_endpoint_group(
+        state: &Arc<AppState>,
+        group_id: &str,
+        stable_group_id: &str,
+        secure_plane: x0x::mls::SecureGroupPlane,
+    ) {
+        let info = secure_endpoint_group_for_agent(
+            state.agent.agent_id(),
+            group_id,
+            stable_group_id,
+            secure_plane,
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+    }
+
+    fn assert_lost_race_conflict_drops_fields(
+        status: StatusCode,
+        body: &serde_json::Value,
+        leaked_fields: &[&str],
+    ) {
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["ok"].as_bool(), Some(false));
+        assert_eq!(body["error"].as_str(), Some("group is withdrawn"));
+        for field in leaked_fields {
+            assert!(
+                body.get(*field).is_none(),
+                "withdrawn conflict must not leak secure effect field {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn secure_encrypt_endpoint_gss_lost_race_drops_ciphertext() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "gss-encrypt-local";
+        let stable_group_id = "gss-encrypt-stable";
+        install_secure_endpoint_group(
+            &state,
+            group_id,
+            stable_group_id,
+            x0x::mls::SecureGroupPlane::Gss,
+        )
+        .await;
+
+        let _guard = force_post_crypto_withdrawn_ids(&[stable_group_id]);
+        let (status, body) = secure_group_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(SecureEncryptRequest {
+                payload_b64: BASE64.encode(b"secret"),
+            }),
+        )
+        .await;
+
+        assert_lost_race_conflict_drops_fields(status, &body.0, &["ciphertext_b64", "nonce_b64"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secure_decrypt_endpoint_gss_lost_race_drops_plaintext() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "gss-decrypt-local";
+        let stable_group_id = "gss-decrypt-stable";
+        install_secure_endpoint_group(
+            &state,
+            group_id,
+            stable_group_id,
+            x0x::mls::SecureGroupPlane::Gss,
+        )
+        .await;
+        let (encrypt_status, encrypted) = secure_group_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(SecureEncryptRequest {
+                payload_b64: BASE64.encode(b"secret"),
+            }),
+        )
+        .await;
+        assert_eq!(encrypt_status, StatusCode::OK);
+
+        let _guard = force_post_crypto_withdrawn_ids(&[stable_group_id]);
+        let (status, body) = secure_group_decrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(SecureDecryptRequest {
+                ciphertext_b64: encrypted.0["ciphertext_b64"]
+                    .as_str()
+                    .expect("ciphertext present")
+                    .to_string(),
+                nonce_b64: encrypted.0["nonce_b64"]
+                    .as_str()
+                    .expect("nonce present")
+                    .to_string(),
+                secret_epoch: encrypted.0["secret_epoch"].as_u64().expect("epoch present"),
+            }),
+        )
+        .await;
+
+        assert_lost_race_conflict_drops_fields(status, &body.0, &["payload_b64"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secure_reseal_endpoint_lost_race_drops_secret_envelope() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "gss-reseal-local";
+        let stable_group_id = "gss-reseal-stable";
+        install_secure_endpoint_group(
+            &state,
+            group_id,
+            stable_group_id,
+            x0x::mls::SecureGroupPlane::Gss,
+        )
+        .await;
+        let recipient = hex::encode(state.agent.agent_id().as_bytes());
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(group_id)
+            .expect("group installed")
+            .set_member_kem_public_key(
+                &recipient,
+                BASE64.encode(&state.agent_kem_keypair.public_bytes),
+            );
+
+        let _guard = force_post_crypto_withdrawn_ids(&[stable_group_id]);
+        let (status, body) = secure_group_reseal(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(ResealRequest { recipient }),
+        )
+        .await;
+
+        assert_lost_race_conflict_drops_fields(
+            status,
+            &body.0,
+            &[
+                "kem_ciphertext_b64",
+                "aead_nonce_b64",
+                "aead_ciphertext_b64",
+            ],
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secure_open_envelope_endpoint_lost_race_drops_opened_secret() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "open-envelope-stable";
+        install_secure_endpoint_group(&state, group_id, group_id, x0x::mls::SecureGroupPlane::Gss)
+            .await;
+        let recipient = hex::encode(state.agent.agent_id().as_bytes());
+        let secret = [7_u8; 32];
+        let aad = secure_share_aad(group_id, &recipient, 7);
+        let (kem_ct, aead_nonce, aead_ct) =
+            x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+                &state.agent_kem_keypair.public_bytes,
+                &aad,
+                &secret,
+            )?;
+
+        let _guard = force_post_crypto_withdrawn_ids(&[group_id]);
+        let (status, body) = secure_open_envelope_adversarial(
+            State(Arc::clone(&state)),
+            Json(OpenEnvelopeRequest {
+                group_id: group_id.to_string(),
+                recipient,
+                secret_epoch: 7,
+                kem_ciphertext_b64: BASE64.encode(&kem_ct),
+                aead_nonce_b64: BASE64.encode(aead_nonce),
+                aead_ciphertext_b64: BASE64.encode(&aead_ct),
+            }),
+        )
+        .await;
+
+        assert_lost_race_conflict_drops_fields(status, &body.0, &["secret_b64"]);
+        Ok(())
+    }
+
+    async fn install_treekem_endpoint_group(
+        state: &Arc<AppState>,
+        group_id: &str,
+        stable_group_id: &str,
+    ) -> Result<()> {
+        install_secure_endpoint_group(
+            state,
+            group_id,
+            stable_group_id,
+            x0x::mls::SecureGroupPlane::TreeKem,
+        )
+        .await;
+        let group = x0x::mls::TreeKemMlsGroup::create(
+            group_id.as_bytes().to_vec(),
+            state.agent.agent_id(),
+            &[3; 32],
+        )?;
+        state
+            .treekem_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), Arc::new(Mutex::new(group)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secure_encrypt_endpoint_treekem_lost_race_drops_ciphertext() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = &"ab".repeat(16);
+        let stable_group_id = "treekem-encrypt-stable";
+        install_treekem_endpoint_group(&state, group_id, stable_group_id).await?;
+
+        let _guard = force_post_crypto_withdrawn_ids(&[stable_group_id]);
+        let (status, body) = secure_group_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(SecureEncryptRequest {
+                payload_b64: BASE64.encode(b"secret"),
+            }),
+        )
+        .await;
+
+        assert_lost_race_conflict_drops_fields(status, &body.0, &["ciphertext_b64"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secure_decrypt_endpoint_treekem_lost_race_drops_plaintext() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = &"cd".repeat(16);
+        let stable_group_id = "treekem-decrypt-stable";
+        install_treekem_endpoint_group(&state, group_id, stable_group_id).await?;
+        let (encrypt_status, encrypted) = secure_group_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(SecureEncryptRequest {
+                payload_b64: BASE64.encode(b"secret"),
+            }),
+        )
+        .await;
+        assert_eq!(encrypt_status, StatusCode::OK);
+
+        let _guard = force_post_crypto_withdrawn_ids(&[stable_group_id]);
+        let (status, body) = secure_group_decrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(SecureDecryptRequest {
+                ciphertext_b64: encrypted.0["ciphertext_b64"]
+                    .as_str()
+                    .expect("ciphertext present")
+                    .to_string(),
+                nonce_b64: String::new(),
+                secret_epoch: 0,
+            }),
+        )
+        .await;
+
+        assert_lost_race_conflict_drops_fields(status, &body.0, &["payload_b64"]);
+        Ok(())
+    }
+
+    async fn install_legacy_mls_endpoint_group(
+        state: &Arc<AppState>,
+        group_id: &str,
+    ) -> Result<()> {
+        let group = x0x::mls::MlsGroup::new(hex::decode(group_id)?, state.agent.agent_id()).await?;
+        state
+            .mls_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), group);
+        install_secure_endpoint_group(state, group_id, group_id, x0x::mls::SecureGroupPlane::Gss)
+            .await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_mls_encrypt_lost_race_drops_ciphertext() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = &"ef".repeat(16);
+        install_legacy_mls_endpoint_group(&state, group_id).await?;
+
+        let _guard = force_post_crypto_withdrawn_ids(&[group_id]);
+        let (status, body) = mls_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(MlsEncryptRequest {
+                payload: BASE64.encode(b"secret"),
+            }),
+        )
+        .await;
+
+        assert_lost_race_conflict_drops_fields(status, &body.0, &["ciphertext"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_mls_decrypt_lost_race_drops_plaintext() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = &"01".repeat(16);
+        install_legacy_mls_endpoint_group(&state, group_id).await?;
+        let (encrypt_status, encrypted) = mls_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(MlsEncryptRequest {
+                payload: BASE64.encode(b"secret"),
+            }),
+        )
+        .await;
+        assert_eq!(encrypt_status, StatusCode::OK);
+
+        let _guard = force_post_crypto_withdrawn_ids(&[group_id]);
+        let (status, body) = mls_decrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(MlsDecryptRequest {
+                ciphertext: encrypted.0["ciphertext"]
+                    .as_str()
+                    .expect("ciphertext present")
+                    .to_string(),
+                epoch: encrypted.0["epoch"].as_u64().expect("epoch present"),
+            }),
+        )
+        .await;
+
+        assert_lost_race_conflict_drops_fields(status, &body.0, &["payload"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secure_encrypt_endpoint_withdrawn_stable_stub_does_not_poison_live_keyed_alias(
+    ) -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "live-keyed-local";
+        let stable_group_id = "stale-withdrawn-stable";
+        install_secure_endpoint_group(
+            &state,
+            group_id,
+            stable_group_id,
+            x0x::mls::SecureGroupPlane::Gss,
+        )
+        .await;
+
+        let mut stale_stub = secure_endpoint_group_for_agent(
+            state.agent.agent_id(),
+            stable_group_id,
+            stable_group_id,
+            x0x::mls::SecureGroupPlane::Gss,
+        );
+        stale_stub.shared_secret = None;
+        stale_stub.members_v2.clear();
+        stale_stub.withdrawn = true;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(stable_group_id.to_string(), stale_stub);
+
+        let (status, body) = secure_group_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(SecureEncryptRequest {
+                payload_b64: BASE64.encode(b"secret"),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.0.get("ciphertext_b64").is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_envelope_withdrawn_stable_stub_does_not_poison_live_keyed_alias() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let stable_group_id = "open-envelope-stale-stable";
+        let live_alias = "open-envelope-live-alias";
+        install_secure_endpoint_group(
+            &state,
+            live_alias,
+            stable_group_id,
+            x0x::mls::SecureGroupPlane::Gss,
+        )
+        .await;
+
+        let mut stale_stub = secure_endpoint_group_for_agent(
+            state.agent.agent_id(),
+            stable_group_id,
+            stable_group_id,
+            x0x::mls::SecureGroupPlane::Gss,
+        );
+        stale_stub.shared_secret = None;
+        stale_stub.members_v2.clear();
+        stale_stub.withdrawn = true;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(stable_group_id.to_string(), stale_stub);
+
+        let recipient = hex::encode(state.agent.agent_id().as_bytes());
+        let secret = [7_u8; 32];
+        let aad = secure_share_aad(stable_group_id, &recipient, 7);
+        let (kem_ct, aead_nonce, aead_ct) =
+            x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+                &state.agent_kem_keypair.public_bytes,
+                &aad,
+                &secret,
+            )?;
+
+        let (status, body) = secure_open_envelope_adversarial(
+            State(Arc::clone(&state)),
+            Json(OpenEnvelopeRequest {
+                group_id: stable_group_id.to_string(),
+                recipient,
+                secret_epoch: 7,
+                kem_ciphertext_b64: BASE64.encode(&kem_ct),
+                aead_nonce_b64: BASE64.encode(aead_nonce),
+                aead_ciphertext_b64: BASE64.encode(&aead_ct),
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.0.get("secret_b64").is_some());
+        Ok(())
+    }
+
     #[test]
     fn same_stable_group_aliases_include_all_local_records() {
         let stable_id = "stable-card-id";
@@ -20656,11 +21586,10 @@ mod tests {
         assert!(!withdrawn_card_can_terminally_mark_local_group(
             &info, &card, true,
         ));
-        assert!(!withdrawn_card_authority_is_active_admin(&info, &card));
     }
 
     #[test]
-    fn withdrawn_card_admin_can_terminally_mark_and_clear_keyed_live_group() {
+    fn withdrawn_card_admin_cannot_terminally_mark_keyed_live_group_without_signed_commit() {
         let creator = x0x::identity::AgentKeypair::generate().expect("creator keypair");
         let admin = x0x::identity::AgentKeypair::generate().expect("admin keypair");
         let creator_hex = hex::encode(creator.agent_id().as_bytes());
@@ -20686,12 +21615,11 @@ mod tests {
         card.withdrawn = true;
         card.authority_agent_id = admin_hex;
 
-        assert!(withdrawn_card_can_terminally_mark_local_group(
+        assert!(!withdrawn_card_can_terminally_mark_local_group(
             &info, &card, true,
         ));
-        assert!(apply_withdrawn_group_card_to_group_info(&mut info, &card));
-        assert!(info.withdrawn);
-        assert_eq!(info.shared_secret, None);
+        assert!(!info.withdrawn);
+        assert_eq!(info.shared_secret, Some(vec![9; 32]));
     }
 
     #[test]
@@ -20720,6 +21648,133 @@ mod tests {
         assert!(apply_withdrawn_group_card_to_group_info(&mut stub, &card));
         assert!(stub.withdrawn);
         assert_eq!(stub.shared_secret, None);
+    }
+
+    #[tokio::test]
+    async fn withdrawn_card_import_does_not_wipe_same_stable_keyed_alias_via_keyless_stub(
+    ) -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let stable_group_id = "same-stable-card";
+        let keyed_alias = "same-stable-live-alias";
+        let creator = x0x::identity::AgentKeypair::generate()?;
+        let creator_hex = hex::encode(creator.agent_id().as_bytes());
+
+        let mut keyless_stub = x0x::groups::GroupInfo::with_policy(
+            "stub".to_string(),
+            String::new(),
+            creator.agent_id(),
+            stable_group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        keyless_stub.state_revision = 1;
+        keyless_stub.updated_at = 1_000;
+        keyless_stub.shared_secret = None;
+        keyless_stub.members_v2.clear();
+
+        let mut live_keyed = x0x::groups::GroupInfo::with_policy(
+            "live".to_string(),
+            String::new(),
+            creator.agent_id(),
+            keyed_alias.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        live_keyed.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.to_string(),
+            creator_hex,
+            live_keyed.created_at,
+            String::new(),
+        ));
+        live_keyed.state_revision = 1;
+        live_keyed.updated_at = 1_000;
+        live_keyed.shared_secret = Some(vec![9; 32]);
+
+        {
+            let mut groups = state.named_groups.write().await;
+            groups.insert(stable_group_id.to_string(), keyless_stub);
+            groups.insert(keyed_alias.to_string(), live_keyed);
+        }
+
+        let mut card = sample_group_card(stable_group_id, 2, 2_000);
+        card.withdrawn = true;
+        card.sign(&creator)?;
+
+        let response = import_group_card(State(Arc::clone(&state)), Json(card))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let groups = state.named_groups.read().await;
+        let live = groups.get(keyed_alias).expect("live alias retained");
+        assert!(!live.withdrawn);
+        assert_eq!(live.shared_secret, Some(vec![9; 32]));
+        let stub = groups.get(stable_group_id).expect("keyless stub retained");
+        assert!(!stub.withdrawn);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn withdrawn_card_import_does_not_wipe_keyed_alias_via_stale_withdrawn_stub() -> Result<()>
+    {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let stable_group_id = "stale-withdrawn-card";
+        let keyed_alias = "stale-withdrawn-live-alias";
+        let creator = x0x::identity::AgentKeypair::generate()?;
+        let creator_hex = hex::encode(creator.agent_id().as_bytes());
+
+        let mut stale_withdrawn_stub = x0x::groups::GroupInfo::with_policy(
+            "stub".to_string(),
+            String::new(),
+            creator.agent_id(),
+            stable_group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        stale_withdrawn_stub.state_revision = 1;
+        stale_withdrawn_stub.updated_at = 1_000;
+        stale_withdrawn_stub.shared_secret = None;
+        stale_withdrawn_stub.members_v2.clear();
+        stale_withdrawn_stub.withdrawn = true;
+
+        let mut live_keyed = x0x::groups::GroupInfo::with_policy(
+            "live".to_string(),
+            String::new(),
+            creator.agent_id(),
+            keyed_alias.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        live_keyed.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.to_string(),
+            creator_hex,
+            live_keyed.created_at,
+            String::new(),
+        ));
+        live_keyed.state_revision = 1;
+        live_keyed.updated_at = 1_000;
+        live_keyed.shared_secret = Some(vec![9; 32]);
+
+        {
+            let mut groups = state.named_groups.write().await;
+            groups.insert(stable_group_id.to_string(), stale_withdrawn_stub);
+            groups.insert(keyed_alias.to_string(), live_keyed);
+        }
+
+        let mut card = sample_group_card(stable_group_id, 2, 2_000);
+        card.withdrawn = true;
+        card.sign(&creator)?;
+
+        let response = import_group_card(State(Arc::clone(&state)), Json(card))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let groups = state.named_groups.read().await;
+        let live = groups.get(keyed_alias).expect("live alias retained");
+        assert!(!live.withdrawn);
+        assert_eq!(live.shared_secret, Some(vec![9; 32]));
+        let stub = groups
+            .get(stable_group_id)
+            .expect("stale withdrawn stub retained");
+        assert!(stub.withdrawn);
+        Ok(())
     }
 
     #[tokio::test]

@@ -296,8 +296,8 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | GET | `/groups` | `x0x group list` | List named groups |
 | GET | `/groups/:id` | `x0x group info <group_id>` | Get group info |
 | GET | `/groups/:id/members` | `x0x group members <group_id>` | List named-group members |
-| POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id>` | Creator-authored member add (propagates to subscribed peers) |
-| DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Creator-authored member removal (propagates to subscribed peers) |
+| POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id>` | Admin-authored member add (propagates to subscribed peers) |
+| DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate an invite link |
 | POST | `/groups/join` | `x0x group join <invite>` | Join via invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |
@@ -382,7 +382,8 @@ Write-access is enforced at both endpoint and ingest:
 - `MembersOnly` — only active members may send.
 - `ModeratedPublic` — any non-banned author may send (moderators
   remove inappropriate content later).
-- `AdminOnly` — only `Admin` or `Owner` may send.
+- `AdminOnly` — only active admins may send; legacy `Owner` entries count as
+  Admin-equivalent.
 
 Banned authors are rejected in **every** write-access mode. `POST
 /groups/:id/send` also rejects `MlsEncrypted` groups (route to
@@ -401,7 +402,7 @@ Each named group maintains a signed commit chain:
 - `GET /groups/:id/state` returns `{ group_id (stable), genesis,
   state_revision, state_hash, prev_state_hash, security_binding,
   withdrawn, roster_root, policy_hash, public_meta_hash }`.
-- `POST /groups/:id/state/seal` (owner/admin) advances the chain by one
+- `POST /groups/:id/state/seal` (any admin) advances the chain by one
   revision and republishes the authority-signed public `GroupCard` to
   the global discovery topic. Returns the signed `GroupStateCommit`.
 - `POST /groups/:id/state/withdraw` (`x0x group disband`, any admin)
@@ -415,10 +416,12 @@ Each named group maintains a signed commit chain:
   receipt regardless of TTL; Hidden groups rely on the metadata/direct disband
   event, not public-card discovery.
   Explicit `POST /groups/cards/import` keeps passive discovery/listed/shard
-  withdrawal handling cache-only, but a withdrawn card may terminally mark and
-  wipe an existing live/keyed local group only when `authority_agent_id` is an
-  active Admin-or-higher in the local roster. Non-admin withdrawn cards can still
-  supersede discovery stubs/listings that have no local key material to protect.
+  withdrawal handling cache-only for live/keyed local groups: a withdrawn card
+  alone cannot terminally mark or wipe a group that has local GSS/MLS/TreeKEM key
+  material, even if the card's `authority_agent_id` names an active Admin. Live
+  keyed terminality requires the signed terminal `GroupStateCommit` delivered via
+  metadata/direct disband. Withdrawn cards can still supersede discovery
+  stubs/listings that have no local key material to protect.
 
 Cards and commits carry ML-DSA-65 signatures. Peers verify both the
 signature and the chain link (`prev_state_hash`) before accepting; stale

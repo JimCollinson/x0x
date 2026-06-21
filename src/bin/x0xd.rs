@@ -9836,6 +9836,13 @@ async fn apply_named_group_metadata_event_inner(
                         return false;
                     }
                 };
+                let rollback_snapshot = match guard.to_snapshot_bytes() {
+                    Ok(snapshot) => snapshot,
+                    Err(e) => {
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), member = %LogHexId::agent(&member_agent_id), "MemberJoined: failed to snapshot TreeKEM group before add: {e}");
+                        return false;
+                    }
+                };
                 let out = match guard.add_member(member_id, kp_bytes) {
                     Ok(out) => out,
                     Err(e) => {
@@ -9844,6 +9851,14 @@ async fn apply_named_group_metadata_event_inner(
                     }
                 };
                 if guard.epoch() != expected_epoch {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_joined_add",
+                    );
                     return false;
                 }
                 if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
@@ -9854,6 +9869,14 @@ async fn apply_named_group_metadata_event_inner(
                 )
                 .await
                 {
+                    rollback_treekem_group_after_failed_install(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        &rollback_snapshot,
+                        &mut guard,
+                        "member_joined_add",
+                    );
                     tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after invite add: {e}");
                     return false;
                 }
@@ -21495,6 +21518,138 @@ mod tests {
         info
     }
 
+    struct MemberJoinedTreeKemFixture {
+        state: Arc<AppState>,
+        _dir: tempfile::TempDir,
+        group_id: String,
+        stable_group_id: String,
+        member_id: AgentId,
+        member_hex: String,
+        event: NamedGroupMetadataEvent,
+        group: Arc<Mutex<x0x::mls::TreeKemMlsGroup>>,
+        initial_epoch: u64,
+    }
+
+    async fn member_joined_treekem_fixture(
+        group_byte: u8,
+        stable_byte: u8,
+    ) -> Result<MemberJoinedTreeKemFixture> {
+        let (state, dir) = secure_endpoint_test_state().await?;
+        let group_id = format!("{group_byte:02x}").repeat(32);
+        let stable_group_id = format!("{stable_byte:02x}").repeat(32);
+        let group_id_bytes = hex::decode(&group_id)?;
+        let inviter = state.agent.agent_id();
+        let inviter_hex = hex::encode(inviter.as_bytes());
+        let creator_seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let live_group = x0x::mls::TreeKemMlsGroup::create(group_id_bytes, inviter, &creator_seed)?;
+        let initial_epoch = live_group.epoch();
+        let group = Arc::new(Mutex::new(live_group));
+        state
+            .treekem_groups
+            .write()
+            .await
+            .insert(group_id.clone(), Arc::clone(&group));
+
+        let mut info = treekem_metadata_group_info(inviter, &group_id, &stable_group_id);
+        let now_ms = now_millis_u64();
+        let invite_secret = format!("member-joined-invite-{group_byte:02x}");
+        info.record_issued_invite(
+            invite_secret.clone(),
+            now_ms / 1_000,
+            0,
+            x0x::groups::GroupRole::Member,
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        let member_keypair = x0x::identity::AgentKeypair::generate()?;
+        let member_id = member_keypair.agent_id();
+        let member_hex = hex::encode(member_id.as_bytes());
+        let member_public_key_b64 = BASE64.encode(member_keypair.public_key().as_bytes());
+        let member_seed = [stable_byte; 32];
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(member_id, &member_seed)?;
+        let treekem_key_package_b64 = BASE64.encode(prepared.key_package_bytes());
+        let canonical = canonical_member_joined_bytes(
+            &group_id,
+            Some(&stable_group_id),
+            &member_hex,
+            &member_public_key_b64,
+            x0x::groups::GroupRole::Member,
+            None,
+            &inviter_hex,
+            &invite_secret,
+            now_ms,
+            Some(&treekem_key_package_b64),
+        );
+        let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            member_keypair.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| anyhow::anyhow!("sign MemberJoined fixture: {e:?}"))?;
+        let event = NamedGroupMetadataEvent::MemberJoined {
+            group_id: group_id.clone(),
+            stable_group_id: Some(stable_group_id.clone()),
+            member_agent_id: member_hex.clone(),
+            member_public_key_b64,
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: inviter_hex,
+            invite_secret,
+            ts_ms: now_ms,
+            treekem_key_package_b64: Some(treekem_key_package_b64),
+            signature_b64: BASE64.encode(signature.as_bytes()),
+        };
+
+        Ok(MemberJoinedTreeKemFixture {
+            state,
+            _dir: dir,
+            group_id,
+            stable_group_id,
+            member_id,
+            member_hex,
+            event,
+            group,
+            initial_epoch,
+        })
+    }
+
+    async fn assert_member_joined_treekem_did_not_install(
+        fixture: &MemberJoinedTreeKemFixture,
+    ) -> Result<()> {
+        let guard = fixture.group.lock().await;
+        assert_eq!(
+            guard.epoch(),
+            fixture.initial_epoch,
+            "rejected MemberJoined must roll back in-memory TreeKEM epoch"
+        );
+        assert_eq!(
+            guard.member_count(),
+            1,
+            "rejected MemberJoined must not leave an added TreeKEM leaf"
+        );
+        drop(guard);
+        assert!(
+            !tokio::fs::try_exists(treekem_snapshot_path(
+                &fixture.state.treekem_dir,
+                &fixture.group_id,
+            ))
+            .await?,
+            "rejected MemberJoined must not persist TreeKEM snapshot material"
+        );
+        let groups = fixture.state.named_groups.read().await;
+        let live = groups
+            .get(&fixture.group_id)
+            .expect("live group record retained");
+        assert!(
+            !live.has_active_member(&fixture.member_hex),
+            "rejected MemberJoined must not store roster/key-state advance"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn treekem_welcome_lost_race_does_not_install_tree_state() -> Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
@@ -21652,6 +21807,70 @@ mod tests {
         assert!(
             !stored.has_active_member(&member_hex),
             "rejected commit must not store roster/key-state advance"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn member_joined_treekem_lost_race_rolls_back_in_memory_tree_state() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x53, 0x53).await?;
+        let _guard = force_post_crypto_withdrawn_ids(&[&fixture.stable_group_id]);
+
+        let should_exit = apply_named_group_metadata_event_inner(
+            &fixture.state,
+            fixture.event.clone(),
+            fixture.member_id,
+            true,
+            true,
+        )
+        .await;
+
+        assert!(!should_exit);
+        assert_member_joined_treekem_did_not_install(&fixture).await?;
+        let groups = fixture.state.named_groups.read().await;
+        assert!(
+            groups
+                .get(&fixture.group_id)
+                .is_some_and(|info| info.withdrawn),
+            "lost-race withdrawal should win"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn member_joined_treekem_withdrawn_same_stable_alias_rolls_back() -> Result<()> {
+        let fixture = member_joined_treekem_fixture(0x54, 0x55).await?;
+        let mut withdrawn_alias = treekem_metadata_group_info(
+            fixture.state.agent.agent_id(),
+            &fixture.stable_group_id,
+            &fixture.stable_group_id,
+        );
+        withdrawn_alias.withdrawn = true;
+        clear_group_info_key_material(&mut withdrawn_alias);
+        fixture
+            .state
+            .named_groups
+            .write()
+            .await
+            .insert(fixture.stable_group_id.clone(), withdrawn_alias);
+
+        let should_exit = apply_named_group_metadata_event_inner(
+            &fixture.state,
+            fixture.event.clone(),
+            fixture.member_id,
+            true,
+            true,
+        )
+        .await;
+
+        assert!(!should_exit);
+        assert_member_joined_treekem_did_not_install(&fixture).await?;
+        let groups = fixture.state.named_groups.read().await;
+        assert!(
+            groups
+                .get(&fixture.stable_group_id)
+                .is_some_and(|info| info.withdrawn),
+            "withdrawn same-stable alias should remain terminal"
         );
         Ok(())
     }

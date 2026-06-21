@@ -11961,15 +11961,39 @@ async fn ensure_named_group_key_material_install_allowed(
     #[cfg(test)]
     maybe_force_post_crypto_withdrawn_group_for_test(state, group_id, stable_group_id).await;
 
-    let withdrawn = {
-        let groups = state.named_groups.read().await;
-        has_withdrawn_same_stable_group_record(&groups, group_id, stable_group_id)
-    };
-    if withdrawn {
-        remove_treekem_persistence_for_group_id(state, group_id, reason).await;
+    if repair_withdrawn_named_groups_json_and_wipe_key_material(
+        state,
+        group_id,
+        stable_group_id,
+        reason,
+    )
+    .await?
+    {
         anyhow::bail!("refusing to install key material for withdrawn group");
     }
     Ok(())
+}
+
+async fn repair_withdrawn_named_groups_json_and_wipe_key_material(
+    state: &AppState,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+    reason: &str,
+) -> anyhow::Result<bool> {
+    let repair_json = {
+        let groups = state.named_groups.read().await;
+        if !has_withdrawn_same_stable_group_record(&groups, group_id, stable_group_id) {
+            return Ok(false);
+        }
+        serde_json::to_string_pretty(&*groups)
+            .map_err(|e| anyhow::anyhow!("withdrawn named groups repair encode: {e}"))?
+    };
+
+    remove_treekem_persistence_for_group_id(state, group_id, reason).await;
+    write_named_groups_json_atomic(&state.named_groups_path, &repair_json)
+        .await
+        .map_err(|e| anyhow::anyhow!("withdrawn named groups repair write: {e}"))?;
+    Ok(true)
 }
 
 fn has_withdrawn_group_record_for_journal_replay(
@@ -12869,6 +12893,11 @@ static POST_CRYPTO_FORCED_WITHDRAWN_GROUPS: std::sync::LazyLock<StdMutex<HashSet
     std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
 
 #[cfg(test)]
+static ATOMIC_PERSIST_POST_JSON_FORCED_WITHDRAWN_GROUPS: std::sync::LazyLock<
+    StdMutex<HashSet<String>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+#[cfg(test)]
 fn post_crypto_forced_withdrawn_for_test(group_id: &str, stable_group_id: Option<&str>) -> bool {
     let forced = POST_CRYPTO_FORCED_WITHDRAWN_GROUPS
         .lock()
@@ -12886,6 +12915,44 @@ async fn maybe_force_post_crypto_withdrawn_group_for_test(
     stable_group_id: Option<&str>,
 ) {
     if !post_crypto_forced_withdrawn_for_test(group_id, stable_group_id) {
+        return;
+    }
+
+    let mut groups = state.named_groups.write().await;
+    let mut aliases = collect_same_stable_group_aliases(&groups, group_id, stable_group_id);
+    aliases.insert(group_id.to_string());
+    if let Some(stable) = stable_group_id.filter(|stable| !stable.is_empty()) {
+        aliases.insert(stable.to_string());
+    }
+    for alias in aliases {
+        if let Some(info) = groups.get_mut(&alias) {
+            info.withdrawn = true;
+            clear_group_info_key_material(info);
+        }
+    }
+}
+
+#[cfg(test)]
+fn atomic_persist_post_json_forced_withdrawn_for_test(
+    group_id: &str,
+    stable_group_id: Option<&str>,
+) -> bool {
+    let forced = ATOMIC_PERSIST_POST_JSON_FORCED_WITHDRAWN_GROUPS
+        .lock()
+        .expect("atomic-persist forced-withdrawn test hook poisoned");
+    forced.contains(group_id)
+        || stable_group_id
+            .filter(|stable| !stable.is_empty())
+            .is_some_and(|stable| forced.contains(stable))
+}
+
+#[cfg(test)]
+async fn maybe_force_atomic_persist_post_json_withdrawn_group_for_test(
+    state: &AppState,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+) {
+    if !atomic_persist_post_json_forced_withdrawn_for_test(group_id, stable_group_id) {
         return;
     }
 
@@ -14502,6 +14569,8 @@ async fn import_group_card(
         return bad_request(format!("invalid signed card: {e}"));
     }
     let group_id = card.group_id.clone();
+    let membership_lock = group_membership_lock(&state, &group_id).await;
+    let _membership_guard = membership_lock.lock().await;
 
     if card.withdrawn {
         let mut cache = state.group_card_cache.write().await;
@@ -18372,10 +18441,11 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     info: x0x::groups::GroupInfo,
     group: &x0x::mls::TreeKemMlsGroup,
 ) -> anyhow::Result<()> {
+    let stable_group_id = info.stable_group_id().to_string();
     ensure_treekem_persistence_allowed(
         state,
         group_id_hex,
-        Some(info.stable_group_id()),
+        Some(&stable_group_id),
         "withdrawn_atomic_persist",
     )
     .await?;
@@ -18386,6 +18456,15 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         serde_json::to_string_pretty(&next_groups)
             .map_err(|e| anyhow::anyhow!("named groups encode: {e}"))?
     };
+
+    #[cfg(test)]
+    maybe_force_atomic_persist_post_json_withdrawn_group_for_test(
+        state,
+        group_id_hex,
+        Some(&stable_group_id),
+    )
+    .await;
+
     let snapshot_envelope = encode_treekem_snapshot_envelope(&info, group)?;
     let journal = TreeKemNamedPersistJournal {
         version: TREEKEM_NAMED_JOURNAL_VERSION,
@@ -18400,6 +18479,16 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
         .await
         .map_err(|e| anyhow::anyhow!("TreeKEM journal write: {e}"))?;
     persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, snapshot_envelope).await?;
+    if repair_withdrawn_named_groups_json_and_wipe_key_material(
+        state,
+        group_id_hex,
+        Some(&stable_group_id),
+        "withdrawn_atomic_persist_late",
+    )
+    .await?
+    {
+        anyhow::bail!("refusing to persist key material for withdrawn group");
+    }
     write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
         .await
         .map_err(|e| anyhow::anyhow!("named groups write: {e}"))?;
@@ -21122,11 +21211,26 @@ mod tests {
         ids: Vec<String>,
     }
 
+    struct AtomicPersistPostJsonForcedWithdrawal {
+        ids: Vec<String>,
+    }
+
     impl Drop for PostCryptoForcedWithdrawal {
         fn drop(&mut self) {
             let mut forced = POST_CRYPTO_FORCED_WITHDRAWN_GROUPS
                 .lock()
                 .expect("post-crypto forced-withdrawn test hook poisoned");
+            for id in &self.ids {
+                forced.remove(id);
+            }
+        }
+    }
+
+    impl Drop for AtomicPersistPostJsonForcedWithdrawal {
+        fn drop(&mut self) {
+            let mut forced = ATOMIC_PERSIST_POST_JSON_FORCED_WITHDRAWN_GROUPS
+                .lock()
+                .expect("atomic-persist forced-withdrawn test hook poisoned");
             for id in &self.ids {
                 forced.remove(id);
             }
@@ -21142,6 +21246,19 @@ mod tests {
             forced.insert(id.clone());
         }
         PostCryptoForcedWithdrawal { ids }
+    }
+
+    fn force_atomic_persist_post_json_withdrawn_ids(
+        ids: &[&str],
+    ) -> AtomicPersistPostJsonForcedWithdrawal {
+        let ids = ids.iter().map(|id| (*id).to_string()).collect::<Vec<_>>();
+        let mut forced = ATOMIC_PERSIST_POST_JSON_FORCED_WITHDRAWN_GROUPS
+            .lock()
+            .expect("atomic-persist forced-withdrawn test hook poisoned");
+        for id in &ids {
+            forced.insert(id.clone());
+        }
+        AtomicPersistPostJsonForcedWithdrawal { ids }
     }
 
     async fn secure_endpoint_test_state() -> Result<(Arc<AppState>, tempfile::TempDir)> {
@@ -21710,6 +21827,91 @@ mod tests {
         );
         let groups = state.named_groups.read().await;
         assert!(groups.get(group_id).is_some_and(|info| info.withdrawn));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn treekem_atomic_persist_lost_race_withdrawn_repairs_named_groups() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "56".repeat(32);
+        let stable_group_id = "57".repeat(32);
+        let group_id_bytes = hex::decode(&group_id)?;
+        let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let group =
+            x0x::mls::TreeKemMlsGroup::create(group_id_bytes, state.agent.agent_id(), &seed)?;
+        let epoch = group.epoch();
+        let mut current =
+            treekem_metadata_group_info(state.agent.agent_id(), &group_id, &stable_group_id);
+        current.secret_epoch = epoch;
+        current.security_binding = Some(format!("treekem:epoch={epoch}"));
+        current.shared_secret = Some(vec![9; 32]);
+        current.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), current.clone());
+        save_named_groups(&state).await;
+
+        let added_member = "58".repeat(32);
+        let mut next = current;
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        next.add_member(
+            added_member.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(hex::encode(state.agent.agent_id().as_bytes())),
+            None,
+        );
+        next.recompute_state_hash();
+
+        let _guard = force_atomic_persist_post_json_withdrawn_ids(&[&stable_group_id]);
+        let result = install_joined_treekem_group_after_crypto_recheck(
+            state.as_ref(),
+            &group_id,
+            next,
+            group,
+            "test_treekem_atomic_persist_lost_race",
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "late withdrawn recheck must reject durable TreeKEM install"
+        );
+        assert!(
+            !state.treekem_groups.read().await.contains_key(&group_id),
+            "rejected install must not leave in-memory TreeKEM state"
+        );
+        assert!(
+            !tokio::fs::try_exists(treekem_snapshot_path(&state.treekem_dir, &group_id)).await?,
+            "late withdrawal must wipe snapshot material"
+        );
+        assert!(
+            !tokio::fs::try_exists(treekem_journal_path(&state.treekem_dir, &group_id)).await?,
+            "late withdrawal must wipe journal material"
+        );
+        let durable_groups = load_named_groups(&state.named_groups_path).await?;
+        let durable = durable_groups
+            .get(&group_id)
+            .expect("withdrawn group shell remains durable");
+        assert!(
+            durable.withdrawn,
+            "durable named_groups.json must retain withdrawal terminality"
+        );
+        assert_eq!(
+            durable.shared_secret, None,
+            "durable withdrawn shell must not retain key material"
+        );
+        assert!(
+            !durable.has_active_member(&added_member),
+            "durable withdrawn shell must not contain the stale TreeKEM roster advance"
+        );
+        let groups = state.named_groups.read().await;
+        let in_memory = groups
+            .get(&group_id)
+            .expect("withdrawn group shell remains in memory");
+        assert!(in_memory.withdrawn);
+        assert!(!in_memory.has_active_member(&added_member));
         Ok(())
     }
 

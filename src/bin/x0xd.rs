@@ -7501,11 +7501,140 @@ async fn store_named_group_info(
     info: x0x::groups::GroupInfo,
 ) -> bool {
     let mut groups = state.named_groups.write().await;
+    if !info.withdrawn
+        && has_withdrawn_same_stable_group_record(&groups, group_id, Some(info.stable_group_id()))
+    {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            stable_group_id = %LogHexId::group(info.stable_group_id()),
+            "refusing to overwrite withdrawn named-group terminal record"
+        );
+        return false;
+    }
     let Some(slot) = groups.get_mut(group_id) else {
         return false;
     };
     *slot = info;
     true
+}
+
+fn restore_local_treekem_group_from_snapshot(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    snapshot: &[u8],
+) -> anyhow::Result<x0x::mls::TreeKemMlsGroup> {
+    let group_id_bytes = hex::decode(&info.mls_group_id)
+        .map_err(|e| anyhow::anyhow!("invalid TreeKEM group id for rollback: {e}"))?;
+    let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+    x0x::mls::TreeKemMlsGroup::restore(snapshot, state.agent.agent_id(), &seed)
+        .map_err(|e| anyhow::anyhow!("restore TreeKEM rollback snapshot: {e}"))
+}
+
+fn rollback_treekem_group_after_failed_install(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+    snapshot: &[u8],
+    group: &mut x0x::mls::TreeKemMlsGroup,
+    reason: &str,
+) {
+    match restore_local_treekem_group_from_snapshot(state, info, snapshot) {
+        Ok(restored) => {
+            *group = restored;
+        }
+        Err(e) => {
+            tracing::error!(
+                group_id = %LogHexId::group(group_id),
+                reason,
+                "failed to rollback TreeKEM group after rejected install: {e}"
+            );
+        }
+    }
+}
+
+async fn install_joined_treekem_group_after_crypto_recheck(
+    state: &AppState,
+    group_id: &str,
+    info: x0x::groups::GroupInfo,
+    group: x0x::mls::TreeKemMlsGroup,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let stable_group_id = info.stable_group_id().to_string();
+    ensure_named_group_key_material_install_allowed(
+        state,
+        group_id,
+        Some(&stable_group_id),
+        reason,
+    )
+    .await?;
+    persist_treekem_and_named_groups_atomic_with_info(state, group_id, info, &group).await?;
+    ensure_named_group_key_material_install_allowed(
+        state,
+        group_id,
+        Some(&stable_group_id),
+        reason,
+    )
+    .await?;
+    state.treekem_groups.write().await.insert(
+        group_id.to_string(),
+        Arc::new(tokio::sync::Mutex::new(group)),
+    );
+    Ok(())
+}
+
+async fn process_treekem_commit_after_crypto_recheck(
+    state: &AppState,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+    group: Arc<tokio::sync::Mutex<x0x::mls::TreeKemMlsGroup>>,
+    commit_bytes: &[u8],
+    expected_epoch: u64,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let mut guard = group.lock().await;
+    let rollback_snapshot = guard
+        .to_snapshot_bytes()
+        .map_err(|e| anyhow::anyhow!("snapshot TreeKEM group before commit: {e}"))?;
+    if let Err(e) = guard.process_commit(commit_bytes) {
+        rollback_treekem_group_after_failed_install(
+            state,
+            group_id,
+            info,
+            &rollback_snapshot,
+            &mut guard,
+            reason,
+        );
+        return Err(anyhow::anyhow!("process TreeKEM commit: {e}"));
+    }
+    if guard.epoch() != expected_epoch {
+        let actual_epoch = guard.epoch();
+        rollback_treekem_group_after_failed_install(
+            state,
+            group_id,
+            info,
+            &rollback_snapshot,
+            &mut guard,
+            reason,
+        );
+        anyhow::bail!(
+            "TreeKEM commit advanced to unexpected epoch {actual_epoch}, expected {expected_epoch}"
+        );
+    }
+    if let Err(e) =
+        persist_treekem_and_named_groups_atomic_with_info(state, group_id, info.clone(), &guard)
+            .await
+    {
+        rollback_treekem_group_after_failed_install(
+            state,
+            group_id,
+            info,
+            &rollback_snapshot,
+            &mut guard,
+            reason,
+        );
+        return Err(e);
+    }
+    Ok(())
 }
 
 async fn maybe_publish_group_card_after_state_change(state: &AppState, group_id: &str) {
@@ -8462,44 +8591,36 @@ async fn apply_named_group_metadata_event_inner(
                     if tk.epoch() != epoch {
                         return false;
                     }
-                    if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                    if let Err(e) = install_joined_treekem_group_after_crypto_recheck(
                         state,
                         &resolved_group_key,
                         next.clone(),
-                        &tk,
+                        tk,
+                        "member_added_welcome",
                     )
                     .await
                     {
-                        tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after MemberAdded Welcome: {e}");
+                        tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to install TreeKEM snapshot after MemberAdded Welcome: {e}");
                         return false;
                     }
-                    state.treekem_groups.write().await.insert(
-                        resolved_group_key.clone(),
-                        Arc::new(tokio::sync::Mutex::new(tk)),
-                    );
                 } else {
                     let group = {
                         let map = state.treekem_groups.read().await;
                         map.get(&resolved_group_key).cloned()
                     };
                     if let Some(group) = group {
-                        let mut guard = group.lock().await;
-                        if let Err(e) = guard.process_commit(&commit_bytes) {
-                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM MemberAdded commit: {e}");
-                            return false;
-                        }
-                        if guard.epoch() != epoch {
-                            return false;
-                        }
-                        if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                        if let Err(e) = process_treekem_commit_after_crypto_recheck(
                             state,
                             &resolved_group_key,
-                            next.clone(),
-                            &guard,
+                            &next,
+                            group,
+                            &commit_bytes,
+                            epoch,
+                            "member_added_commit",
                         )
                         .await
                         {
-                            tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after MemberAdded commit: {e}");
+                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM MemberAdded commit: {e}");
                             return false;
                         }
                     } else if !info.has_active_member(&local_agent_hex) {
@@ -8655,24 +8776,18 @@ async fn apply_named_group_metadata_event_inner(
                 let Some(group) = group else {
                     return false;
                 };
-                let mut guard = group.lock().await;
-                if let Err(e) = guard.process_commit(&commit_bytes) {
-                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM remove commit: {e}");
-                    return false;
-                }
-                if guard.epoch() != _epoch {
-                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM remove commit advanced to unexpected epoch");
-                    return false;
-                }
-                if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                if let Err(e) = process_treekem_commit_after_crypto_recheck(
                     state,
                     &resolved_group_key,
-                    next.clone(),
-                    &guard,
+                    &next,
+                    group,
+                    &commit_bytes,
+                    _epoch,
+                    "member_removed_commit",
                 )
                 .await
                 {
-                    tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after remove commit: {e}");
+                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM remove commit: {e}");
                     return false;
                 }
             }
@@ -8898,23 +9013,18 @@ async fn apply_named_group_metadata_event_inner(
                 let Some(group) = group else {
                     return false;
                 };
-                let mut guard = group.lock().await;
-                if let Err(e) = guard.process_commit(&commit_bytes) {
-                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM ban commit: {e}");
-                    return false;
-                }
-                if guard.epoch() != epoch {
-                    return false;
-                }
-                if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                if let Err(e) = process_treekem_commit_after_crypto_recheck(
                     state,
                     &resolved_group_key,
-                    next.clone(),
-                    &guard,
+                    &next,
+                    group,
+                    &commit_bytes,
+                    epoch,
+                    "member_banned_commit",
                 )
                 .await
                 {
-                    tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after ban commit: {e}");
+                    tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM ban commit: {e}");
                     return false;
                 }
             }
@@ -9189,21 +9299,18 @@ async fn apply_named_group_metadata_event_inner(
                         tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), expected_epoch = _epoch, actual_epoch = tk.epoch(), "TreeKEM Welcome joined at unexpected epoch");
                         return false;
                     }
-                    if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
+                    if let Err(e) = install_joined_treekem_group_after_crypto_recheck(
                         state,
                         &resolved_group_key,
                         next.clone(),
-                        &tk,
+                        tk,
+                        "join_request_approved_welcome",
                     )
                     .await
                     {
-                        tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist joined TreeKEM snapshot: {e}");
+                        tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to install joined TreeKEM snapshot: {e}");
                         return false;
                     }
-                    state.treekem_groups.write().await.insert(
-                        resolved_group_key.clone(),
-                        Arc::new(tokio::sync::Mutex::new(tk)),
-                    );
                 } else {
                     let group = {
                         let map = state.treekem_groups.read().await;
@@ -9212,27 +9319,19 @@ async fn apply_named_group_metadata_event_inner(
                     let Some(group) = group else {
                         return false;
                     };
+                    if let Err(e) = process_treekem_commit_after_crypto_recheck(
+                        state,
+                        &resolved_group_key,
+                        &next,
+                        group,
+                        &commit_bytes,
+                        _epoch,
+                        "join_request_approved_commit",
+                    )
+                    .await
                     {
-                        let mut guard = group.lock().await;
-                        if let Err(e) = guard.process_commit(&commit_bytes) {
-                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process TreeKEM add commit: {e}");
-                            return false;
-                        }
-                        if guard.epoch() != _epoch {
-                            tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), expected_epoch = _epoch, actual_epoch = guard.epoch(), "TreeKEM add commit advanced to unexpected epoch");
-                            return false;
-                        }
-                        if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
-                            state,
-                            &resolved_group_key,
-                            next.clone(),
-                            &guard,
-                        )
-                        .await
-                        {
-                            tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after add commit: {e}");
-                            return false;
-                        }
+                        tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM add commit: {e}");
+                        return false;
                     }
                 }
             }
@@ -9467,6 +9566,17 @@ async fn apply_named_group_metadata_event_inner(
                     return false;
                 }
             };
+            if let Err(e) = ensure_named_group_key_material_install_allowed(
+                state,
+                &resolved_group_key,
+                Some(info.stable_group_id()),
+                "secure_share_delivered",
+            )
+            .await
+            {
+                tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "rejecting SecureShareDelivered after post-crypto terminality recheck: {e}");
+                return false;
+            }
             let mut next = info.clone();
             next.shared_secret = Some(secret.to_vec());
             next.secret_epoch = secret_epoch;
@@ -11802,6 +11912,41 @@ fn has_withdrawn_group_record(
         || groups.values().any(|info| {
             info.withdrawn && (info.stable_group_id() == group_id || info.mls_group_id == group_id)
         })
+}
+
+fn has_withdrawn_same_stable_group_record(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+) -> bool {
+    let mut aliases = collect_same_stable_group_aliases(groups, group_id, stable_group_id);
+    aliases.insert(group_id.to_string());
+    if let Some(stable) = stable_group_id.filter(|stable| !stable.is_empty()) {
+        aliases.insert(stable.to_string());
+    }
+    aliases
+        .iter()
+        .any(|alias| has_withdrawn_group_record(groups, alias))
+}
+
+async fn ensure_named_group_key_material_install_allowed(
+    state: &AppState,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+    reason: &str,
+) -> anyhow::Result<()> {
+    #[cfg(test)]
+    maybe_force_post_crypto_withdrawn_group_for_test(state, group_id, stable_group_id).await;
+
+    let withdrawn = {
+        let groups = state.named_groups.read().await;
+        has_withdrawn_same_stable_group_record(&groups, group_id, stable_group_id)
+    };
+    if withdrawn {
+        remove_treekem_persistence_for_group_id(state, group_id, reason).await;
+        anyhow::bail!("refusing to install key material for withdrawn group");
+    }
+    Ok(())
 }
 
 fn has_withdrawn_group_record_for_journal_replay(
@@ -18161,7 +18306,6 @@ async fn persist_treekem_snapshot_bound(
     group_id_hex: &str,
     group: &x0x::mls::TreeKemMlsGroup,
 ) -> anyhow::Result<()> {
-    ensure_treekem_persistence_allowed(state, group_id_hex, "withdrawn_snapshot_persist").await?;
     let info = {
         let groups = state.named_groups.read().await;
         groups
@@ -18169,25 +18313,32 @@ async fn persist_treekem_snapshot_bound(
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("named group missing for TreeKEM snapshot"))?
     };
+    ensure_treekem_persistence_allowed(
+        state,
+        group_id_hex,
+        Some(info.stable_group_id()),
+        "withdrawn_snapshot_persist",
+    )
+    .await?;
     let bytes = encode_treekem_snapshot_envelope(&info, group)?;
     persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, bytes).await?;
-    ensure_treekem_persistence_allowed(state, group_id_hex, "withdrawn_snapshot_persist").await
+    ensure_treekem_persistence_allowed(
+        state,
+        group_id_hex,
+        Some(info.stable_group_id()),
+        "withdrawn_snapshot_persist",
+    )
+    .await
 }
 
 async fn ensure_treekem_persistence_allowed(
     state: &AppState,
     group_id_hex: &str,
+    stable_group_id: Option<&str>,
     reason: &str,
 ) -> anyhow::Result<()> {
-    let withdrawn = {
-        let groups = state.named_groups.read().await;
-        has_withdrawn_group_record(&groups, group_id_hex)
-    };
-    if withdrawn {
-        remove_treekem_persistence_for_group_id(state, group_id_hex, reason).await;
-        anyhow::bail!("refusing to persist TreeKEM snapshot for withdrawn group");
-    }
-    Ok(())
+    ensure_named_group_key_material_install_allowed(state, group_id_hex, stable_group_id, reason)
+        .await
 }
 
 /// Persist a supplied named-group state and matching TreeKEM snapshot with a
@@ -18198,7 +18349,13 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     info: x0x::groups::GroupInfo,
     group: &x0x::mls::TreeKemMlsGroup,
 ) -> anyhow::Result<()> {
-    ensure_treekem_persistence_allowed(state, group_id_hex, "withdrawn_atomic_persist").await?;
+    ensure_treekem_persistence_allowed(
+        state,
+        group_id_hex,
+        Some(info.stable_group_id()),
+        "withdrawn_atomic_persist",
+    )
+    .await?;
     let named_groups_json = {
         let groups = state.named_groups.read().await;
         let mut next_groups = groups.clone();
@@ -21256,6 +21413,246 @@ mod tests {
         .await;
 
         assert_lost_race_conflict_drops_fields(status, &body.0, &["secret_b64"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_secure_share_lost_race_does_not_install_secret() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "metadata-share-local";
+        let stable_group_id = "metadata-share-stable";
+        install_secure_endpoint_group(
+            &state,
+            group_id,
+            stable_group_id,
+            x0x::mls::SecureGroupPlane::Gss,
+        )
+        .await;
+        let recipient = hex::encode(state.agent.agent_id().as_bytes());
+        let secret_epoch = 8;
+        let secret = [8_u8; 32];
+        let aad = secure_share_aad(stable_group_id, &recipient, secret_epoch);
+        let (kem_ct, aead_nonce, aead_ct) =
+            x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+                &state.agent_kem_keypair.public_bytes,
+                &aad,
+                &secret,
+            )?;
+        let event = NamedGroupMetadataEvent::SecureShareDelivered {
+            group_id: stable_group_id.to_string(),
+            recipient: recipient.clone(),
+            secret_epoch,
+            kem_ciphertext_b64: BASE64.encode(&kem_ct),
+            aead_nonce_b64: BASE64.encode(aead_nonce),
+            aead_ciphertext_b64: BASE64.encode(&aead_ct),
+            actor: recipient,
+        };
+
+        let _guard = force_post_crypto_withdrawn_ids(&[stable_group_id]);
+        let _ = apply_named_group_metadata_event_inner(
+            &state,
+            event,
+            state.agent.agent_id(),
+            true,
+            true,
+        )
+        .await;
+
+        let groups = state.named_groups.read().await;
+        let info = groups
+            .get(group_id)
+            .expect("group retained as terminal shell");
+        assert!(info.withdrawn, "lost-race withdrawal should win");
+        assert_eq!(info.shared_secret, None, "secret must not be installed");
+        assert_ne!(info.secret_epoch, secret_epoch, "epoch must not advance");
+        Ok(())
+    }
+
+    fn treekem_metadata_group_info(
+        creator: AgentId,
+        group_id: &str,
+        stable_group_id: &str,
+    ) -> x0x::groups::GroupInfo {
+        let creator_hex = hex::encode(creator.as_bytes());
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "secure".to_string(),
+            String::new(),
+            creator,
+            group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.to_string(),
+            creator_hex,
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.shared_secret = None;
+        info.secret_epoch = 0;
+        info.security_binding = Some("treekem:epoch=0".to_string());
+        info.recompute_state_hash();
+        info
+    }
+
+    #[tokio::test]
+    async fn treekem_welcome_lost_race_does_not_install_tree_state() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "51".repeat(32);
+        let group_id = group_id_storage.as_str();
+        let group_id_bytes = hex::decode(group_id)?;
+        let authority = AgentId([0x51; 32]);
+        let authority_hex = hex::encode(authority.as_bytes());
+        let mut authority_group =
+            x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), authority, &[0x51; 32])?;
+        let local_seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(state.agent.agent_id(), &local_seed)?;
+        let add =
+            authority_group.add_member(state.agent.agent_id(), prepared.key_package_bytes())?;
+        let joined = x0x::mls::TreeKemMlsGroup::join_from_welcome(prepared, &add.welcome)?;
+        let epoch = joined.epoch();
+        let info = treekem_metadata_group_info(authority, group_id, group_id);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let mut next = info;
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        next.add_member(
+            local_hex,
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex),
+            None,
+        );
+        next.secret_epoch = epoch;
+        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+        next.recompute_state_hash();
+
+        let _guard = force_post_crypto_withdrawn_ids(&[group_id]);
+        let result = install_joined_treekem_group_after_crypto_recheck(
+            state.as_ref(),
+            group_id,
+            next,
+            joined,
+            "test_treekem_welcome_lost_race",
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "withdrawn recheck must reject welcome install"
+        );
+        assert!(
+            !state.treekem_groups.read().await.contains_key(group_id),
+            "welcome must not install in-memory TreeKEM state"
+        );
+        assert!(
+            !tokio::fs::try_exists(treekem_snapshot_path(&state.treekem_dir, group_id)).await?,
+            "welcome must not persist TreeKEM snapshot material"
+        );
+        let groups = state.named_groups.read().await;
+        assert!(groups.get(group_id).is_some_and(|info| info.withdrawn));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn treekem_commit_lost_race_rolls_back_in_memory_tree_state() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id_storage = "52".repeat(32);
+        let group_id = group_id_storage.as_str();
+        let group_id_bytes = hex::decode(group_id)?;
+        let authority = AgentId([0x54; 32]);
+        let authority_hex = hex::encode(authority.as_bytes());
+        let mut author_group =
+            x0x::mls::TreeKemMlsGroup::create(group_id_bytes.clone(), authority, &[0x54; 32])?;
+        let local_seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+        let local_prepared =
+            x0x::mls::TreeKemMlsGroup::prepare_member(state.agent.agent_id(), &local_seed)?;
+        let local_add =
+            author_group.add_member(state.agent.agent_id(), local_prepared.key_package_bytes())?;
+        let local_group =
+            x0x::mls::TreeKemMlsGroup::join_from_welcome(local_prepared, &local_add.welcome)?;
+        let initial_epoch = local_group.epoch();
+        let pre_commit_snapshot = local_group.to_snapshot_bytes()?;
+        let pre_commit_group = x0x::mls::TreeKemMlsGroup::restore(
+            &pre_commit_snapshot,
+            state.agent.agent_id(),
+            &local_seed,
+        )?;
+        let member = AgentId([0x53; 32]);
+        let member_hex = hex::encode(member.as_bytes());
+        let prepared = x0x::mls::TreeKemMlsGroup::prepare_member(member, &[0x53; 32])?;
+        let add = author_group.add_member(member, prepared.key_package_bytes())?;
+        let expected_epoch = author_group.epoch();
+        let mut info = treekem_metadata_group_info(authority, group_id, group_id);
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        info.add_member(
+            local_hex,
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex.clone()),
+            None,
+        );
+        info.secret_epoch = initial_epoch;
+        info.security_binding = Some(format!("treekem:epoch={initial_epoch}"));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info.clone());
+        let group = Arc::new(Mutex::new(pre_commit_group));
+        state
+            .treekem_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), Arc::clone(&group));
+        let mut next = info;
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        next.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex),
+            None,
+        );
+        next.secret_epoch = expected_epoch;
+        next.security_binding = Some(format!("treekem:epoch={expected_epoch}"));
+        next.recompute_state_hash();
+
+        let _guard = force_post_crypto_withdrawn_ids(&[group_id]);
+        let result = process_treekem_commit_after_crypto_recheck(
+            state.as_ref(),
+            group_id,
+            &next,
+            Arc::clone(&group),
+            &add.commit,
+            expected_epoch,
+            "test_treekem_commit_lost_race",
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "withdrawn recheck must reject commit install"
+        );
+        assert_eq!(
+            group.lock().await.epoch(),
+            initial_epoch,
+            "rejected commit must roll back in-memory TreeKEM epoch"
+        );
+        assert!(
+            !tokio::fs::try_exists(treekem_snapshot_path(&state.treekem_dir, group_id)).await?,
+            "rejected commit must not persist TreeKEM snapshot material"
+        );
+        let groups = state.named_groups.read().await;
+        let stored = groups.get(group_id).expect("withdrawn shell retained");
+        assert!(stored.withdrawn);
+        assert!(
+            !stored.has_active_member(&member_hex),
+            "rejected commit must not store roster/key-state advance"
+        );
         Ok(())
     }
 

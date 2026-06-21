@@ -1576,7 +1576,7 @@ async fn withdrawn_card_from_non_admin_does_not_terminate_live_keyed_group() {
 
 #[tokio::test]
 #[ignore]
-async fn withdrawn_card_from_roster_admin_terminates_and_wipes_live_keyed_group() {
+async fn withdrawn_card_from_roster_admin_does_not_terminate_live_keyed_group() {
     let d = daemon().await;
     let admin = AgentKeypair::generate().unwrap();
     let admin_hex = agent_hex(&admin);
@@ -1584,7 +1584,7 @@ async fn withdrawn_card_from_roster_admin_terminates_and_wipes_live_keyed_group(
         .post(d.url("/groups"))
         .json(&serde_json::json!({
             "name": "Admin withdrawn card guard",
-            "description": "live keyed group should terminate",
+            "description": "live keyed group must require signed terminal commit",
             "preset": "public_request_secure"
         }))
         .send()
@@ -1639,7 +1639,7 @@ async fn withdrawn_card_from_roster_admin_terminates_and_wipes_live_keyed_group(
         .json()
         .await
         .unwrap();
-    assert_eq!(state["withdrawn"], true, "state after import: {state:?}");
+    assert_eq!(state["withdrawn"], false, "state after import: {state:?}");
     let named_groups: Value = serde_json::from_str(
         &tokio::fs::read_to_string(d.data_dir().join("named_groups.json"))
             .await
@@ -1647,8 +1647,8 @@ async fn withdrawn_card_from_roster_admin_terminates_and_wipes_live_keyed_group(
     )
     .unwrap();
     assert!(
-        named_groups[group_id.as_str()]["shared_secret"].is_null(),
-        "authorized withdrawn card must wipe GSS secret: {named_groups:?}"
+        named_groups[group_id.as_str()]["shared_secret"].is_array(),
+        "admin-signed withdrawn card alone must not wipe live GSS secret; signed terminal GroupStateCommit is required: {named_groups:?}"
     );
 }
 

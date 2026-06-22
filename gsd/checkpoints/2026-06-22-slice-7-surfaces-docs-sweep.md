@@ -94,3 +94,11 @@ Commands run in build worktree unless noted:
 ## Status
 
 Implementation complete with one baseline-reproduced local nextest blocker. All slice changes are surgical and all introduced/focused checks pass; CI green of record still requires the existing mirror PR flow if/when the branch is pushed.
+
+## Post-review wording remediation — 2026-06-22
+
+- Code review wording findings remediated in build commit `1c3f17a58c94c04f4099014bfad121f04dc1b904`.
+- GUI `nagWithdrawState` feedback now uses disband copy: `Group disbanded — public card superseded.` / `Disband failed.`
+- `docs/api-reference.md` now describes `GET /groups/:id/requests` as `admin-only`, not `admin-authored`.
+- Verification rerun in the build worktree: `cargo fmt --all`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo check --workspace --all-targets`; `cargo run --bin gui-coverage -- --threshold 95`; `cargo test --all-features --test parity_cli group_set_role_help_lists_only_assignable_roles` — all passed.
+- No `.gsd/gate.sh`, CI workflow, test harness, service/daemon wrapper, build invocation, environment setup, `Cargo.toml`, or `Cargo.lock` changes; no push or PR action.

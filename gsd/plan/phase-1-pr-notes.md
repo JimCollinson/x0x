@@ -50,6 +50,10 @@ Local implementation attempt `939ab8c fix(adr-0016-phase-1): retain withdrawn di
 
 Scope assumption for David/future slices: file transfer, KV-store, and task-list writes are not named-group-bound today, so they are outside Slice 5 withdrawal terminality. If a future slice binds those data planes to named groups, the withdrawal sweep must be revisited for those surfaces.
 
+## Raw MLS members endpoints maintainer note
+
+The raw `POST`/`DELETE /mls/groups/:id/members` endpoints are a separate legacy MLS surface, not named-group terminality. They operate on the separate `state.mls_groups` keyspace, which Slice 5 disband/withdraw wipes, and they cannot resurrect a named group, signed named-group metadata, or the retained withdrawn named-group shell. This is flagged for David as a separate maintainer decision if the raw MLS API should be deprecated or given its own terminality guard; it is not fixed in Slice 5.
+
 ## Slice 7 deferred surface backlog
 
 Slice 5 deliberately did **not** perform the full R9 user-surface language sweep. These items are deferred, not forgotten, and must be handled in Slice 7 before PR-ready handoff:

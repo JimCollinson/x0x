@@ -54,6 +54,7 @@ Jim explicitly approved the GUI owner-gating swap for this slice. The GUI now ex
 - The group-ending user-facing verb is still provisional `disband` pending maintainer answer on #107; it is isolated for a pre-PR one-line swap if David chooses a different verb.
 - Withdrawn named groups retain a keyless tombstone/terminality marker, not a "shell"; MLS/TreeKEM/GSS key material is wiped and the retained record blocks stale-card reanimation.
 - Maintainer follow-up invariant: no legacy/raw `/mls/groups` endpoint may expose usable key material or reactivate a withdrawn named group. This slice records the invariant; it does not implement new `/mls` behavior.
+- Phase 2 maintainer follow-up: card-bound discovery/request-access still seeds imported stubs from `owner_agent_id` / creator-era card fields, so a non-creator Admin's card-bound approval can be rejected by the requester-side stub even though member-side any-Admin admission/convergence holds through the invite/base-roster flow. This is a deliberate Phase 1 / Phase 2 boundary, not fixed in Slice 7; sketch on #107 before changing card/discovery authority semantics.
 - Local full nextest on this macOS host still hits the pre-existing daemon-startup timeout in `forged_member_joined_admin_role_or_secret_is_rejected`; baseline `b16c34c` reproduces the same failure.
 
 ## Verification evidence
@@ -102,3 +103,13 @@ Implementation complete with one baseline-reproduced local nextest blocker. All 
 - `docs/api-reference.md` now describes `GET /groups/:id/requests` as `admin-only`, not `admin-authored`.
 - Verification rerun in the build worktree: `cargo fmt --all`; `cargo clippy --all-features --all-targets -- -D warnings`; `cargo check --workspace --all-targets`; `cargo run --bin gui-coverage -- --threshold 95`; `cargo test --all-features --test parity_cli group_set_role_help_lists_only_assignable_roles` — all passed.
 - No `.gsd/gate.sh`, CI workflow, test harness, service/daemon wrapper, build invocation, environment setup, `Cargo.toml`, or `Cargo.lock` changes; no push or PR action.
+
+## Post-adversarial disposition — 2026-06-22
+
+- Final adversarial review at `1c3f17a` identified the card-bound discovery/request-access limitation above. Jim explicitly deferred it to Phase 2 / maintainer follow-up and instructed that it be surfaced in the PR description's deferred-to-Phase-2 section. No Slice 7 code change was made for this finding.
+- PR #5 raw CI remains red in two daemon suites, but both failures match the `gsd/ci-arbiter.md` startup-health-timeout signature. Jim accepted the integrated carve-out after base-vs-branch reproduction confirmed base/equivalent and branch both fail before assertions at `tests/harness/src/cluster.rs:68:17`; the integrated `async fn main` diff is the inert AppState field initialization `expected_join_result_inviters: StdMutex::new(HashMap::new())`, not startup/health/network/bootstrap behavior.
+
+## Final Craft Review dispositions — 2026-06-22
+
+- Craft CONFORMANCE: current docs still contain `owner` roster wording in the ADR-0012/x0x 0.21.0 secure-group-plane limitation note (`docs/api-reference.md` and `docs/primers/groups.md`). Disposition: explicitly justified as historical/versioned limitation wording, not a current Phase 1 authority requirement. Historical/legacy owner terminology is allowed where it describes older behavior and does not instruct users that a current owner must exist.
+- Craft CONFORMANCE: the provisional `disband` verb was not literally isolated to one line despite earlier plan/spec wording. Disposition: PR notes now correct the handoff language — `disband` is consistent across current surfaces, but a maintainer-requested verb change before PR requires a small CLI/API/docs/GUI sweep, not a one-line swap. No code change needed unless #107 returns a different verb.

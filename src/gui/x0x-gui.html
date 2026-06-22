@@ -4583,8 +4583,8 @@ async function nagSealState(gid){
 async function nagWithdrawState(gid){
   nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'Working…');
   const r=await api('/groups/'+gid+'/state/withdraw',{method:'POST'});
-  if(r&&r.ok){nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'Withdrawal sealed — public card superseded.','ok');nagRenderAdmin(gid)}
-  else{nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,(r&&r.error)||'Withdraw failed.','err')}
+  if(r&&r.ok){nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,'Group disbanded — public card superseded.','ok');nagRenderAdmin(gid)}
+  else{nagSetFeedback(`[data-nag-state="${gid}"] [data-k="state-feedback"]`,(r&&r.error)||'Disband failed.','err')}
 }
 
 function nagMemberFeedback(gid,aid,msg,tone){

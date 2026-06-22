@@ -312,7 +312,7 @@ helper API.
 | PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role <group_id> <agent_id> <role>` | Assign `admin` or `member` (admin-authored) |
 | POST | `/groups/:id/ban/:agent_id` | `x0x group ban <group_id> <agent_id>` | Ban a member (admin-authored) |
 | DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban <group_id> <agent_id>` | Unban a member (admin-authored) |
-| GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests (admin-authored) |
+| GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests (admin-only) |
 | POST | `/groups/:id/requests` | `x0x group request-access <group_id>` | Submit a join request |
 | POST | `/groups/:id/requests/:request_id/approve` | `x0x group approve-request <group_id> <request_id>` | Approve a join request (admin-authored) |
 | POST | `/groups/:id/requests/:request_id/reject` | `x0x group reject-request <group_id> <request_id>` | Reject a join request (admin-authored) |

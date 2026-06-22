@@ -6,9 +6,10 @@ use std::collections::BTreeMap;
 use x0x::groups::state_commit::validate_apply;
 use x0x::groups::{
     card::AgentCard, compute_policy_hash, compute_public_meta_hash, compute_roster_root,
-    enforce_last_admin_invariant, invite::SignedInvite, ActionKind, ApplyContext, ApplyError,
+    enforce_last_admin_invariant, invite::SignedInvite, last_admin_precheck_error,
+    last_admin_self_leave_precheck_error, ActionKind, ApplyContext, ApplyError,
     GroupDiscoverability, GroupInfo, GroupMember, GroupMemberState, GroupPolicyPreset, GroupRole,
-    GroupStateCommit,
+    GroupStateCommit, LAST_ADMIN_PRECHECK_ERROR, LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
 };
 use x0x::identity::{AgentId, AgentKeypair};
 
@@ -171,6 +172,85 @@ enum LastAdminAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastAdminActionKind {
+    AddMember,
+    RemoveMember,
+    BanMember,
+    SetRole,
+    SelfLeave,
+    UpdatePolicy,
+    Withdraw,
+}
+
+impl LastAdminAction {
+    fn kind(&self) -> LastAdminActionKind {
+        match self {
+            Self::AddMember { .. } => LastAdminActionKind::AddMember,
+            Self::RemoveMember { .. } => LastAdminActionKind::RemoveMember,
+            Self::BanMember { .. } => LastAdminActionKind::BanMember,
+            Self::SetRole { .. } => LastAdminActionKind::SetRole,
+            Self::SelfLeave { .. } => LastAdminActionKind::SelfLeave,
+            Self::UpdatePolicy { .. } => LastAdminActionKind::UpdatePolicy,
+            Self::Withdraw { .. } => LastAdminActionKind::Withdraw,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct SequencePathStats {
+    accepted: usize,
+    rejected: usize,
+    accepted_add_member: usize,
+    accepted_remove_member: usize,
+    accepted_ban_member: usize,
+    accepted_set_role: usize,
+    accepted_self_leave: usize,
+    accepted_update_policy: usize,
+    accepted_withdraw: usize,
+}
+
+impl SequencePathStats {
+    fn record(&mut self, action: &LastAdminAction, outcome: SequenceOutcome) {
+        match outcome {
+            SequenceOutcome::Accepted => {
+                self.accepted += 1;
+                match action.kind() {
+                    LastAdminActionKind::AddMember => self.accepted_add_member += 1,
+                    LastAdminActionKind::RemoveMember => self.accepted_remove_member += 1,
+                    LastAdminActionKind::BanMember => self.accepted_ban_member += 1,
+                    LastAdminActionKind::SetRole => self.accepted_set_role += 1,
+                    LastAdminActionKind::SelfLeave => self.accepted_self_leave += 1,
+                    LastAdminActionKind::UpdatePolicy => self.accepted_update_policy += 1,
+                    LastAdminActionKind::Withdraw => self.accepted_withdraw += 1,
+                }
+            }
+            SequenceOutcome::Rejected => self.rejected += 1,
+        }
+    }
+
+    fn total(&self) -> usize {
+        self.accepted + self.rejected
+    }
+
+    fn assert_all_semantically_valid_actions_accepted(&self, path: &str) {
+        for (kind, count) in [
+            ("add member", self.accepted_add_member),
+            ("remove member", self.accepted_remove_member),
+            ("ban member", self.accepted_ban_member),
+            ("role change", self.accepted_set_role),
+            ("self leave", self.accepted_self_leave),
+            ("policy update", self.accepted_update_policy),
+            ("withdrawal", self.accepted_withdraw),
+        ] {
+            assert!(
+                count > 0,
+                "{path} deterministic coverage did not accept {kind}; stats: {self:?}"
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SequenceOutcome {
     Accepted,
     Rejected,
@@ -253,13 +333,51 @@ fn arb_last_admin_action() -> impl Strategy<Value = LastAdminAction> {
 }
 
 fn arb_last_admin_sequence() -> impl Strategy<Value = Vec<LastAdminAction>> {
-    prop::collection::vec(arb_last_admin_action(), 0..=LAST_ADMIN_MAX_ACTIONS)
+    prop::collection::vec(arb_last_admin_action(), 0..LAST_ADMIN_MAX_ACTIONS).prop_map(
+        |mut generated| {
+            let mut actions = vec![LastAdminAction::UpdatePolicy {
+                actor: 0,
+                preset: GroupPolicyPreset::PublicOpen,
+            }];
+            actions.append(&mut generated);
+            actions
+        },
+    )
+}
+
+fn arb_last_admin_zero_admin_rest_attempt() -> impl Strategy<Value = LastAdminAction> {
+    prop_oneof![
+        Just(LastAdminAction::RemoveMember {
+            actor: 0,
+            target: 0
+        }),
+        Just(LastAdminAction::BanMember {
+            actor: 0,
+            target: 0
+        }),
+        Just(LastAdminAction::SetRole {
+            actor: 0,
+            target: 0,
+            role: GroupRole::Member,
+        }),
+        Just(LastAdminAction::SelfLeave { actor: 0 }),
+    ]
 }
 
 fn sequence_keypairs() -> Vec<AgentKeypair> {
     (0..LAST_ADMIN_SEQUENCE_AGENT_SLOTS)
-        .map(|_| AgentKeypair::generate().unwrap())
+        .map(deterministic_agent_keypair)
         .collect()
+}
+
+fn deterministic_agent_keypair(slot: usize) -> AgentKeypair {
+    use fips204::traits::{KeyGen, SerDes};
+
+    let mut seed = [0x42; 32];
+    seed[0] = slot as u8;
+    seed[31] = 0xa6;
+    let (public_key, secret_key) = fips204::ml_dsa_65::KG::keygen_from_seed(&seed);
+    AgentKeypair::from_bytes(&public_key.into_bytes(), &secret_key.into_bytes()).unwrap()
 }
 
 fn keypair_hex(keypairs: &[AgentKeypair], slot: usize) -> String {
@@ -386,11 +504,28 @@ fn seal_rest_state(
     match next.seal_commit(signer, now_ms) {
         Ok(commit) => {
             commit.verify_structure().unwrap();
+            assert_ne!(state_snapshot(&next), before);
             *info = next;
             SequenceOutcome::Accepted
         }
         Err(_) => reject_without_mutation(info, before),
     }
+}
+
+fn reject_last_admin_precheck_and_seal_chokepoint(
+    info: &GroupInfo,
+    mut next: GroupInfo,
+    signer: &AgentKeypair,
+    now_ms: u64,
+    before: &str,
+) -> SequenceOutcome {
+    assert!(!next.withdrawn);
+    assert!(!independent_has_active_admin(&next));
+    assert!(matches!(
+        next.seal_commit(signer, now_ms),
+        Err(ApplyError::Invariant(_))
+    ));
+    reject_without_mutation(info, before)
 }
 
 fn apply_rest_action(
@@ -413,9 +548,6 @@ fn apply_rest_action(
             }
             let mut next = info.clone();
             mutate_add_member(&mut next, keypairs, *actor, *target);
-            if !independent_has_active_admin(&next) {
-                return reject_without_mutation(info, &before);
-            }
             seal_rest_state(info, next, &keypairs[*actor], now_ms, &before)
         }
         LastAdminAction::RemoveMember { actor, target } => {
@@ -424,11 +556,22 @@ fn apply_rest_action(
             {
                 return reject_without_mutation(info, &before);
             }
+            if let Some(error) = last_admin_precheck_error(info, |g| {
+                mutate_remove_member(g, keypairs, *actor, *target);
+            }) {
+                assert_eq!(error, LAST_ADMIN_PRECHECK_ERROR);
+                let mut next = info.clone();
+                mutate_remove_member(&mut next, keypairs, *actor, *target);
+                return reject_last_admin_precheck_and_seal_chokepoint(
+                    info,
+                    next,
+                    &keypairs[*actor],
+                    now_ms,
+                    &before,
+                );
+            }
             let mut next = info.clone();
             mutate_remove_member(&mut next, keypairs, *actor, *target);
-            if !independent_has_active_admin(&next) {
-                return reject_without_mutation(info, &before);
-            }
             seal_rest_state(info, next, &keypairs[*actor], now_ms, &before)
         }
         LastAdminAction::BanMember { actor, target } => {
@@ -437,11 +580,22 @@ fn apply_rest_action(
             {
                 return reject_without_mutation(info, &before);
             }
+            if let Some(error) = last_admin_precheck_error(info, |g| {
+                mutate_ban_member(g, keypairs, *actor, *target);
+            }) {
+                assert_eq!(error, LAST_ADMIN_PRECHECK_ERROR);
+                let mut next = info.clone();
+                mutate_ban_member(&mut next, keypairs, *actor, *target);
+                return reject_last_admin_precheck_and_seal_chokepoint(
+                    info,
+                    next,
+                    &keypairs[*actor],
+                    now_ms,
+                    &before,
+                );
+            }
             let mut next = info.clone();
             mutate_ban_member(&mut next, keypairs, *actor, *target);
-            if !independent_has_active_admin(&next) {
-                return reject_without_mutation(info, &before);
-            }
             seal_rest_state(info, next, &keypairs[*actor], now_ms, &before)
         }
         LastAdminAction::SetRole {
@@ -455,22 +609,43 @@ fn apply_rest_action(
             {
                 return reject_without_mutation(info, &before);
             }
+            if let Some(error) = last_admin_precheck_error(info, |g| {
+                mutate_set_role(g, keypairs, *target, *role);
+            }) {
+                assert_eq!(error, LAST_ADMIN_PRECHECK_ERROR);
+                let mut next = info.clone();
+                mutate_set_role(&mut next, keypairs, *target, *role);
+                return reject_last_admin_precheck_and_seal_chokepoint(
+                    info,
+                    next,
+                    &keypairs[*actor],
+                    now_ms,
+                    &before,
+                );
+            }
             let mut next = info.clone();
             mutate_set_role(&mut next, keypairs, *target, *role);
-            if !independent_has_active_admin(&next) {
-                return reject_without_mutation(info, &before);
-            }
             seal_rest_state(info, next, &keypairs[*actor], now_ms, &before)
         }
         LastAdminAction::SelfLeave { actor } => {
             if !slot_is_active_member(info, keypairs, *actor) {
                 return reject_without_mutation(info, &before);
             }
+            let actor_hex = keypair_hex(keypairs, *actor);
+            if let Some(error) = last_admin_self_leave_precheck_error(info, &actor_hex) {
+                assert_eq!(error, LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR);
+                let mut next = info.clone();
+                mutate_self_leave(&mut next, keypairs, *actor);
+                return reject_last_admin_precheck_and_seal_chokepoint(
+                    info,
+                    next,
+                    &keypairs[*actor],
+                    now_ms,
+                    &before,
+                );
+            }
             let mut next = info.clone();
             mutate_self_leave(&mut next, keypairs, *actor);
-            if !independent_has_active_admin(&next) {
-                return reject_without_mutation(info, &before);
-            }
             seal_rest_state(info, next, &keypairs[*actor], now_ms, &before)
         }
         LastAdminAction::UpdatePolicy { actor, preset } => {
@@ -534,6 +709,7 @@ fn apply_gossip_commit(
     mutate(&mut next);
     match next.finalize_applied_commit(commit) {
         Ok(()) => {
+            assert_ne!(state_snapshot(&next), before);
             *info = next;
             SequenceOutcome::Accepted
         }
@@ -867,31 +1043,65 @@ proptest! {
         prop_assert!(independent_has_active_admin(&rest_group));
         prop_assert!(independent_has_active_admin(&gossip_group));
 
+        let mut rest_stats = SequencePathStats::default();
+        let mut gossip_stats = SequencePathStats::default();
+
         for (idx, action) in actions.iter().enumerate() {
             let now_ms = 1_000 + idx as u64;
 
-            let _rest_outcome = apply_rest_action(
+            let rest_outcome = apply_rest_action(
                 &mut rest_group,
                 &rest_keypairs,
                 action,
                 now_ms,
             );
+            rest_stats.record(action, rest_outcome);
             prop_assert!(
                 rest_group.withdrawn || independent_has_active_admin(&rest_group),
                 "REST path reached live zero-admin state after action {idx}: {action:?}"
             );
 
-            let _gossip_outcome = apply_gossip_action(
+            let gossip_outcome = apply_gossip_action(
                 &mut gossip_group,
                 &gossip_keypairs,
                 action,
                 now_ms,
             );
+            gossip_stats.record(action, gossip_outcome);
             prop_assert!(
                 gossip_group.withdrawn || independent_has_active_admin(&gossip_group),
                 "gossip path reached live zero-admin state after action {idx}: {action:?}"
             );
         }
+
+        prop_assert_eq!(rest_stats.total(), actions.len());
+        prop_assert_eq!(gossip_stats.total(), actions.len());
+        prop_assert!(
+            rest_stats.accepted > 0,
+            "REST sequence had no accepted mutations; stats: {rest_stats:?}"
+        );
+        prop_assert!(
+            gossip_stats.accepted > 0,
+            "gossip sequence had no accepted mutations; stats: {gossip_stats:?}"
+        );
+    }
+
+    #[test]
+    fn last_admin_rest_generated_zero_admin_attempts_hit_precheck_and_seal_chokepoint(
+        sole_admin_role in prop_oneof![Just(GroupRole::Admin), Just(GroupRole::Owner)],
+        action in arb_last_admin_zero_admin_rest_attempt(),
+    ) {
+        let initial = sole_admin_initial_specs(sole_admin_role);
+        let keypairs = sequence_keypairs();
+        let mut group = group_from_initial_specs(&keypairs, &initial);
+        let before = state_snapshot(&group);
+
+        prop_assert_eq!(independent_active_admin_count(&group), 1);
+        let outcome = apply_rest_action(&mut group, &keypairs, &action, 7_000);
+
+        prop_assert_eq!(outcome, SequenceOutcome::Rejected);
+        prop_assert_eq!(state_snapshot(&group), before);
+        prop_assert_eq!(independent_active_admin_count(&group), 1);
     }
 
     #[test]
@@ -916,4 +1126,75 @@ proptest! {
         prop_assert!(rest_group.withdrawn);
         prop_assert!(gossip_group.withdrawn);
     }
+}
+
+#[test]
+fn last_admin_deterministic_sequence_covers_accepted_mutations_on_rest_and_gossip_paths() {
+    let initial = vec![
+        member_spec(GroupRole::Admin, GroupMemberState::Active),
+        member_spec(GroupRole::Member, GroupMemberState::Active),
+        member_spec(GroupRole::Member, GroupMemberState::Removed),
+        member_spec(GroupRole::Member, GroupMemberState::Active),
+        member_spec(GroupRole::Admin, GroupMemberState::Active),
+    ];
+    let actions = [
+        LastAdminAction::AddMember {
+            actor: 0,
+            target: 2,
+        },
+        LastAdminAction::SetRole {
+            actor: 0,
+            target: 1,
+            role: GroupRole::Admin,
+        },
+        LastAdminAction::RemoveMember {
+            actor: 1,
+            target: 2,
+        },
+        LastAdminAction::BanMember {
+            actor: 1,
+            target: 3,
+        },
+        LastAdminAction::UpdatePolicy {
+            actor: 1,
+            preset: GroupPolicyPreset::PublicOpen,
+        },
+        LastAdminAction::SelfLeave { actor: 0 },
+        LastAdminAction::Withdraw { actor: 1 },
+    ];
+
+    let rest_keypairs = sequence_keypairs();
+    let gossip_keypairs = sequence_keypairs();
+    let mut rest_group = group_from_initial_specs(&rest_keypairs, &initial);
+    let mut gossip_group = group_from_initial_specs(&gossip_keypairs, &initial);
+    let mut rest_stats = SequencePathStats::default();
+    let mut gossip_stats = SequencePathStats::default();
+
+    for (idx, action) in actions.iter().enumerate() {
+        let now_ms = 20_000 + idx as u64;
+
+        let rest_outcome = apply_rest_action(&mut rest_group, &rest_keypairs, action, now_ms);
+        assert_eq!(
+            rest_outcome,
+            SequenceOutcome::Accepted,
+            "REST deterministic action should be accepted: {action:?}"
+        );
+        rest_stats.record(action, rest_outcome);
+        assert!(rest_group.withdrawn || independent_has_active_admin(&rest_group));
+
+        let gossip_outcome =
+            apply_gossip_action(&mut gossip_group, &gossip_keypairs, action, now_ms);
+        assert_eq!(
+            gossip_outcome,
+            SequenceOutcome::Accepted,
+            "gossip deterministic action should be accepted: {action:?}"
+        );
+        gossip_stats.record(action, gossip_outcome);
+        assert!(gossip_group.withdrawn || independent_has_active_admin(&gossip_group));
+    }
+
+    rest_stats.assert_all_semantically_valid_actions_accepted("REST");
+    gossip_stats.assert_all_semantically_valid_actions_accepted("gossip");
+    assert!(rest_group.withdrawn);
+    assert!(gossip_group.withdrawn);
 }

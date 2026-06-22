@@ -11936,6 +11936,10 @@ fn join_result_key_matches_any_group_alias(key: &str, aliases: &HashSet<String>)
         .unwrap_or(false)
 }
 
+// Named-group terminality helpers are grouped by the boundary they protect:
+// withdrawn-record lookup and aliasing, key-material install guards, journal
+// replay filtering, card-terminality checks, local crypto teardown / retained
+// tombstones vs local drops, post-crypto race rechecks, and test-only race hooks.
 fn has_withdrawn_group_record(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
@@ -11961,6 +11965,8 @@ fn has_withdrawn_same_stable_group_record(
         .any(|alias| has_withdrawn_group_record(groups, alias))
 }
 
+// Install / commit choke-points: refuse to add crypto material if durable
+// named-group state has already crossed terminality.
 async fn ensure_named_group_key_material_install_allowed(
     state: &AppState,
     group_id: &str,
@@ -12005,6 +12011,8 @@ async fn repair_withdrawn_named_groups_json_and_wipe_key_material(
     Ok(true)
 }
 
+// Journal-recovery guard: stale TreeKEM journals cannot resurrect a group that
+// durable named-group state already records as withdrawn.
 fn has_withdrawn_group_record_for_journal_replay(
     durable_groups: &HashMap<String, x0x::groups::GroupInfo>,
     journal_group_id: &str,
@@ -12038,6 +12046,8 @@ fn clear_group_info_key_material(info: &mut x0x::groups::GroupInfo) {
     info.shared_secret = None;
 }
 
+// Card-terminality gate: withdrawn discovery cards may mark keyless stubs, but
+// must not terminate local keyed state without the signed withdrawal commit.
 fn withdrawn_card_can_terminally_mark_local_group(
     info: &x0x::groups::GroupInfo,
     card: &x0x::groups::GroupCard,
@@ -12081,12 +12091,12 @@ async fn local_group_has_protected_crypto_material(
     }
     for alias in aliases {
         if let Some(path) = treekem_snapshot_path_for_drop(state, alias) {
-            if tokio::fs::try_exists(path).await.unwrap_or(false) {
+            if tokio::fs::try_exists(path).await.unwrap_or(true) {
                 return true;
             }
         }
         if let Some(path) = treekem_journal_path_for_drop(state, alias) {
-            if tokio::fs::try_exists(path).await.unwrap_or(false) {
+            if tokio::fs::try_exists(path).await.unwrap_or(true) {
                 return true;
             }
         }
@@ -12094,6 +12104,8 @@ async fn local_group_has_protected_crypto_material(
     false
 }
 
+// Local crypto teardown: wipe in-memory and persisted key material; either keep
+// a keyless withdrawn tombstone or drop only local, non-terminal state.
 async fn wipe_local_group_crypto_material(
     state: &AppState,
     id: &str,
@@ -12906,15 +12918,46 @@ static ATOMIC_PERSIST_POST_JSON_FORCED_WITHDRAWN_GROUPS: std::sync::LazyLock<
     StdMutex<HashSet<String>>,
 > = std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
 
+// Test-only hooks that force the post-crypto race windows exercised by the
+// terminality unit tests. Production code never populates these sets.
 #[cfg(test)]
-fn post_crypto_forced_withdrawn_for_test(group_id: &str, stable_group_id: Option<&str>) -> bool {
-    let forced = POST_CRYPTO_FORCED_WITHDRAWN_GROUPS
-        .lock()
-        .expect("post-crypto forced-withdrawn test hook poisoned");
+fn forced_withdrawn_for_test(
+    forced: &StdMutex<HashSet<String>>,
+    poison_message: &'static str,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+) -> bool {
+    let forced = forced.lock().expect(poison_message);
     forced.contains(group_id)
         || stable_group_id
             .filter(|stable| !stable.is_empty())
             .is_some_and(|stable| forced.contains(stable))
+}
+
+#[cfg(test)]
+async fn maybe_force_withdrawn_group_for_test(
+    forced: &StdMutex<HashSet<String>>,
+    poison_message: &'static str,
+    state: &AppState,
+    group_id: &str,
+    stable_group_id: Option<&str>,
+) {
+    if !forced_withdrawn_for_test(forced, poison_message, group_id, stable_group_id) {
+        return;
+    }
+
+    let mut groups = state.named_groups.write().await;
+    let mut aliases = collect_same_stable_group_aliases(&groups, group_id, stable_group_id);
+    aliases.insert(group_id.to_string());
+    if let Some(stable) = stable_group_id.filter(|stable| !stable.is_empty()) {
+        aliases.insert(stable.to_string());
+    }
+    for alias in aliases {
+        if let Some(info) = groups.get_mut(&alias) {
+            info.withdrawn = true;
+            clear_group_info_key_material(info);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -12923,36 +12966,14 @@ async fn maybe_force_post_crypto_withdrawn_group_for_test(
     group_id: &str,
     stable_group_id: Option<&str>,
 ) {
-    if !post_crypto_forced_withdrawn_for_test(group_id, stable_group_id) {
-        return;
-    }
-
-    let mut groups = state.named_groups.write().await;
-    let mut aliases = collect_same_stable_group_aliases(&groups, group_id, stable_group_id);
-    aliases.insert(group_id.to_string());
-    if let Some(stable) = stable_group_id.filter(|stable| !stable.is_empty()) {
-        aliases.insert(stable.to_string());
-    }
-    for alias in aliases {
-        if let Some(info) = groups.get_mut(&alias) {
-            info.withdrawn = true;
-            clear_group_info_key_material(info);
-        }
-    }
-}
-
-#[cfg(test)]
-fn atomic_persist_post_json_forced_withdrawn_for_test(
-    group_id: &str,
-    stable_group_id: Option<&str>,
-) -> bool {
-    let forced = ATOMIC_PERSIST_POST_JSON_FORCED_WITHDRAWN_GROUPS
-        .lock()
-        .expect("atomic-persist forced-withdrawn test hook poisoned");
-    forced.contains(group_id)
-        || stable_group_id
-            .filter(|stable| !stable.is_empty())
-            .is_some_and(|stable| forced.contains(stable))
+    maybe_force_withdrawn_group_for_test(
+        &POST_CRYPTO_FORCED_WITHDRAWN_GROUPS,
+        "post-crypto forced-withdrawn test hook poisoned",
+        state,
+        group_id,
+        stable_group_id,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -12961,24 +12982,18 @@ async fn maybe_force_atomic_persist_post_json_withdrawn_group_for_test(
     group_id: &str,
     stable_group_id: Option<&str>,
 ) {
-    if !atomic_persist_post_json_forced_withdrawn_for_test(group_id, stable_group_id) {
-        return;
-    }
-
-    let mut groups = state.named_groups.write().await;
-    let mut aliases = collect_same_stable_group_aliases(&groups, group_id, stable_group_id);
-    aliases.insert(group_id.to_string());
-    if let Some(stable) = stable_group_id.filter(|stable| !stable.is_empty()) {
-        aliases.insert(stable.to_string());
-    }
-    for alias in aliases {
-        if let Some(info) = groups.get_mut(&alias) {
-            info.withdrawn = true;
-            clear_group_info_key_material(info);
-        }
-    }
+    maybe_force_withdrawn_group_for_test(
+        &ATOMIC_PERSIST_POST_JSON_FORCED_WITHDRAWN_GROUPS,
+        "atomic-persist forced-withdrawn test hook poisoned",
+        state,
+        group_id,
+        stable_group_id,
+    )
+    .await;
 }
 
+// Post-crypto rechecks: if terminality wins a race after expensive crypto work,
+// drop the just-produced effect and report the withdrawn conflict instead.
 fn post_crypto_withdrawn_group_conflict(
     groups: &HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
@@ -22481,6 +22496,32 @@ mod tests {
         assert!(!withdrawn_card_can_terminally_mark_local_group(
             &info, &card, true,
         ));
+    }
+
+    #[tokio::test]
+    async fn withdrawn_card_protected_crypto_probe_fails_closed_on_io_error() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        tokio::fs::remove_dir_all(&state.treekem_dir).await?;
+        tokio::fs::write(&state.treekem_dir, b"not a directory").await?;
+
+        let creator = x0x::identity::AgentKeypair::generate()?;
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "keyless stub".to_string(),
+            String::new(),
+            creator.agent_id(),
+            "aa".repeat(16),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        info.shared_secret = None;
+
+        let mut aliases = HashSet::new();
+        aliases.insert(info.stable_group_id().to_string());
+
+        assert!(
+            local_group_has_protected_crypto_material(&state, &info, &aliases).await,
+            "TreeKEM persistence probe errors must fail closed as protected"
+        );
+        Ok(())
     }
 
     #[test]

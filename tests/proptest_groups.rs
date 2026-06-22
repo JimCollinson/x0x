@@ -2,11 +2,134 @@
 #![allow(clippy::unwrap_used)]
 
 use proptest::prelude::*;
-use x0x::groups::{card::AgentCard, invite::SignedInvite, GroupInfo};
+use std::collections::BTreeMap;
+use x0x::groups::{
+    card::AgentCard, enforce_last_admin_invariant, invite::SignedInvite, ApplyError, GroupInfo,
+    GroupMember, GroupMemberState, GroupRole,
+};
 use x0x::identity::AgentId;
 
 fn agent(bytes: [u8; 32]) -> AgentId {
     AgentId(bytes)
+}
+
+#[derive(Debug, Clone)]
+struct RosterMemberSpec {
+    role: GroupRole,
+    state: GroupMemberState,
+}
+
+fn member_spec(role: GroupRole, state: GroupMemberState) -> RosterMemberSpec {
+    RosterMemberSpec { role, state }
+}
+
+fn arb_member_spec() -> impl Strategy<Value = RosterMemberSpec> {
+    (
+        prop_oneof![
+            Just(GroupRole::Owner),
+            Just(GroupRole::Admin),
+            Just(GroupRole::Moderator),
+            Just(GroupRole::Member),
+            Just(GroupRole::Guest),
+        ],
+        prop_oneof![
+            Just(GroupMemberState::Active),
+            Just(GroupMemberState::Pending),
+            Just(GroupMemberState::Removed),
+            Just(GroupMemberState::Banned),
+        ],
+    )
+        .prop_map(|(role, state)| member_spec(role, state))
+}
+
+fn arb_last_admin_case() -> impl Strategy<Value = (Vec<RosterMemberSpec>, bool)> {
+    prop_oneof![
+        // Zero-admin live rosters.
+        Just((Vec::new(), false)),
+        Just((
+            vec![member_spec(GroupRole::Member, GroupMemberState::Active)],
+            false
+        )),
+        Just((
+            vec![member_spec(GroupRole::Moderator, GroupMemberState::Active)],
+            false
+        )),
+        Just((
+            vec![member_spec(GroupRole::Guest, GroupMemberState::Active)],
+            false
+        )),
+        // Exactly-one-admin live boundaries.
+        Just((
+            vec![member_spec(GroupRole::Admin, GroupMemberState::Active)],
+            false
+        )),
+        Just((
+            vec![member_spec(GroupRole::Owner, GroupMemberState::Active)],
+            false
+        )),
+        // Admin-rank members in non-active states must not count.
+        Just((
+            vec![member_spec(GroupRole::Admin, GroupMemberState::Banned)],
+            false
+        )),
+        Just((
+            vec![member_spec(GroupRole::Owner, GroupMemberState::Banned)],
+            false
+        )),
+        Just((
+            vec![member_spec(GroupRole::Admin, GroupMemberState::Removed)],
+            false
+        )),
+        Just((
+            vec![member_spec(GroupRole::Owner, GroupMemberState::Pending)],
+            false
+        )),
+        // Withdrawal is the explicit exit valve even with no active admins.
+        Just((Vec::new(), true)),
+        Just((
+            vec![member_spec(GroupRole::Admin, GroupMemberState::Banned)],
+            true
+        )),
+        // Mixed arbitrary rosters keep shrinking useful while still exploring.
+        (
+            prop::collection::vec(arb_member_spec(), 0..16),
+            any::<bool>()
+        ),
+    ]
+}
+
+fn roster_from_specs(specs: &[RosterMemberSpec]) -> BTreeMap<String, GroupMember> {
+    specs
+        .iter()
+        .enumerate()
+        .map(|(idx, spec)| {
+            let agent_id = format!("{idx:064x}");
+            (
+                agent_id.clone(),
+                GroupMember {
+                    agent_id,
+                    user_id: None,
+                    role: spec.role,
+                    state: spec.state,
+                    display_name: None,
+                    joined_at: idx as u64,
+                    updated_at: idx as u64,
+                    added_by: None,
+                    removed_by: None,
+                    kem_public_key_b64: None,
+                    treekem_key_package_b64: None,
+                },
+            )
+        })
+        .collect()
+}
+
+fn independent_last_admin_oracle(specs: &[RosterMemberSpec], withdrawn: bool) -> bool {
+    withdrawn
+        || specs.iter().any(|spec| {
+            matches!(spec.state, GroupMemberState::Active)
+                && matches!(spec.role, GroupRole::Admin | GroupRole::Owner)
+        })
 }
 
 proptest! {
@@ -105,5 +228,18 @@ proptest! {
         prop_assert_eq!(&parsed.agent_id, &hex::encode(agent_bytes));
         prop_assert_eq!(&parsed.machine_id, &machine_id);
         prop_assert_eq!(parsed.display_name, display_name);
+    }
+
+    #[test]
+    fn last_admin_invariant_matches_independent_oracle(case in arb_last_admin_case()) {
+        let (specs, withdrawn) = case;
+        let members = roster_from_specs(&specs);
+        let result = enforce_last_admin_invariant(&members, withdrawn);
+        let expected_ok = independent_last_admin_oracle(&specs, withdrawn);
+
+        prop_assert_eq!(result.is_ok(), expected_ok);
+        if !expected_ok {
+            prop_assert!(matches!(result, Err(ApplyError::Invariant(_))));
+        }
     }
 }

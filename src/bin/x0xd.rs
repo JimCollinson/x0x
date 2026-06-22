@@ -21051,6 +21051,72 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn ban_store_guard_allows_active_ban_and_rejects_withdrawn_same_stable_record() {
+        let group_id = "ban-local-mls-id";
+        let withdrawn_alias = "ban-withdrawn-mls-id";
+        let stable_group_id = "ban-stable-card-id";
+        let admin_hex = "02".repeat(32);
+        let target_hex = "03".repeat(32);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "ban guard".to_string(),
+            String::new(),
+            AgentId([2; 32]),
+            group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.to_string(),
+            admin_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.add_member(
+            target_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.roster_revision = info.roster_revision.saturating_add(1);
+        info.recompute_state_hash();
+
+        let mut allowed_groups = HashMap::from([(group_id.to_string(), info.clone())]);
+        let mut banned_next = info.clone();
+        banned_next.ban_member(&target_hex, Some(admin_hex.clone()));
+        banned_next.roster_revision = banned_next.roster_revision.saturating_add(1);
+
+        assert!(store_named_group_info_locked(
+            &mut allowed_groups,
+            group_id,
+            banned_next
+        ));
+        assert!(allowed_groups[group_id].members_v2[&target_hex].is_banned());
+
+        let mut withdrawn = info.clone();
+        withdrawn.mls_group_id = withdrawn_alias.to_string();
+        withdrawn.withdrawn = true;
+        withdrawn.shared_secret = None;
+        let before = info.clone();
+        let mut guarded_groups = HashMap::from([
+            (group_id.to_string(), info),
+            (withdrawn_alias.to_string(), withdrawn),
+        ]);
+        let mut rejected_next = before.clone();
+        rejected_next.ban_member(&target_hex, Some(admin_hex));
+        rejected_next.roster_revision = rejected_next.roster_revision.saturating_add(1);
+
+        assert!(!store_named_group_info_locked(
+            &mut guarded_groups,
+            group_id,
+            rejected_next
+        ));
+        let stored = &guarded_groups[group_id];
+        assert_eq!(stored.members_v2, before.members_v2);
+        assert_eq!(stored.roster_revision, before.roster_revision);
+        assert_eq!(stored.state_hash, before.state_hash);
+        assert!(!stored.members_v2[&target_hex].is_banned());
+    }
+
     fn secure_post_crypto_recheck_group(
         group_id: &str,
         stable_group_id: &str,

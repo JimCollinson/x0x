@@ -13359,7 +13359,7 @@ async fn ban_group_member(
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
-    let mut groups = state.named_groups.write().await;
+    let groups = state.named_groups.write().await;
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
@@ -13413,9 +13413,10 @@ async fn ban_group_member(
             );
         }
     };
-    groups.insert(id.clone(), next);
-
     drop(groups);
+    if !store_named_group_info(&state, &id, next).await {
+        return api_error(StatusCode::CONFLICT, "group is withdrawn");
+    }
     save_named_groups(&state).await;
 
     // Deliver the rotated secret to each remaining member (skip self). Each

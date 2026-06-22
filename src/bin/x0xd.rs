@@ -7495,14 +7495,13 @@ async fn refresh_group_card_cache_from_info(
     }
 }
 
-async fn store_named_group_info(
-    state: &AppState,
+fn store_named_group_info_locked(
+    groups: &mut HashMap<String, x0x::groups::GroupInfo>,
     group_id: &str,
     info: x0x::groups::GroupInfo,
 ) -> bool {
-    let mut groups = state.named_groups.write().await;
     if !info.withdrawn
-        && has_withdrawn_same_stable_group_record(&groups, group_id, Some(info.stable_group_id()))
+        && has_withdrawn_same_stable_group_record(groups, group_id, Some(info.stable_group_id()))
     {
         tracing::warn!(
             group_id = %LogHexId::group(group_id),
@@ -7516,6 +7515,15 @@ async fn store_named_group_info(
     };
     *slot = info;
     true
+}
+
+async fn store_named_group_info(
+    state: &AppState,
+    group_id: &str,
+    info: x0x::groups::GroupInfo,
+) -> bool {
+    let mut groups = state.named_groups.write().await;
+    store_named_group_info_locked(&mut groups, group_id, info)
 }
 
 fn restore_local_treekem_group_from_snapshot(
@@ -13359,7 +13367,7 @@ async fn ban_group_member(
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
-    let groups = state.named_groups.write().await;
+    let mut groups = state.named_groups.write().await;
     let Some(info) = groups.get(&id) else {
         return not_found("group not found");
     };
@@ -13413,10 +13421,10 @@ async fn ban_group_member(
             );
         }
     };
-    drop(groups);
-    if !store_named_group_info(&state, &id, next).await {
+    if !store_named_group_info_locked(&mut groups, &id, next) {
         return api_error(StatusCode::CONFLICT, "group is withdrawn");
     }
+    drop(groups);
     save_named_groups(&state).await;
 
     // Deliver the rotated secret to each remaining member (skip self). Each

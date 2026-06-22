@@ -9,6 +9,8 @@ use crate::cli::{print_value, DaemonClient};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 
+pub const DISBAND_VERB: &str = "disband";
+
 // ── Core CRUD ───────────────────────────────────────────────────────────
 
 /// `x0x group list` — GET /groups.
@@ -141,7 +143,7 @@ pub async fn set_name(client: &DaemonClient, group_id: &str, name: &str) -> Resu
     Ok(())
 }
 
-/// `x0x group leave` — DELETE /groups/:id.
+/// `x0x group leave` — DELETE /groups/:id (self-removal; group continues).
 pub async fn leave(client: &DaemonClient, group_id: &str) -> Result<()> {
     client.run_delete(&format!("/groups/{group_id}")).await
 }
@@ -426,8 +428,17 @@ pub async fn state_seal(client: &DaemonClient, group_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// `x0x group state-withdraw` — POST /groups/:id/state/withdraw.
+/// `x0x group disband` — POST /groups/:id/state/withdraw (irreversible terminal withdrawal).
+pub async fn disband(client: &DaemonClient, group_id: &str) -> Result<()> {
+    post_state_withdraw(client, group_id).await
+}
+
+/// Deprecated alias for `x0x group disband`.
 pub async fn state_withdraw(client: &DaemonClient, group_id: &str) -> Result<()> {
+    disband(client, group_id).await
+}
+
+async fn post_state_withdraw(client: &DaemonClient, group_id: &str) -> Result<()> {
     client.ensure_running().await?;
     let resp = client
         .post_empty(&format!("/groups/{group_id}/state/withdraw"))
@@ -655,6 +666,15 @@ mod tests {
             "state_withdraw should succeed: {:?}",
             result
         );
+    }
+
+    #[tokio::test]
+    async fn disband_returns_mock_response() {
+        let mock_resp = serde_json::json!({"ok": true});
+        let (url, _shutdown) = start_mock_server(mock_resp).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        let result = disband(&client, "group-123").await;
+        assert!(result.is_ok(), "{DISBAND_VERB} should succeed: {result:?}");
     }
 
     #[tokio::test]

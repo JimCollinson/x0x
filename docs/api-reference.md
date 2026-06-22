@@ -260,6 +260,12 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 
 ## MLS encrypted groups
 
+Operational invariant (maintainer follow-up): legacy/raw `/mls/groups` helpers
+must not expose usable key material or reactivate a withdrawn named group. A
+named-group tombstone/terminality marker remains authoritative for group
+terminality; this is a documented maintainer invariant, not a new low-level MLS
+helper API.
+
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | POST | `/mls/groups` | `x0x groups create` | Create an encrypted group |
@@ -296,21 +302,64 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | GET | `/groups` | `x0x group list` | List named groups |
 | GET | `/groups/:id` | `x0x group info <group_id>` | Get group info |
 | GET | `/groups/:id/members` | `x0x group members <group_id>` | List named-group members |
-| POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id>` | Creator-authored member add (propagates to subscribed peers) |
-| DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Creator-authored member removal (propagates to subscribed peers) |
+| POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id>` | Admin-authored member add (propagates to subscribed peers) |
+| DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate an invite link |
 | POST | `/groups/join` | `x0x group join <invite>` | Join via invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |
+| PATCH | `/groups/:id` | `x0x group update <group_id>` | Update name/description (admin-authored) |
+| PATCH | `/groups/:id/policy` | `x0x group policy <group_id>` | Update group policy (admin-authored) |
+| PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role <group_id> <agent_id> <role>` | Assign `admin` or `member` (admin-authored) |
+| POST | `/groups/:id/ban/:agent_id` | `x0x group ban <group_id> <agent_id>` | Ban a member (admin-authored) |
+| DELETE | `/groups/:id/ban/:agent_id` | `x0x group unban <group_id> <agent_id>` | Unban a member (admin-authored) |
+| GET | `/groups/:id/requests` | `x0x group requests <group_id>` | List join requests (admin-only) |
+| POST | `/groups/:id/requests` | `x0x group request-access <group_id>` | Submit a join request |
+| POST | `/groups/:id/requests/:request_id/approve` | `x0x group approve-request <group_id> <request_id>` | Approve a join request (admin-authored) |
+| POST | `/groups/:id/requests/:request_id/reject` | `x0x group reject-request <group_id> <request_id>` | Reject a join request (admin-authored) |
+| DELETE | `/groups/:id/requests/:request_id` | `x0x group cancel-request <group_id> <request_id>` | Cancel your own pending request |
 | GET | `/groups/:id/state` | `x0x group state <group_id>` | **Phase D.3**: inspect the signed state-commit chain |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
-| POST | `/groups/:id/state/withdraw` | `x0x group state-withdraw <group_id>` | **Phase D.3**: seal terminal withdrawal; evicts public card on peers |
+| POST | `/groups/:id/state/withdraw` | `x0x group disband <group_id>` | **Phase D.3**: any admin permanently disbands the group with a signed terminal withdrawal |
 | POST | `/groups/:id/send` | `x0x group send` | **Phase E**: publish a signed message to a SignedPublic group |
 | GET | `/groups/:id/messages` | `x0x group messages` | **Phase E**: retrieve cached public messages (non-members on Public read) |
 | GET | `/groups/discover/nearby` | `x0x group discover-nearby` | **Phase C.2**: presence-social browse of PublicDirectory groups |
 | GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |
 | POST | `/groups/discover/subscribe` | `x0x group discover-subscribe` | **Phase C.2**: subscribe to a tag/name/id shard |
 | DELETE | `/groups/discover/subscribe/:kind/:shard` | `x0x group discover-unsubscribe` | **Phase C.2**: unsubscribe from a shard |
-| DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave or delete the group |
+| DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave the group by self-removing, for any rank. The last admin is blocked; promote another admin first or use `x0x group disband` |
+
+### Roles
+
+Admin is root for the group. A hostile or compromised Admin can admit members,
+remove members, rekey secure material, change policy, assign roles, and disband
+the group for everyone. Keep the admin set small, and do not map softer
+application roles onto x0x Admin.
+
+`x0x group set-role` accepts only:
+
+- `admin` — full group control, including membership, policy, rekey, role
+  assignment, and disbanding.
+- `member` — ordinary participant.
+
+Stored legacy `owner` entries still render/read as admin-equivalent for old
+groups, but `owner` is not assignable. `moderator` and `guest` remain reserved
+and non-assignable.
+
+### Leaving vs disbanding a group
+
+`x0x group leave` (`DELETE /groups/:id`) is self-removal: **I'm out; the
+group lives on**. Any rank may leave, but the last admin receives `409` and must
+promote another admin first (or disband instead). Local secure material is wiped
+on leave.
+
+`x0x group disband` (`POST /groups/:id/state/withdraw`) is admin-only and
+irreversible: **group over for everyone, permanently**. It seals the unchanged
+signed terminal `GroupDeleted` commit over metadata/direct delivery; the
+withdrawn public card supersedes discovery. After disband, each recipient keeps
+only a withdrawn keyless tombstone/terminality marker: MLS/TreeKEM/GSS key
+material is wiped, the terminal record remains to block stale-card reanimation,
+and all authoring is rejected. Delivery is best-effort to online/reachable peers;
+offline peers are not guaranteed to receive the disband event.
 
 ### Phase C.2 — distributed shard discovery
 
@@ -366,7 +415,8 @@ Write-access is enforced at both endpoint and ingest:
 - `MembersOnly` — only active members may send.
 - `ModeratedPublic` — any non-banned author may send (moderators
   remove inappropriate content later).
-- `AdminOnly` — only `Admin` or `Owner` may send.
+- `AdminOnly` — only active admins may send; legacy `Owner` entries count as
+  Admin-equivalent.
 
 Banned authors are rejected in **every** write-access mode. `POST
 /groups/:id/send` also rejects `MlsEncrypted` groups (route to
@@ -376,6 +426,7 @@ cached history:
 - `read_access == Public` — open to any caller with a valid API token.
 - `read_access == MembersOnly` — requires active membership.
 - `MlsEncrypted` — returns 400 (encrypted history belongs elsewhere).
+- Withdrawn groups return 409 and do not restart public-message listeners.
 
 ### Phase D.3 — state-commit chain
 
@@ -384,13 +435,26 @@ Each named group maintains a signed commit chain:
 - `GET /groups/:id/state` returns `{ group_id (stable), genesis,
   state_revision, state_hash, prev_state_hash, security_binding,
   withdrawn, roster_root, policy_hash, public_meta_hash }`.
-- `POST /groups/:id/state/seal` (owner/admin) advances the chain by one
+- `POST /groups/:id/state/seal` (any admin) advances the chain by one
   revision and republishes the authority-signed public `GroupCard` to
   the global discovery topic. Returns the signed `GroupStateCommit`.
-- `POST /groups/:id/state/withdraw` (owner) seals a terminal
-  higher-revision commit with `withdrawn=true` and broadcasts the
-  withdrawal card. Peers evict stale listings on receipt regardless of
-  TTL.
+- `POST /groups/:id/state/withdraw` (`x0x group disband`, any admin)
+  permanently ends the group by sealing a terminal higher-revision commit with
+  `withdrawn=true`. Members are notified with the unchanged signed
+  `GroupDeleted` metadata event over the group metadata topic plus direct
+  delivery; recipients verify the terminal commit, retain the withdrawn
+  tombstone/terminality marker, and wipe local MLS/TreeKEM/GSS key material. The
+  terminal commit remains signed/verifiable in that retained record.
+  A withdrawn card is also refreshed to supersede public discovery listings on
+  receipt regardless of TTL; Hidden groups rely on the metadata/direct disband
+  event, not public-card discovery.
+  Explicit `POST /groups/cards/import` keeps passive discovery/listed/shard
+  disband/withdrawal handling cache-only for live/keyed local groups: a withdrawn card
+  alone cannot terminally mark or wipe a group that has local GSS/MLS/TreeKEM key
+  material, even if the card's `authority_agent_id` names an active Admin. Live
+  keyed terminality requires the signed terminal `GroupStateCommit` delivered via
+  metadata/direct disband. Withdrawn cards can still supersede discovery
+  stubs/listings that have no local key material to protect.
 
 Cards and commits carry ML-DSA-65 signatures. Peers verify both the
 signature and the chain link (`prev_state_hash`) before accepting; stale

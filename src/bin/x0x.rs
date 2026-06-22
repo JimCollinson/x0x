@@ -795,7 +795,7 @@ enum GroupSub {
         /// Display name.
         name: String,
     },
-    /// Leave (or delete) a group.
+    /// Leave this member/daemon; the group continues (last admin is blocked).
     Leave {
         /// Group ID.
         group_id: String,
@@ -812,7 +812,7 @@ enum GroupSub {
         #[arg(long)]
         description: Option<String>,
     },
-    /// Update the group's access policy (owner only).
+    /// Update the group's access policy (admin+).
     Policy {
         /// Group ID.
         group_id: String,
@@ -836,12 +836,15 @@ enum GroupSub {
         write_access: Option<String>,
     },
     /// Change a member's role (admin+).
+    #[command(
+        after_help = "Assignable roles:\n  admin   Full group control: membership, policy, rekey, and disband.\n  member  Group participant.\n\nLegacy owner entries render/read as admin-equivalent but cannot be assigned. Keep the admin set small; do not map softer application roles onto x0x Admin."
+    )]
     SetRole {
         /// Group ID.
         group_id: String,
         /// Target agent hex.
         agent_id: String,
-        /// Role: owner | admin | moderator | member | guest.
+        /// Role to assign: admin | member.
         role: String,
     },
     /// Ban a member (admin+).
@@ -955,8 +958,9 @@ enum GroupSub {
         /// Group ID.
         group_id: String,
     },
-    /// Seal a terminal withdrawal commit (supersedes the public card).
-    StateWithdraw {
+    /// Irreversibly disband for everyone; retains a withdrawn keyless terminality marker.
+    #[command(alias = "state-withdraw")]
+    Disband {
         /// Group ID.
         group_id: String,
     },
@@ -1617,8 +1621,8 @@ async fn run(
             Some(GroupSub::StateSeal { group_id }) => {
                 commands::group::state_seal(&client, &group_id).await
             }
-            Some(GroupSub::StateWithdraw { group_id }) => {
-                commands::group::state_withdraw(&client, &group_id).await
+            Some(GroupSub::Disband { group_id }) => {
+                commands::group::disband(&client, &group_id).await
             }
             Some(GroupSub::SecureEncrypt { group_id, payload }) => {
                 let bytes = if let Some(path) = payload.strip_prefix('@') {
@@ -1828,7 +1832,8 @@ x0x (v{VERSION})
 |   +-- group invite       Generate invite link
 |   +-- group join         Join via invite link
 |   +-- group set-name     Set display name in group
-|   +-- group leave        Leave or delete group
+|   +-- group leave        Leave group
+|   +-- group disband      Disband group
 |
 +-- Data
 |   +-- store list         List key-value stores

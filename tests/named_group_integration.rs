@@ -672,7 +672,7 @@ async fn named_group_leave() {
     assert_eq!(info["ok"], true, "group after rejected leave: {info:?}");
     assert_eq!(info["name"], "Leave Group");
 
-    // Ending the group is explicit disband/withdraw and retains a withdrawn shell.
+    // Ending the group is explicit disband/withdraw and retains a withdrawn tombstone.
     let disband_r: Value = authed_client(&d)
         .post(d.url(&format!("/groups/{group_id}/state/withdraw")))
         .json(&serde_json::json!({}))
@@ -1238,7 +1238,7 @@ async fn named_group_full_lifecycle() {
         "sole-admin leave response: {leave_r:?}"
     );
 
-    // Step 8: Explicit disband/withdraw succeeds and retains a terminal shell.
+    // Step 8: Explicit disband/withdraw succeeds and retains a terminality marker.
     let disband_r: Value = authed_client(&d)
         .post(d.url(&format!("/groups/{group_id}/state/withdraw")))
         .json(&serde_json::json!({}))
@@ -1250,15 +1250,18 @@ async fn named_group_full_lifecycle() {
         .unwrap();
     assert_eq!(disband_r["ok"], true, "disband response: {disband_r:?}");
 
-    let shell_resp = authed_client(&d)
+    let marker_resp = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
         .unwrap();
-    assert_eq!(shell_resp.status(), StatusCode::OK);
-    let shell_info: Value = shell_resp.json().await.unwrap();
-    assert_eq!(shell_info["ok"], true, "withdrawn shell: {shell_info:?}");
-    assert_eq!(shell_info["group_id"], group_id);
+    assert_eq!(marker_resp.status(), StatusCode::OK);
+    let marker_info: Value = marker_resp.json().await.unwrap();
+    assert_eq!(
+        marker_info["ok"], true,
+        "withdrawn tombstone: {marker_info:?}"
+    );
+    assert_eq!(marker_info["group_id"], group_id);
 
     let state_r: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}/state")))
@@ -1880,7 +1883,7 @@ async fn named_group_admin_disband_propagates_to_peer_after_creator_delete_409()
     .await;
     assert!(
         withdrawn_seen,
-        "alice never observed non-creator admin disband as retained withdrawn shell"
+        "alice never observed non-creator admin disband as retained withdrawn tombstone"
     );
     let alice_encrypt = alice
         .post(

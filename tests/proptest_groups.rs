@@ -528,6 +528,31 @@ fn reject_last_admin_precheck_and_seal_chokepoint(
     reject_without_mutation(info, before)
 }
 
+fn production_precheck_error_for_rest_zero_admin_attempt(
+    info: &GroupInfo,
+    keypairs: &[AgentKeypair],
+    action: &LastAdminAction,
+) -> Option<&'static str> {
+    match action {
+        LastAdminAction::RemoveMember { actor, target } => last_admin_precheck_error(info, |g| {
+            mutate_remove_member(g, keypairs, *actor, *target);
+        }),
+        LastAdminAction::BanMember { actor, target } => last_admin_precheck_error(info, |g| {
+            mutate_ban_member(g, keypairs, *actor, *target);
+        }),
+        LastAdminAction::SetRole { target, role, .. } => last_admin_precheck_error(info, |g| {
+            mutate_set_role(g, keypairs, *target, *role);
+        }),
+        LastAdminAction::SelfLeave { actor } => {
+            let actor_hex = keypair_hex(keypairs, *actor);
+            last_admin_self_leave_precheck_error(info, &actor_hex)
+        }
+        LastAdminAction::AddMember { .. }
+        | LastAdminAction::UpdatePolicy { .. }
+        | LastAdminAction::Withdraw { .. } => None,
+    }
+}
+
 fn apply_rest_action(
     info: &mut GroupInfo,
     keypairs: &[AgentKeypair],
@@ -1097,6 +1122,14 @@ proptest! {
         let before = state_snapshot(&group);
 
         prop_assert_eq!(independent_active_admin_count(&group), 1);
+        let expected_precheck_error = match action {
+            LastAdminAction::SelfLeave { .. } => LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
+            _ => LAST_ADMIN_PRECHECK_ERROR,
+        };
+        prop_assert_eq!(
+            production_precheck_error_for_rest_zero_admin_attempt(&group, &keypairs, &action),
+            Some(expected_precheck_error)
+        );
         let outcome = apply_rest_action(&mut group, &keypairs, &action, 7_000);
 
         prop_assert_eq!(outcome, SequenceOutcome::Rejected);

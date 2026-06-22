@@ -8854,12 +8854,13 @@ async fn apply_named_group_metadata_event_inner(
                     return false;
                 }
             };
-            // Keep the signed terminal record as a keyless withdrawn shell.
+            // Keep the signed terminal record as a keyless withdrawn tombstone.
             // ADR-0012's "leave nothing behind" is interpreted as wiping MLS,
             // TreeKEM snapshots/queues and GSS shared_secret material; the
             // retained GroupInfo is the guard that blocks stale-card imports
             // from recreating a live authoring-capable group.
-            retain_withdrawn_group_shell(state, &resolved_group_key, next, "group_deleted").await;
+            retain_withdrawn_group_tombstone(state, &resolved_group_key, next, "group_deleted")
+                .await;
             true
         }
         NamedGroupMetadataEvent::PolicyUpdated {
@@ -12228,7 +12229,7 @@ async fn remove_directory_cache_entries_for_group_info(
     }
 }
 
-async fn retain_withdrawn_group_shell(
+async fn retain_withdrawn_group_tombstone(
     state: &AppState,
     group_id: &str,
     mut info: x0x::groups::GroupInfo,
@@ -12698,7 +12699,7 @@ async fn withdraw_group_state(
                 );
             }
         };
-        // Disband retains a keyless withdrawn shell: ADR-0012's "leave
+        // Disband retains a keyless withdrawn tombstone: ADR-0012's "leave
         // nothing behind" means no MLS/TreeKEM/GSS key material survives, not
         // that the terminal metadata record is deleted. Keeping this record is
         // the stale-card reanimation guard for future imports.
@@ -12722,7 +12723,7 @@ async fn withdraw_group_state(
             terminal_info,
         )
     };
-    retain_withdrawn_group_shell(&state, &id, terminal_info, "withdraw_disband").await;
+    retain_withdrawn_group_tombstone(&state, &id, terminal_info, "withdraw_disband").await;
 
     // Refresh the withdrawn-card path for public discovery supersession after
     // stale local cards are gone. Hidden groups still do not publish public
@@ -14612,7 +14613,8 @@ async fn import_group_card(
             ) {
                 let mut next = info;
                 if apply_withdrawn_group_card_to_group_info(&mut next, &card) {
-                    retain_withdrawn_group_shell(&state, &key, next, "withdrawn_card_import").await;
+                    retain_withdrawn_group_tombstone(&state, &key, next, "withdrawn_card_import")
+                        .await;
                 }
             } else if protects_keyed_local_group && group_card_supersedes_group_info(&card, &info) {
                 tracing::warn!(
@@ -21676,7 +21678,7 @@ mod tests {
         let groups = state.named_groups.read().await;
         let info = groups
             .get(group_id)
-            .expect("group retained as terminal shell");
+            .expect("group retained as terminality marker");
         assert!(info.withdrawn, "lost-race withdrawal should win");
         assert_eq!(info.shared_secret, None, "secret must not be installed");
         assert_ne!(info.secret_epoch, secret_epoch, "epoch must not advance");
@@ -21968,23 +21970,23 @@ mod tests {
         let durable_groups = load_named_groups(&state.named_groups_path).await?;
         let durable = durable_groups
             .get(&group_id)
-            .expect("withdrawn group shell remains durable");
+            .expect("withdrawn group tombstone remains durable");
         assert!(
             durable.withdrawn,
             "durable named_groups.json must retain withdrawal terminality"
         );
         assert_eq!(
             durable.shared_secret, None,
-            "durable withdrawn shell must not retain key material"
+            "durable withdrawn tombstone must not retain key material"
         );
         assert!(
             !durable.has_active_member(&added_member),
-            "durable withdrawn shell must not contain the stale TreeKEM roster advance"
+            "durable withdrawn tombstone must not contain the stale TreeKEM roster advance"
         );
         let groups = state.named_groups.read().await;
         let in_memory = groups
             .get(&group_id)
-            .expect("withdrawn group shell remains in memory");
+            .expect("withdrawn group tombstone remains in memory");
         assert!(in_memory.withdrawn);
         assert!(!in_memory.has_active_member(&added_member));
         Ok(())
@@ -22079,7 +22081,7 @@ mod tests {
             "rejected commit must not persist TreeKEM snapshot material"
         );
         let groups = state.named_groups.read().await;
-        let stored = groups.get(group_id).expect("withdrawn shell retained");
+        let stored = groups.get(group_id).expect("withdrawn tombstone retained");
         assert!(stored.withdrawn);
         assert!(
             !stored.has_active_member(&member_hex),

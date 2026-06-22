@@ -676,7 +676,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Patch,
         path: "/groups/:id/policy",
         cli_name: "group policy",
-        description: "Update group policy (owner only)",
+        description: "Update group policy (admin+)",
         category: "named-groups",
     },
     EndpointDef {

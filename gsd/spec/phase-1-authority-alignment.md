@@ -1,6 +1,6 @@
 # Spec: ADR-0016 Phase 1 — authority alignment
 
-- Status: **Approved by Jim, 2026-06-12.** One open cosmetic item: the user-facing verb for the group-ending act ("disband" proposed, "delete" fallback) is pending the maintainer's preference, asked on issue #107 — a one-line swap either way, non-blocking for planning and implementation.
+- Status: **Approved by Jim, 2026-06-12.** User-facing verb resolved during final polish: the group-ending act is exposed as `delete`; the internal signed terminal record remains `withdrawn` for wire/history compatibility, and `state-withdraw` remains a deprecated compatibility alias.
 - Date: 2026-06-12
 - Contract: upstream `docs/adr/0016-role-based-group-authority-flat-admin.md` (Accepted, `189b89c`). This spec implements its **Phase 1 only** and must never contradict it; on any conflict, the ADR wins and the conflict is reported.
 - Context: upstream issue #107 (maintainer's triage and phasing comments).
@@ -8,7 +8,7 @@
 
 ## 1. Purpose and boundaries
 
-Make runtime behaviour match the signed state chain's authority model: administrative acts on a group are authorised by the actor's **role on the committed roster** — never by creator identity. Ships as **one PR** from `feat/adr-0016-phase-1-authority-alignment`.
+Make runtime behaviour match the signed state chain's authority model: administrative acts on a group are authorised by the actor's **role on the committed roster** — never by creator identity. Ships as **one PR** from the v0.26 re-home branch `feat/adr-0016-phase-1-on-v0.26` (superseding the historical pre-v0.26 implementation branch `feat/adr-0016-phase-1-authority-alignment`).
 
 **In this PR:** everything in §2.
 **Deferred, stated openly in the PR description:** delegated ban remains non-operational (target KeyPackage distribution is Phase 2); deterministic-committer and race mitigations are Phase 3; the two-admin metadata race window therefore exists in the interim — exposed, not solved, per the ADR.
@@ -76,7 +76,7 @@ Style rules (Jim, 2026-06-12): short, instructive, name the valid options; do **
 Background: `DELETE /groups/:id` is documented as "**Leave or delete** the group" — one endpoint whose meaning today depends on caller identity (creator ⇒ delete the group; anyone else ⇒ leave). Post-Phase-1 a mechanical creator→admin conversion of that switch would let an admin who merely wants to leave silently destroy the group. Decision:
 
 1. **Leave group** — `DELETE /groups/:id` means *leave* for **everyone, regardless of rank**: a pure self-act. Blocked only when the leaver is the last active admin (R2; legacy Owner counts), with the §3 message.
-2. **End the group** — a separate, explicit, deliberate action; any admin may perform it at any time, including as last admin (exempt from the invariant per the ADR). Mechanically this is the existing terminal-withdrawal commit; the endpoint path (`POST /groups/:id/state/withdraw`) is kept for wire/API compatibility. **The user-facing verb is pending the maintainer's answer on #107**: "disband" proposed (accurate — the group ends as a unit; its signed history remains; cannot be misread as a member-level act), "delete" the fallback (conventional). Whichever wins: one primary CLI command (`x0x group disband <id>` or `x0x group delete <id>`), `state-withdraw` retained as a quiet deprecated alias, api-reference describing the endpoint as "<Verb> the group for everyone (permanent; propagates to all members)". A one-line swap; does not block any slice.
+2. **End the group** — a separate, explicit, deliberate action; any admin may perform it at any time, including as last admin (exempt from the invariant per the ADR). Mechanically this is the existing terminal-withdrawal commit; the endpoint path (`POST /groups/:id/state/withdraw`) is kept for wire/API compatibility. The resolved user-facing verb is `delete`: primary CLI command `x0x group delete <id>`, with `state-withdraw` retained as a quiet deprecated alias. User-facing API/docs describe this as deleting the group for everyone; `withdraw`/`withdrawn` remains internal wire/history vocabulary.
 3. **"Withdraw/withdrawal" becomes internal vocabulary only** (the chain's terminal `withdrawn` record — wire-frozen, cannot be renamed without breaking historical verification). The R9 audit includes a language sweep: no user-facing surface (CLI help, GUI, api-reference) may describe the group-ending act as "withdrawing" without the chosen verb alongside.
 
 Verify current `DELETE /groups/:id` handler semantics at slice time before implementing.

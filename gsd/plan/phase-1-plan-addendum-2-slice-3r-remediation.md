@@ -64,7 +64,7 @@ Add normal-gate tests for the ban-absent → unban path and preserve legacy repl
 ## Out of scope
 
 - Slice 4 invite changes.
-- Full Slice 5 leave/disband endpoint split.
+- Full Slice 5 leave/delete endpoint split.
 - KeyPackage distribution, Phase 2.
 - Deterministic committer / rekey, Phase 3.
 - Broad actor/sender/committer normalization across all gossip arms, unless a tiny local role-update cleanup is necessary for the reserved-role fix.
@@ -78,7 +78,7 @@ Add normal-gate tests for the ban-absent → unban path and preserve legacy repl
    - Audit `DELETE /groups/:id` paths at current head.
    - For non-creator self-leave, avoid mutating live `GroupInfo` before the last-admin check can reject.
    - Preferred fix: clone-first plus explicit last-admin precheck before mutation/side effects.
-   - It is acceptable to introduce the Slice 5 “before leaving” 409 string early, but do not implement the full Slice 5 leave/disband split.
+   - It is acceptable to introduce the Slice 5 “before leaving” 409 string early, but do not implement the full Slice 5 leave/delete split.
    - Preserve existing creator-delete behavior for Slice 5.
 3. Disposition reserved-role signed apply:
    - Confirm whether Moderator/Guest role-update commits could have been produced by shipped code.

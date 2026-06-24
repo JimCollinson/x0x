@@ -1,9 +1,9 @@
 # GSD Plan: ADR-0016 Phase 1 — authority alignment
 
-- Status: **Approved by Jim, 2026-06-12** (open questions resolved with plan defaults: provisional "disband" if #107 unanswered at S5; clean-break endpoint semantics; S3/S4 separate; property test after S5).
+- Status: **Approved by Jim, 2026-06-12** (updated after final polish: group-ending verb resolved to `delete`; clean-break endpoint semantics; S3/S4 separate; property test after S5).
 - Date: 2026-06-12
 - Role performed: Planner (gsd-plan). Planning only.
-- Objective: implement ADR-0016 Phase 1 (flat Admin/Member authority, retiring Owner) as one PR from `JimCollinson/x0x` branch `feat/adr-0016-phase-1-authority-alignment`, sliced into independently verifiable work packets for Claude Code cloud sessions.
+- Objective: implement ADR-0016 Phase 1 (flat Admin/Member authority, retiring Owner) as one PR from `JimCollinson/x0x` branch `feat/adr-0016-phase-1-on-v0.26` (the v0.26 re-home of the historical `feat/adr-0016-phase-1-authority-alignment` branch), sliced into independently verifiable work packets for Claude Code cloud sessions.
 
 ## Sources read
 
@@ -21,7 +21,7 @@ Seven slices, dispatched serially (one cloud session each) on the single feature
 
 ## Universal slice preamble (binding for every slice)
 
-1. Sync fork `main` with upstream `saorsa-labs/x0x` `main`; rebase `feat/adr-0016-phase-1-authority-alignment` onto it if upstream has moved.
+1. Sync fork `main` with upstream `saorsa-labs/x0x` `main`; rebase `feat/adr-0016-phase-1-on-v0.26` onto it if upstream has moved.
 2. **Re-verify every cited code site before relying on it.** All line numbers below are pinned to upstream `189b89c` and upstream ships daily. Record drift in the slice checkpoint. If a cited mechanism has materially changed upstream (not just moved), stop and surface to Jim before implementing.
 3. Work only this slice, from its approved packet. No GSD files on the feature branch. Conventional Commits.
 4. No production `unwrap`/`expect`/`panic` in new or touched code.
@@ -155,8 +155,8 @@ plus the per-slice targeted filter listed in each slice. The `#[ignore]`d daemon
 - **First step (spec-mandated):** verify the current `DELETE /groups/:id` handler semantics on freshly synced main (documented today as "leave or delete" switched on caller identity). If reality differs materially from that description, stop before implementing.
 - `DELETE /groups/:id` becomes a pure self-act for all ranks. Last-active-admin leaver (legacy `Owner` counts) blocked with the exact §3 409: `{"error":"a group must always have at least one admin; make another member an admin before leaving"}` as the REST pre-check, with the Slice 1 choke-point invariant backing every path.
 - End-group: the existing terminal-withdrawal commit; endpoint path `POST /groups/:id/state/withdraw` kept for wire/API compatibility; any admin may perform it at any time, including as last admin (invariant-exempt per the ADR).
-- CLI: one primary command — provisionally `x0x group disband <id>` (the spec's proposed verb; "delete" is the fallback pending the maintainer's answer on #107). Isolate the verb string so the swap is one line. `state-withdraw` retained as a quiet deprecated alias.
-- `docs/api-reference.md` entry for the endpoint: "<Verb> the group for everyone (permanent; propagates to all members)". (The full language sweep is Slice 7.)
+- CLI: one primary command — `x0x group delete <id>`. `state-withdraw` retained as a quiet deprecated alias.
+- `docs/api-reference.md` entry for the endpoint: "Delete the group for everyone (permanent; propagates to all members)". (The full language sweep is Slice 7.)
 
 **Out of scope:** renaming the chain's internal `withdrawn` record (wire-frozen); self-leave PCS rekey (Phase 3); the broader R9 sweep.
 
@@ -166,11 +166,11 @@ plus the per-slice targeted filter listed in each slice. The `#[ignore]`d daemon
 - Last-admin end-group succeeds (exempt); a `member` cannot end the group; a promoted admin's end-group converges to other members (acceptance criterion 1, end-group leg).
 - CLI command and deprecated alias behavior.
 
-**Verification:** universal commands plus `cargo nextest run --all-features -E 'test(leave) or test(disband) or test(withdraw)'`.
+**Verification:** universal commands plus `cargo nextest run --all-features -E 'test(leave) or test(delete) or test(withdraw)'`.
 
 **Done when:** the two-action model holds with exact error strings; old creator-DELETE delete-group behavior is gone (and flagged for the PR description as an intentional endpoint-semantics change); all gates green.
 
-**Stop if:** the verified current handler semantics diverge from the spec's description in a way that changes the design point; or honoring wire/API compatibility for the withdraw endpoint proves impossible without format changes; or the verb decision turns out to require more than the localized swap.
+**Stop if:** the verified current handler semantics diverge from the spec's description in a way that changes the design point; or honoring wire/API compatibility for the withdraw endpoint proves impossible without format changes.
 
 ---
 
@@ -245,9 +245,9 @@ S1 (R2 net) ──> S2 (owner retirement) ──> S3 (add/remove/ban) ──> S4
 ## Post-slice steps (plan steps, not slices — each is a gate)
 
 1. **Final rebase + full gates.** Rebase the feature branch onto freshly synced upstream `main`; re-run fmt/clippy/nextest workspace-wide; capture evidence to `gsd/evidence/` on the planning branch.
-2. **End-of-phase gauntlet (before PR).** Per-slice adversarial + craft reviews are already done at each checkpoint (preamble §7). This end gate adds: a **clean-context test** (fresh agent, repo + docs only, exercises acceptance criteria 1, 3, 4 and the leave/disband flows from the documentation alone — it needs the complete feature); and an **integrated adversarial + craft sweep** over the whole composed branch (cross-slice composition, residual creator-identity authority across slices, §3 string/code, roster-hash/migration on legacy chains, the S5 endpoint-semantics blast radius). Gate: blockers fixed or explicitly accepted by Jim.
+2. **End-of-phase gauntlet (before PR).** Per-slice adversarial + craft reviews are already done at each checkpoint (preamble §7). This end gate adds: a **clean-context test** (fresh agent, repo + docs only, exercises acceptance criteria 1, 3, 4 and the leave/delete flows from the documentation alone — it needs the complete feature); and an **integrated adversarial + craft sweep** over the whole composed branch (cross-slice composition, residual creator-identity authority across slices, §3 string/code, roster-hash/migration on legacy chains, the S5 endpoint-semantics blast radius). Gate: blockers fixed or explicitly accepted by Jim.
 3. **Jim's local maintainer-side gate:** the `#[ignore]`d daemon-API suite and multi-daemon convergence tests on Jim's machine. Never run inside cloud slices.
-4. **Verb confirmation:** if the maintainer has answered #107, apply the one-line swap before PR; if unanswered, ship "disband" provisionally (Jim's accepted default).
+4. **Verb confirmation:** resolved in final polish — ship user-facing `delete` for the explicit group-ending action; `state-withdraw` remains a deprecated compatibility alias and `withdrawn` remains wire/history vocabulary.
 5. **PR creation — Jim's explicit confirmation required, always.** PR description must state openly: deferred items (delegated ban non-operational until Phase 2; deterministic committer and the two-admin metadata race window until Phase 3); the unchanged 424 explained; the `DELETE /groups/:id` semantics change for creators; the deliberately-kept items (stored `owner` entries, reserved variants, `new_owner` constructor, `creator_agent_id`, audit fields).
 
 ## Assumptions
@@ -260,7 +260,7 @@ S1 (R2 net) ──> S2 (owner retirement) ──> S3 (add/remove/ban) ──> S4
 
 ## Resolved questions (Jim, 2026-06-12)
 
-1. Verb: proceed with provisional "disband" if #107 unanswered at S5 (one-line swap isolated).
+1. Verb: resolved during final polish — use `delete` for the explicit group-ending action.
 2. S5 endpoint change: clean break, loudly flagged in PR description; no transitional behavior.
 3. S3/S4: stay separate; merging is a Jim call at dispatch time only.
 4. Property test: after S5, as planned.

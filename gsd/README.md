@@ -20,8 +20,9 @@ artifacts ONLY:
    branches, and only with Jim Collinson's explicit prior approval —
    PR creation is always a human gate.
 3. **Deliverable work happens on feature branches** cut from freshly-synced
-   `main` (current: `feat/adr-0016-phase-1-authority-alignment`) and
-   contains only the deliverable: code changes plus their documentation.
+   `main` (current v0.26 re-home: `feat/adr-0016-phase-1-on-v0.26`;
+   historical pre-v0.26 branch: `feat/adr-0016-phase-1-authority-alignment`)
+   and contains only the deliverable: code changes plus their documentation.
    No GSD files there, ever — a PR ships the whole branch diff.
 4. **Upstream ships several times a day.** Sync `main` with upstream at
    session start; rebase in-flight feature branches before review and
@@ -43,4 +44,3 @@ the maintainer's phasing comments on issue #107: Phase 1 = authority
 alignment (this work), Phase 2 = KeyPackage distribution (wire-shape
 sketch on the issue REQUIRED before any implementation), Phase 3 =
 deterministic committer + race handling.
-

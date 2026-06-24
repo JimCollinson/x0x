@@ -11,6 +11,8 @@ Base/fork main for PR #6: `71a92f23234190b934cd616c76370084181aa1c6` (same tree 
 
 passed — 8/8 requested goals verified. No required remediation found.
 
+**Post-verification note:** final adversarial review later found a CRITICAL withdrawn self-leave authority bypass at the same implementation head. This verification result is superseded for readiness until that blocker is remediated and re-reviewed. See `gsd/checkpoints/2026-06-24-v026-adversarial-blocker-a56f4ce.md`.
+
 ## Sources read
 
 - `docs/adr/0016-role-based-group-authority-flat-admin.md`

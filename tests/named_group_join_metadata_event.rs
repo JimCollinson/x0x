@@ -388,6 +388,19 @@ async fn member_joined_event_propagates_to_inviter() {
         "alice diagnostics members_v2_size should reflect alice+bob: {row:?}",
     );
 
+    // The join response returns after bob has created a local base stub and
+    // published MemberJoined. Bob can only satisfy the local MembersOnly write
+    // check after alice's authority-signed MemberAdded commit arrives back and
+    // updates bob's own roster view.
+    let bob_sees_self = wait_until(Duration::from_secs(30), || async {
+        list_members(bob, &group_id).await.contains(&bob_aid)
+    })
+    .await;
+    assert!(
+        bob_sees_self,
+        "bob's local roster never picked up the authority-signed MemberAdded event",
+    );
+
     // Phase 2: bob's signed public message lands in alice's cache.
     let body = "from bob: roster-propagation-fix";
     let post = post_public_message(bob, &group_id, body).await;

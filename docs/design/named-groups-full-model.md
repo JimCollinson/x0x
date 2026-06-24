@@ -618,27 +618,26 @@ Public should still be accountable.
 
 ## Authorization rules
 
-A minimal first ruleset:
+ADR-0016 defines a flat protocol ruleset:
 
-- `Owner`
-  - change policy
-  - appoint/remove admins
-  - delete group
-  - approve/reject requests
-  - add/remove members
-
-- `Admin`
-  - approve/reject requests
-  - add/remove members except owner
-  - manage moderators/member roles
-  - moderate public spaces
-
-- `Moderator`
-  - remove public posts where applicable
-  - mute/ban in public or moderated spaces
+- `Admin` is group root:
+  - change policy and public metadata
+  - appoint/demote admins and assign members
+  - issue invites and approve/reject requests
+  - add, remove, ban, and unban members
+  - delete/end the group through the terminal `GroupDeleted` commit
+  - moderate public spaces where the application maps moderation to group admin
 
 - `Member`
-  - normal access
+  - normal group access according to policy
+
+- `Owner`
+  - legacy stored label only; parsed and rendered for old rosters
+  - admin-equivalent during validation, but not assignable by current APIs
+
+- `Moderator` / `Guest`
+  - reserved legacy/application vocabulary
+  - not assignable by ADR-0016 APIs and not a protocol authority tier
 
 ### Explicit rejects
 - non-admin cannot approve requests

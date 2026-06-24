@@ -608,6 +608,46 @@ pub fn enforce_last_admin_invariant(
     }
 }
 
+fn active_signer_role(
+    members_v2: &BTreeMap<String, GroupMember>,
+    signer_hex: &str,
+) -> Option<GroupRole> {
+    members_v2
+        .get(signer_hex)
+        .filter(|m| m.is_active())
+        .map(|m| m.role)
+}
+
+#[must_use]
+pub(crate) fn active_signer_is_admin_or_higher(
+    members_v2: &BTreeMap<String, GroupMember>,
+    signer_hex: &str,
+) -> bool {
+    active_signer_role(members_v2, signer_hex).is_some_and(|role| role.at_least(GroupRole::Admin))
+}
+
+fn validate_live_to_withdrawn_authority(
+    current_withdrawn: bool,
+    commit: &GroupStateCommit,
+    signer_role: Option<GroupRole>,
+    action_kind: ActionKind,
+) -> Result<(), ApplyError> {
+    if current_withdrawn || !commit.withdrawn {
+        return Ok(());
+    }
+
+    if action_kind == ActionKind::AdminOrHigher
+        && signer_role.is_some_and(|role| role.at_least(GroupRole::Admin))
+    {
+        return Ok(());
+    }
+
+    Err(ApplyError::Unauthorized {
+        signer: commit.committed_by.clone(),
+        action: ActionKind::AdminOrHigher.name(),
+    })
+}
+
 /// Input to [`validate_apply`].
 ///
 /// Receivers recompute the hash of the committed payload and verify:
@@ -675,11 +715,12 @@ pub fn validate_apply(
     }
 
     // 6. authority
-    let signer_role = ctx
-        .members_v2
-        .get(&commit.committed_by)
-        .filter(|m| m.is_active())
-        .map(|m| m.role);
+    let signer_role = active_signer_role(ctx.members_v2, &commit.committed_by);
+
+    // A live -> withdrawn transition is a terminal admin act. Already-withdrawn
+    // carry-forward commits are intentionally left to the ordinary action-kind
+    // authority below; un-withdrawal was rejected by the terminality check above.
+    validate_live_to_withdrawn_authority(ctx.current_withdrawn, commit, signer_role, action_kind)?;
 
     let authorized = match action_kind {
         ActionKind::AdminOrHigher => signer_role

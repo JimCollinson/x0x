@@ -270,7 +270,7 @@ fn last_admin_gossip_apply_allows_zero_admin_withdrawal_commit() {
     let commit = craft_commit(&replica, &scratch, &owner, 1_000);
     assert!(commit.withdrawn);
 
-    let next = gossip_apply(&replica, &commit, ActionKind::MemberSelf, |next| {
+    let next = gossip_apply(&replica, &commit, ActionKind::AdminOrHigher, |next| {
         next.remove_member(&owner_hex, Some(owner_hex.clone()));
     })
     .unwrap();

@@ -271,6 +271,14 @@ fn assert_self_leave_converges(mut authority: GroupInfo, actor: &AgentKeypair) {
     let commit = rest_self_leave_semantics(&mut authority, actor).unwrap();
 
     assert_eq!(commit.committed_by, actor_hex);
+    assert!(
+        !commit.withdrawn,
+        "ordinary self-leave must not carry the terminal withdrawal flag"
+    );
+    assert!(
+        !authority.withdrawn,
+        "ordinary self-leave must not tombstone the authority state"
+    );
     assert!(authority.members_v2[&actor_hex].is_removed());
     assert!(
         authority.active_admin_count() >= 1,
@@ -285,6 +293,10 @@ fn assert_self_leave_converges(mut authority: GroupInfo, actor: &AgentKeypair) {
 
     assert_eq!(next.state_hash, authority.state_hash);
     assert!(next.members_v2[&actor_hex].is_removed());
+    assert!(
+        !next.withdrawn,
+        "ordinary self-leave must not tombstone the applied state"
+    );
 }
 
 fn assert_self_leave_conflict_preserves(mut info: GroupInfo, actor: &AgentKeypair) {
@@ -570,6 +582,76 @@ fn membership_authority_crafted_last_admin_self_leave_rejected_at_finalize() {
         ApplyError::Invariant(ref msg)
             if msg == "post-mutation state would leave a live group with zero active admins"
     ));
+}
+
+#[test]
+fn membership_authority_non_admin_self_leave_with_withdrawn_true_rejected_at_apply_choke_point() {
+    let creator = AgentKeypair::generate().unwrap();
+    let admin = AgentKeypair::generate().unwrap();
+    let member = AgentKeypair::generate().unwrap();
+    let target = AgentKeypair::generate().unwrap();
+    let info = group_with_admin_member_and_target(&creator, &admin, &member, &target);
+    let member_hex = hex_id(&member);
+
+    let mut scratch = info.clone();
+    scratch.roster_revision = scratch.roster_revision.saturating_add(1);
+    scratch.remove_member(&member_hex, Some(member_hex.clone()));
+    scratch.withdrawn = true;
+    let commit = craft_commit(&info, &scratch, &member, 2_000);
+    assert!(commit.withdrawn);
+
+    let err = gossip_apply(&info, &commit, ActionKind::MemberSelf, |next| {
+        next.roster_revision = next.roster_revision.saturating_add(1);
+        next.remove_member(&member_hex, Some(member_hex.clone()));
+    })
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        ApplyError::Unauthorized { action, .. }
+            if action == ActionKind::AdminOrHigher.name()
+    ));
+}
+
+#[test]
+fn membership_authority_direct_seal_withdrawn_state_requires_admin_or_legacy_owner() {
+    let creator = AgentKeypair::generate().unwrap();
+    let admin = AgentKeypair::generate().unwrap();
+    let member = AgentKeypair::generate().unwrap();
+    let target = AgentKeypair::generate().unwrap();
+    let info = group_with_admin_member_and_target(&creator, &admin, &member, &target);
+
+    let mut member_attempt = info.clone();
+    member_attempt.withdrawn = true;
+    let before_revision = member_attempt.state_revision;
+    let before_hash = member_attempt.state_hash.clone();
+    let err = member_attempt.seal_commit(&member, 2_000).unwrap_err();
+    assert!(matches!(
+        err,
+        ApplyError::Unauthorized { action, .. }
+            if action == ActionKind::AdminOrHigher.name()
+    ));
+    assert_eq!(member_attempt.state_revision, before_revision);
+    assert_eq!(member_attempt.state_hash, before_hash);
+    assert!(member_attempt.commit_log.is_empty());
+
+    let mut admin_attempt = info.clone();
+    let admin_commit = admin_attempt
+        .seal_withdrawal(&admin, 2_001)
+        .expect("admin withdrawal seals");
+    assert!(admin_commit.withdrawn);
+    assert!(admin_attempt.withdrawn);
+
+    let legacy_owner = AgentKeypair::generate().unwrap();
+    let legacy_owner_hex = hex_id(&legacy_owner);
+    let mut legacy = admin_group(&legacy_owner, "legacy owner withdrawal");
+    legacy.set_member_role(&legacy_owner_hex, GroupRole::Owner);
+    legacy.recompute_state_hash();
+    let legacy_commit = legacy
+        .seal_withdrawal(&legacy_owner, 2_002)
+        .expect("legacy owner withdrawal seals");
+    assert!(legacy_commit.withdrawn);
+    assert!(legacy.withdrawn);
 }
 
 #[test]

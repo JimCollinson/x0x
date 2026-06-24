@@ -497,6 +497,15 @@ impl GroupInfo {
         // the caller's domain mutations, so this evaluates the proposed
         // post-mutation roster before any chain field is touched.
         state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
+        if self.withdrawn {
+            let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+            if !state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex) {
+                return Err(state_commit::ApplyError::Unauthorized {
+                    signer: signer_hex,
+                    action: state_commit::ActionKind::AdminOrHigher.name(),
+                });
+            }
+        }
         // Ensure the genesis record is present — callers may reach here via
         // migrated paths that didn't set it yet.
         if self.genesis.is_none() {

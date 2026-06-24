@@ -365,6 +365,18 @@ fn arb_last_admin_zero_admin_rest_attempt() -> impl Strategy<Value = LastAdminAc
     ]
 }
 
+fn arb_action_kind() -> impl Strategy<Value = ActionKind> {
+    prop_oneof![
+        Just(ActionKind::AdminOrHigher),
+        Just(ActionKind::MemberSelf),
+        Just(ActionKind::NonMemberRequest),
+    ]
+}
+
+fn arb_optional_signer_spec() -> impl Strategy<Value = Option<RosterMemberSpec>> {
+    prop_oneof![Just(None), arb_member_spec().prop_map(Some)]
+}
+
 fn sequence_keypairs() -> Vec<AgentKeypair> {
     (0..LAST_ADMIN_SEQUENCE_AGENT_SLOTS)
         .map(deterministic_agent_keypair)
@@ -527,6 +539,123 @@ fn reject_last_admin_precheck_and_seal_chokepoint(
         Err(ApplyError::Invariant(_))
     ));
     reject_without_mutation(info, before)
+}
+
+fn withdrawal_case_group(
+    keypairs: &[AgentKeypair],
+    signer_spec: Option<&RosterMemberSpec>,
+    current_withdrawn: bool,
+) -> GroupInfo {
+    let mut info = GroupInfo::with_policy(
+        "withdrawal-authority-proptest".to_string(),
+        "generated withdrawal authority case".to_string(),
+        keypairs[0].agent_id(),
+        "ac".repeat(16),
+        GroupPolicyPreset::PublicRequestSecure.to_policy(),
+    );
+    info.members_v2.clear();
+
+    let admin_hex = keypair_hex(keypairs, 0);
+    let admin_spec = member_spec(GroupRole::Admin, GroupMemberState::Active);
+    info.members_v2.insert(
+        admin_hex.clone(),
+        member_from_spec(admin_hex, &admin_spec, None),
+    );
+
+    if let Some(spec) = signer_spec {
+        let signer_hex = keypair_hex(keypairs, 1);
+        info.members_v2.insert(
+            signer_hex.clone(),
+            member_from_spec(signer_hex, spec, Some(keypair_hex(keypairs, 0))),
+        );
+    }
+
+    info.state_revision = 0;
+    info.prev_state_hash = None;
+    info.withdrawn = current_withdrawn;
+    info.recompute_state_hash();
+    info
+}
+
+fn signer_active_role_from_spec(signer_spec: Option<&RosterMemberSpec>) -> Option<GroupRole> {
+    signer_spec
+        .filter(|spec| matches!(spec.state, GroupMemberState::Active))
+        .map(|spec| spec.role)
+}
+
+fn signer_is_active_admin(signer_spec: Option<&RosterMemberSpec>) -> bool {
+    signer_active_role_from_spec(signer_spec)
+        .is_some_and(|role| matches!(role, GroupRole::Admin | GroupRole::Owner))
+}
+
+fn normal_action_authorized_by_spec(
+    signer_spec: Option<&RosterMemberSpec>,
+    action_kind: ActionKind,
+) -> bool {
+    let active_role = signer_active_role_from_spec(signer_spec);
+    match action_kind {
+        ActionKind::AdminOrHigher => {
+            active_role.is_some_and(|role| matches!(role, GroupRole::Admin | GroupRole::Owner))
+        }
+        ActionKind::MemberSelf => active_role.is_some(),
+        ActionKind::NonMemberRequest => active_role.is_none(),
+    }
+}
+
+fn expected_withdrawn_apply_authorized(
+    current_withdrawn: bool,
+    commit_withdrawn: bool,
+    signer_spec: Option<&RosterMemberSpec>,
+    action_kind: ActionKind,
+) -> bool {
+    if current_withdrawn && !commit_withdrawn {
+        return false;
+    }
+    if !current_withdrawn && commit_withdrawn {
+        return action_kind == ActionKind::AdminOrHigher && signer_is_active_admin(signer_spec);
+    }
+    normal_action_authorized_by_spec(signer_spec, action_kind)
+}
+
+fn craft_withdrawn_flag_commit(
+    parent: &GroupInfo,
+    signer: &AgentKeypair,
+    withdrawn: bool,
+    now_ms: u64,
+) -> Result<GroupStateCommit, ApplyError> {
+    GroupStateCommit::sign(
+        parent.stable_group_id().to_string(),
+        parent.state_revision.saturating_add(1),
+        Some(parent.state_hash.clone()),
+        compute_roster_root(&parent.members_v2),
+        compute_policy_hash(&parent.policy),
+        compute_public_meta_hash(&parent.public_meta()),
+        parent.security_binding.clone(),
+        withdrawn,
+        now_ms,
+        signer,
+    )
+}
+
+fn apply_withdrawn_flag_commit(
+    info: &mut GroupInfo,
+    commit: &GroupStateCommit,
+    action_kind: ActionKind,
+) -> Result<(), ApplyError> {
+    let ctx = ApplyContext {
+        current_state_hash: &info.state_hash,
+        current_revision: info.state_revision,
+        current_withdrawn: info.withdrawn,
+        members_v2: &info.members_v2,
+        group_id: info.stable_group_id(),
+    };
+    validate_apply(&ctx, commit, action_kind)?;
+
+    let mut next = info.clone();
+    next.withdrawn = commit.withdrawn;
+    next.finalize_applied_commit(commit)?;
+    *info = next;
+    Ok(())
 }
 
 fn production_precheck_error_for_rest_zero_admin_attempt(
@@ -1046,6 +1175,74 @@ proptest! {
         prop_assert_eq!(result.is_ok(), expected_ok);
         if !expected_ok {
             prop_assert!(matches!(result, Err(ApplyError::Invariant(_))));
+        }
+    }
+
+    #[test]
+    fn withdrawal_flag_authority_matches_transition_oracle(
+        signer_spec in arb_optional_signer_spec(),
+        action_kind in arb_action_kind(),
+        current_withdrawn in any::<bool>(),
+        commit_withdrawn in any::<bool>(),
+    ) {
+        let keypairs = sequence_keypairs();
+        let signer = &keypairs[1];
+        let mut apply_group = withdrawal_case_group(
+            &keypairs,
+            signer_spec.as_ref(),
+            current_withdrawn,
+        );
+        let before = state_snapshot(&apply_group);
+        let commit = craft_withdrawn_flag_commit(
+            &apply_group,
+            signer,
+            commit_withdrawn,
+            11_000,
+        )
+        .expect("sign withdrawal flag commit");
+
+        let result = apply_withdrawn_flag_commit(&mut apply_group, &commit, action_kind);
+        let expected_ok = expected_withdrawn_apply_authorized(
+            current_withdrawn,
+            commit_withdrawn,
+            signer_spec.as_ref(),
+            action_kind,
+        );
+        prop_assert_eq!(result.is_ok(), expected_ok);
+        if expected_ok {
+            prop_assert_eq!(apply_group.withdrawn, commit_withdrawn);
+        } else {
+            prop_assert_eq!(state_snapshot(&apply_group), before);
+            if current_withdrawn && !commit_withdrawn {
+                prop_assert!(matches!(result, Err(ApplyError::Withdrawn)));
+            }
+            if !current_withdrawn && commit_withdrawn {
+                let rejected_by_withdrawal_authority = matches!(
+                    result,
+                    Err(ApplyError::Unauthorized { action, .. })
+                        if action == ActionKind::AdminOrHigher.name()
+                );
+                prop_assert!(rejected_by_withdrawal_authority);
+            }
+        }
+
+        let mut seal_group = withdrawal_case_group(
+            &keypairs,
+            signer_spec.as_ref(),
+            current_withdrawn,
+        );
+        seal_group.withdrawn = true;
+        let before_revision = seal_group.state_revision;
+        let before_state_hash = seal_group.state_hash.clone();
+        let seal_result = seal_group.seal_commit(signer, 12_000);
+        let expected_seal_ok = signer_is_active_admin(signer_spec.as_ref());
+        prop_assert_eq!(seal_result.is_ok(), expected_seal_ok);
+        if let Ok(commit) = seal_result {
+            prop_assert!(commit.withdrawn);
+            prop_assert!(seal_group.withdrawn);
+        } else {
+            prop_assert_eq!(seal_group.state_revision, before_revision);
+            prop_assert_eq!(seal_group.state_hash, before_state_hash);
         }
     }
 }

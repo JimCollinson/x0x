@@ -1679,8 +1679,11 @@ mod tests {
         build_test_service(policy, dir.path()).await
     }
 
-    async fn enabled_test_service(acl: ExecAcl) -> (Arc<ExecService>, tempfile::TempDir) {
+    async fn enabled_test_service(mut acl: ExecAcl) -> (Arc<ExecService>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tmpdir");
+        if acl.audit_log_path.is_relative() {
+            acl.audit_log_path = dir.path().join(&acl.audit_log_path);
+        }
         let service = build_test_service(ExecPolicy::Enabled(acl), dir.path()).await;
         (service, dir)
     }

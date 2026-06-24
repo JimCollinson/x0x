@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.26.0] - 2026-06-21
+
+### Added
+
+- **Embeddable in-process server: `x0x::server::serve()` / `ServerHandle` ([#110](https://github.com/saorsa-labs/x0x/issues/110), proposed by @josh-clsn).** The daemon's entire axum router + SSE hub + serving-side background tasks were factored out of the `x0xd` binary into the library at `src/server/`, so a host process (e.g. an Android/iOS app that can't reliably supervise a child `x0xd`) can run the HTTP/SSE surface in-process. `serve(config)` / `serve_with_options(config, options)` return a non-blocking `ServerHandle { local_addr(), shutdown(&self), wait(), shutdown_and_wait(), cancellation_token() }`; the bin is now a thin wrapper and the HTTP/SSE surface is byte-identical (verified by a 19-test characterization oracle, the full nextest suite, a live 6-node testnet, and a line-multiset diff of the relocation). `DaemonConfig` is the public input, with a new `identity_dir` so a host supplies its own storage paths — no `~/.x0x` fallback is reachable on the embed path. The public `serve()` disables self-update install/restart by default (an embedded library must never replace or restart the host app); the daemon binary opts back in. CLI-only flows (`--doctor`/`--check`/`--check-updates`, arg parsing, logging) stay in the bin.
+
+- **Deterministic shutdown teardown ([#116](https://github.com/saorsa-labs/x0x/issues/116)).** `ServerHandle::shutdown_and_wait()` now stops every owned background task before returning: the server-owned listeners, the gossip runtime, and the QUIC `NetworkNode` (a real `NetworkNode::shutdown()` deadlock was fixed along the way), plus the previously-unstopped `Agent`-internal loops (identity / network-event / direct / lifecycle listeners, presence broadcast-peer refresh, heartbeat, discovery reaper), the presence beacons (wrapper *and* `PresenceManager`), the capability-advert and DM-inbox services, via a `CancellationToken` + a closed task registry. A listener that a still-bootstrapping `join_network` would otherwise start after shutdown is refused (TOCTOU-free). No steady-state behavior change.
+
+- **Force-cancel in-flight exec sessions on shutdown ([#118](https://github.com/saorsa-labs/x0x/issues/118)).** `ExecService::shutdown()` now force-cancels per-request exec handlers and `SIGKILL`s their child processes (out-of-band PID kill + `kill_on_drop` backstop, with a re-snapshot on the grace timeout and reap-time PID clearing so a recycled PID is never signalled), completing the deterministic-teardown story for embedders.
+
+### Changed
+
+- **Bumped `ant-quic` 0.27.26 → 0.27.27.** Picks up the endpoint UDP-socket release on shutdown ([ant-quic#196](https://github.com/saorsa-labs/ant-quic/issues/196)), so an in-process embedder can stop and restart x0x on the **same fixed QUIC port** (proven by the in-process restart tests). Resolver-unified with `saorsa-gossip`'s `ant-quic` requirement — no `saorsa-gossip` re-release needed.
+
+## [v0.25.0] - 2026-06-19
+
+### Added
+
+- **Retained named-group state-commit history + `GET /groups/:id/state/commits` (members-only, paged) — a verifiable role/roster audit trail ([#111](https://github.com/saorsa-labs/x0x/issues/111), proposed by @nkoteskey).** Every authored or applied `GroupStateCommit` is now retained in-struct alongside an independently-verifiable roster projection: recomputing the BLAKE3 `roster_root` from the stored `{agent_id → (role, state)}` snapshot must equal the signed `commit.roster_root`. This makes "who held which role at revision N" auditable after the fact — closing the verification gap that [ADR-0016](docs/adr/0016-role-based-group-authority-flat-admin.md)'s flat Admin/Member delegated authority left open. The endpoint serves the chain to members with pagination (`from_revision`, `limit`) and reports `roster_root_verified` per entry. Retention rides the existing atomic group writes through the two methods every commit-production path funnels through (`seal_commit` for the authoring committer, `finalize_applied_commit` for commits applied over gossip), bounded by `COMMIT_LOG_CAP`. CLI: `x0x group state-commits <group_id>`. Verified on the live 6-node testnet across both the authored (committer) and applied-over-gossip (TreeKEM joiner) paths.
+
+## [v0.24.0] - 2026-06-15
+
+### Added
+
+- **Signed agent cards + A2A (Agent2Agent) discovery — foundation of [ADR-0017](docs/adr/0017-x0x-as-agent-transport-layer.md) (positioning x0x as the agent transport layer).** `AgentCard` now carries an `agent_public_key` and an ML-DSA-65 `signature` over canonical, domain-separated, length-prefixed bytes (mirroring the existing `GroupCard` scheme). The signature commits to the agent's public key, which must hash to the card's `agent_id`, so a relay cannot substitute a foreign key — reachability hints and capability advertisements are now tamper-evident. `GET /agent/card` signs; `POST /agent/card/import` verifies signed cards and rejects tampered ones. Legacy unsigned cards still parse and import for backward compatibility.
+- **`GET /.well-known/agent-card.json` — A2A-compatible discovery card.** The daemon serves an [Agent2Agent](https://a2a-protocol.org)-shaped Agent Card derived from the signed x0x card: KV stores and public groups map to A2A `skills`, the `exec` skill is advertised only when remote-exec is enabled, and the self-authenticating x0x identity (agent/machine/user ids, public key, signature, certificate) is carried under `x0x`-namespaced extension members. This is the discovery half of A2A interop ([docs/design/a2a-agent-card-adapter.md](docs/design/a2a-agent-card-adapter.md)); the A2A-over-x0x message binding ([docs/design/a2a-over-x0x-binding.md](docs/design/a2a-over-x0x-binding.md)) is a tracked follow-up. A transport/identity Internet-Draft skeleton ([docs/design/x0x-transport-protocol-id.md](docs/design/x0x-transport-protocol-id.md)) accompanies the ADR.
+
 ## [v0.23.1] - 2026-06-11
 
 ### Added

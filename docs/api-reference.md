@@ -66,8 +66,9 @@ curl http://127.0.0.1:12700/status
 | GET | `/agent` | `x0x agent` | Local agent identity |
 | POST | `/announce` | `x0x announce` | Re-announce identity to the network |
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
-| GET | `/agent/card` | `x0x agent card` | Generate a shareable identity card |
-| POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts |
+| GET | `/agent/card` | `x0x agent card` | Generate a shareable, signed identity card |
+| GET | `/.well-known/agent-card.json` | — | A2A-compatible discovery card (ADR-0017) |
+| POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts (verifies signature) |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 
@@ -87,6 +88,32 @@ Notes:
 ### Agent card query params
 
 `GET /agent/card?display_name=Alice&include_groups=true`
+
+### Agent card signing (ADR-0017)
+
+Generated cards are signed with the agent's ML-DSA-65 key. The card carries two
+extra fields:
+
+- `agent_public_key` — hex ML-DSA-65 public key of the signer.
+- `signature` — hex ML-DSA-65 signature over the canonical card bytes.
+
+Verification binds the embedded public key to the card's `agent_id`
+(`agent_id == SHA-256(agent_public_key)`) and then checks the signature, so a
+relay cannot substitute a foreign key. `POST /agent/card/import` rejects a signed
+card whose signature fails; legacy unsigned cards (`signature` absent) still
+import for backward compatibility.
+
+### A2A discovery card
+
+`GET /.well-known/agent-card.json` returns an
+[Agent2Agent (A2A)](https://a2a-protocol.org)-compatible Agent Card
+(`application/json`) derived from the local agent's signed card. x0x-native data
+is carried under `x0x`-prefixed extension members (`x0xAgentId`,
+`x0xAgentPublicKey`, `x0xSignature`, `x0xCertificate`, …); KV stores and public
+groups become A2A `skills`; the `exec` skill is advertised only when remote-exec
+is enabled. This is the discovery half of A2A interop — see
+`docs/design/a2a-agent-card-adapter.md`. The A2A-over-x0x message binding
+(`docs/design/a2a-over-x0x-binding.md`) is a tracked follow-up.
 
 ### Sign request body
 
@@ -302,6 +329,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | POST | `/groups/join` | `x0x group join <invite>` | Join via invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |
 | GET | `/groups/:id/state` | `x0x group state <group_id>` | **Phase D.3**: inspect the signed state-commit chain |
+| GET | `/groups/:id/state/commits` | `x0x group state-commits <group_id>` | **issue #111**: read retained state-commit history (members only, paged) |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group state-withdraw <group_id>` | **Phase D.3**: seal terminal withdrawal; evicts public card on peers |
 | POST | `/groups/:id/send` | `x0x group send` | **Phase E**: publish a signed message to a SignedPublic group |
@@ -391,6 +419,37 @@ Each named group maintains a signed commit chain:
   higher-revision commit with `withdrawn=true` and broadcasts the
   withdrawal card. Peers evict stale listings on receipt regardless of
   TTL.
+
+#### Retained commit history (issue #111)
+
+`GET /groups/:id/state` exposes only the chain **head**. To answer
+"what did the signed roster say at revision N" long after the fact (for
+verification and group-governance integrators per ADR-0016), each daemon
+retains every commit it applies — from both local authorship and peer
+commits — paired with the roster projection it effected:
+
+- `GET /groups/:id/state/commits?from_revision=0&limit=100` —
+  **members only** (retained roster projections are member content, so
+  this does *not* use `/state`'s public-projection gate). Returns
+  `{ ok, group_id, state_revision, total_retained,
+  first_available_revision, latest_retained_revision, from_revision,
+  limit, count, has_more, next_from_revision, commits }`, where each
+  `commits[]` entry is `{ commit, roster, roster_root_verified }`.
+  `roster` is the `{ agent_id: { role, state } }` projection of `Active` +
+  `Banned` members; `roster_root_verified` recomputes the root over that
+  projection and compares it to the commit's signed `roster_root`, so any
+  at-rest corruption surfaces rather than serving silently-wrong history.
+  `limit` is capped at 500.
+
+Scope and honest limits: retention is **not retroactive** — history begins
+at the first release that retains it, and each daemon holds only the suffix
+it witnessed (a member who joined at revision 50 has no earlier entries;
+`first_available_revision` lets callers distinguish a real gap from an empty
+result). Each retained entry is independently verifiable against its
+commit's `roster_root` with no dependence on the prior chain. Storage is
+bounded per group (`COMMIT_LOG_CAP`, oldest dropped past the cap with a
+logged warning — never silent); checkpoint-and-truncate and cross-peer
+backfill are deferred.
 
 Cards and commits carry ML-DSA-65 signatures. Peers verify both the
 signature and the chain link (`prev_state_hash`) before accepting; stale

@@ -214,7 +214,7 @@ Phased; each phase independently shippable.
   siblings; optional "seal" act if sealed groups ever earn demand; mandate
   layer if two ranks prove too coarse.
 
-## Acceptance criteria
+## Validation
 
 - A promoted Admin can invite, add, remove, ban, change policy, change
   roles, and delete, with commits that validate and converge to all members

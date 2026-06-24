@@ -375,6 +375,11 @@ const COVERED: &[CoveredEndpoint] = &[
         d4_stateful_events_converge_via_signed_commits
     ),
     covered!(
+        Get,
+        "/groups/:id/state/commits",
+        state_commits_endpoint_serves_retained_history
+    ),
+    covered!(
         Post,
         "/groups/:id/state/seal",
         d4_stateful_events_converge_via_signed_commits
@@ -701,11 +706,12 @@ fn cli_names_unique() {
     );
 }
 
-/// Verifies the route set in x0xd.rs matches the ENDPOINTS registry exactly,
-/// excluding documented aliases.
+/// Verifies the route set in `src/server/mod.rs` matches the ENDPOINTS registry
+/// exactly, excluding documented aliases. The router was relocated from the
+/// `x0xd` binary into the library `server` module in Issue #110 Phase 1.
 #[test]
 fn route_set_matches_registry() {
-    let source = include_str!("../src/bin/x0xd.rs");
+    let source = include_str!("../src/server/mod.rs");
     let routes = extract_route_defs(source);
 
     let endpoints: HashSet<(String, String)> = ENDPOINTS
@@ -713,9 +719,18 @@ fn route_set_matches_registry() {
         .map(|ep| (format!("{}", ep.method), ep.path.to_string()))
         .collect();
 
-    let known_extras: HashSet<(String, String)> = [(String::from("GET"), String::from("/gui/"))]
-        .into_iter()
-        .collect();
+    // Routes intentionally outside the CLI-mapped ENDPOINTS registry:
+    // `/gui/` (static UI) and the A2A well-known discovery URI (ADR-0017),
+    // which is a standards-mandated discovery path, not a CLI command.
+    let known_extras: HashSet<(String, String)> = [
+        (String::from("GET"), String::from("/gui/")),
+        (
+            String::from("GET"),
+            String::from("/.well-known/agent-card.json"),
+        ),
+    ]
+    .into_iter()
+    .collect();
 
     let missing_from_registry: Vec<String> = routes
         .difference(&endpoints)
@@ -731,8 +746,8 @@ fn route_set_matches_registry() {
     assert!(
         missing_from_registry.is_empty() && missing_from_router.is_empty(),
         "\n\nRegistry/router drift detected.\n\
-         Routes in x0xd.rs missing from ENDPOINTS:\n{}\n\n\
-         ENDPOINTS entries missing from x0xd.rs:\n{}\n",
+         Routes in server::mod missing from ENDPOINTS:\n{}\n\n\
+         ENDPOINTS entries missing from server::mod:\n{}\n",
         if missing_from_registry.is_empty() {
             String::from("  <none>")
         } else {

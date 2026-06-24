@@ -46,6 +46,42 @@ def status_token(status: str) -> str:
     return status.split()[0].strip("*").rstrip(".,;:") if status.split() else status
 
 
+def has_section(text: str, section: str) -> bool:
+    return re.search(rf"(?im)^##\s+{re.escape(section)}\b", text) is not None
+
+
+def non_heading_lines(text: str) -> list[str]:
+    """Body lines, excluding markdown ATX headings. Used to prove an edit
+    touched only headings and left the decision content untouched."""
+    return [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+
+
+def is_template_repair(old: str, new: str) -> bool:
+    """True when the only change to an Accepted ADR is editing headings to
+    restore previously-missing required template sections.
+
+    This narrowly permits fixing a mistitled heading on an already-Accepted
+    ADR (e.g. renaming '## Acceptance criteria' to the required
+    '## Validation') without a force-push or a superseding ADR. It is a
+    template-conformance repair, not a decision change, so it does not
+    violate the spirit of immutability. The gate is deliberately tight:
+
+    - the base version must have been missing at least one required section,
+    - the new version must contain every required section, and
+    - every non-heading line must be byte-for-byte identical.
+
+    Any edit that touches body content (adding a new section with new prose,
+    rewording the decision, etc.) fails the last condition and falls through
+    to the immutability error, where it belongs.
+    """
+    missing_before = [s for s in REQUIRED_SECTIONS if not has_section(old, s)]
+    if not missing_before:
+        return False
+    if any(not has_section(new, s) for s in REQUIRED_SECTIONS):
+        return False
+    return non_heading_lines(old) == non_heading_lines(new)
+
+
 def base_ref() -> str | None:
     ref = os.environ.get("GITHUB_BASE_REF")
     if ref:
@@ -135,6 +171,11 @@ def main() -> int:
                 continue
             old_status = status_of(old)
             if old_status and status_token(old_status) == "Accepted":
+                new = file_at("HEAD", name)
+                if new is not None and is_template_repair(old, new):
+                    # Heading-only repair restoring a missing required
+                    # section; allowed without superseding. See is_template_repair.
+                    continue
                 errors.append(
                     f"{name}: Accepted ADRs are immutable. Create a new superseding ADR instead of editing this file."
                 )

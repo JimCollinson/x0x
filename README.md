@@ -87,6 +87,21 @@ x0x agent import x0x://agent/eyJkaXNwbGF5X25hbWUiOi...
 
 Or share your raw `agent_id` — that's the only thing anyone needs to reach you.
 
+**Cards are signed.** Every generated card carries an ML-DSA-65 signature over its
+contents (ADR-0017), and the signature commits to the agent's public key — which
+must hash to the card's `agent_id`. Reachability hints and capabilities therefore
+cannot be forged in transit, and importing a tampered signed card is rejected.
+
+**A2A interoperability.** x0x agents are discoverable by the
+[Agent2Agent (A2A)](https://a2a-protocol.org) ecosystem. The daemon serves an
+A2A-compatible Agent Card at `GET /.well-known/agent-card.json`, mapping the x0x
+identity, capabilities, and signature into the A2A schema — so x0x acts as a
+post-quantum, NAT-traversing **transport layer beneath** application protocols
+like A2A and MCP, rather than a competing standard. See
+[ADR-0017](docs/adr/0017-x0x-as-agent-transport-layer.md),
+[docs/design/a2a-agent-card-adapter.md](docs/design/a2a-agent-card-adapter.md),
+and the [x0x transport I-D skeleton](docs/design/x0x-transport-protocol-id.md).
+
 ### Optional: Human Identity
 
 If you want to bind a human identity to your agent (opt-in, never automatic):
@@ -705,6 +720,100 @@ let agent = x0x::Agent::builder().build().await?;
 agent.join_network().await?;
 let mut rx = agent.subscribe("topic").await?;
 ```
+
+---
+
+## Embedding x0x as a library (mobile / in-process)
+
+The full daemon — the same REST + WebSocket API the `x0x` CLI talks to — can run
+**in-process** inside another application instead of as a separate `x0xd`
+binary. This is how mobile and desktop hosts (e.g. a Tauri/Swift app) bundle x0x:
+start the server on a loopback port, then drive it over local HTTP exactly as
+the CLI does.
+
+```rust
+use x0x::server::{serve, DaemonConfig};
+
+// Host owns the filesystem: supply data + identity directories explicitly.
+let mut config = DaemonConfig::default();
+config.api_address = "127.0.0.1:0".parse()?;   // ephemeral loopback port
+config.data_dir    = app_data_dir.join("x0x");
+config.identity_dir = Some(app_data_dir.join("x0x-identity"));
+
+// Non-blocking: returns once the server is bound and serving.
+let handle = serve(config).await?;
+let base = format!("http://{}", handle.local_addr()); // resolved port (esp. for :0)
+
+// ... the app talks to `base` over HTTP, or embeds a WebView pointed at it ...
+
+// Teardown: stops the HTTP/SSE server, the server-owned background tasks, and
+// shuts down the gossip runtime + QUIC node. See the note below on what is and
+// is not yet guaranteed.
+handle.shutdown_and_wait().await?;
+```
+
+`serve(config)` returns a `ServerHandle`:
+
+- `local_addr()` — the actual bound address, readable immediately (so a host
+  that binds `127.0.0.1:0` can discover the real port without racing startup).
+- `shutdown()` — request graceful shutdown; idempotent, non-blocking, `&self`.
+- `wait().await` — await run-to-completion.
+- `shutdown_and_wait().await` — request shutdown, then await completion. When it
+  returns, the following are guaranteed stopped/closed: the HTTP/SSE server, the
+  server-owned background tasks (discovery / DM-inbox / group / KV listeners,
+  republish, connectivity logger, etc.), the gossip runtime, and the QUIC
+  `NetworkNode` (its receiver/accept/eviction tasks are aborted and the ant-quic
+  node is shut down); both the API (TCP) port and the QUIC endpoint UDP socket
+  are released, so a fresh `serve()` on the same config — including the same
+  FIXED QUIC `bind_address` — binds cleanly (ant-quic 0.27.27 / #196). The
+  endpoint socket release is not perfectly synchronous: a single stop→restart on
+  a fixed QUIC port works reliably, but a host that tears down and immediately
+  re-binds the *same* fixed UDP port in a tight loop should allow a brief retry.
+
+  Background tasks now stop deterministically (issue #116): the `Agent`-internal
+  loops (identity / network-event / direct / lifecycle listeners, the presence
+  broadcast-peer refresh, heartbeat, discovery reaper), the presence beacons
+  (wrapper *and* `PresenceManager`), the capability-advert and DM-inbox services,
+  and the `ExecService` loops (inbound / peer-lifecycle / session-idle) are all
+  cancelled and awaited (bounded grace, then abort). A listener that a
+  still-bootstrapping `join_network` would otherwise start after shutdown is
+  refused (a cancellation token + a closed task registry close that race).
+
+  Remaining caveats, all tracked:
+  - **In-flight exec sessions.** `ExecService::shutdown()` stops the background
+    loops but does not force-cancel a per-request remote command already running
+    (or its child process); it completes, hits its duration/idle/lease cap, or is
+    reaped on process exit.
+  - **Presence stop timeout.** On a rare `PresenceManager::stop_beacons()` 5 s
+    timeout the upstream dependency detaches (does not abort) the beacon task;
+    it is bounded by its own per-send timeout. Tracked upstream.
+  - **Fixed QUIC-port rebind is not instantaneous.** ant-quic 0.27.27 (#196)
+    releases the endpoint UDP socket on shutdown, so a single stop→restart on the
+    same fixed QUIC port works. The OS FD closes shortly after
+    `shutdown_and_wait()` returns, so an embedder that immediately re-binds the
+    *same* fixed UDP port in a tight loop should allow a brief retry.
+  - **One-shot contract.** Do not call agent start/subscribe methods after
+    `shutdown_and_wait()` — the lifecycle is single-use.
+- Dropping the handle requests shutdown (Drop does not block).
+
+For full control (instance name, exec ACL, self-update opt-in) use
+`serve_with_options(config, options)`. The blocking `run(config, options)`
+wrapper is also still available.
+
+### Two policies embedders must know
+
+1. **Self-update is disabled by default on the embed path.** `serve()` never
+   downloads, installs, or restarts anything — an embedded library must not
+   replace or restart its host application. The gossip update listener, the
+   GitHub fallback poll, the startup update check, and `POST /upgrade/apply` are
+   all gated off. (The standalone `x0xd` binary opts back in, so its behaviour
+   is unchanged.) To opt in from an embedder, use `serve_with_options` with
+   `self_update_enabled: true`.
+2. **The host must supply data/identity paths — there is no `~/.x0x`
+   fallback.** When you set `identity_dir` (and `data_dir`), *all* identity
+   material (machine/agent/user keys + agent certificate), the peer cache, and
+   the contact store derive from those directories. x0x will not silently write
+   keys or state under the user's home directory.
 
 ---
 

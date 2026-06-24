@@ -310,7 +310,7 @@ fn arb_initial_roster() -> impl Strategy<Value = Vec<RosterMemberSpec>> {
         })
 }
 
-// ADR-0016 final-close rationale: authoring rejects reserved roles, but signed
+// ADR-0016 reserved-role rationale: authoring rejects reserved roles, but signed
 // apply accepts Moderator/Guest for legacy/cross-version convergence. They rank
 // below Admin and grant no control authority; Owner remains rejected because it
 // is admin-equivalent.

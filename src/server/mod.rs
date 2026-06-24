@@ -8978,9 +8978,9 @@ async fn apply_named_group_metadata_event_inner(
             // use GroupDeleted with a signed terminal withdrawal commit. DELETE
             // /groups/:id now emits MemberRemoved self-leave only. Apply
             // GroupDeleted by the commit signer rather than by the transport
-            // sender: `validate_apply` verifies the ML-DSA signature and that
-            // `commit.committed_by` held an Admin-or-higher role. The advisory
-            // `actor` field must name that verified signer.
+            // sender: terminal apply validation verifies the ML-DSA signature
+            // and that `commit.committed_by` held an Admin-or-higher role. The
+            // advisory `actor` field must name that verified signer.
             if actor != commit.committed_by {
                 return false;
             }
@@ -9081,7 +9081,7 @@ async fn apply_named_group_metadata_event_inner(
             if target.is_removed() || target.is_banned() {
                 return false;
             }
-            // ADR-0016 final-close rationale: the REST authoring API rejects
+            // ADR-0016 reserved-role rationale: the REST authoring API rejects
             // Owner/Moderator/Guest assignments. Signed gossip apply rejects only
             // Owner because it is admin-equivalent; Moderator/Guest rank below
             // Admin, grant no control authority, and remain replayable for

@@ -733,7 +733,7 @@ fn membership_authority_promoted_admin_bans_legacy_owner_not_last_admin() {
 
 #[test]
 fn membership_authority_signed_role_update_apply_accepts_current_and_legacy_labels() {
-    // ADR-0016 final-close rationale: the authoring API enforces reserved-role
+    // ADR-0016 reserved-role rationale: the authoring API enforces reserved-role
     // non-assignability. Signed apply still accepts validly signed Moderator/Guest
     // labels for convergence/legacy replay; both rank below Admin and grant no
     // group-control authority. Owner stays rejected because it is admin-equivalent.

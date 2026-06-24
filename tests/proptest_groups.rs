@@ -3,7 +3,7 @@
 
 use proptest::prelude::*;
 use std::collections::BTreeMap;
-use x0x::groups::state_commit::validate_apply;
+use x0x::groups::state_commit::{validate_apply, validate_apply_terminal};
 use x0x::groups::{
     card::AgentCard, compute_policy_hash, compute_public_meta_hash, compute_roster_root,
     enforce_last_admin_invariant, invite::SignedInvite, last_admin_precheck_error,
@@ -310,7 +310,10 @@ fn arb_initial_roster() -> impl Strategy<Value = Vec<RosterMemberSpec>> {
         })
 }
 
-// ADR-0016: authoring enforces reserved role assignment; signed apply accepts Moderator/Guest for legacy/cross-version convergence while Owner stays rejected as admin-equivalent.
+// ADR-0016 final-close rationale: authoring rejects reserved roles, but signed
+// apply accepts Moderator/Guest for legacy/cross-version convergence. They rank
+// below Admin and grant no control authority; Owner remains rejected because it
+// is admin-equivalent.
 fn arb_role_update() -> impl Strategy<Value = GroupRole> {
     prop_oneof![
         Just(GroupRole::Admin),
@@ -698,7 +701,11 @@ fn apply_withdrawn_flag_commit(
         members_v2: &info.members_v2,
         group_id: info.stable_group_id(),
     };
-    validate_apply(&ctx, commit, action_kind)?;
+    if !info.withdrawn && commit.withdrawn {
+        validate_apply_terminal(&ctx, commit, action_kind)?;
+    } else {
+        validate_apply(&ctx, commit, action_kind)?;
+    }
 
     let live_to_withdrawn = !info.withdrawn && commit.withdrawn;
     let mut next = info.clone();
@@ -918,7 +925,12 @@ fn apply_gossip_commit(
         members_v2: &info.members_v2,
         group_id: info.stable_group_id(),
     };
-    if validate_apply(&ctx, commit, action_kind).is_err() {
+    let validation = if terminal {
+        validate_apply_terminal(&ctx, commit, action_kind)
+    } else {
+        validate_apply(&ctx, commit, action_kind)
+    };
+    if validation.is_err() {
         return reject_without_mutation(info, before);
     }
 

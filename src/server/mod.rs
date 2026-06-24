@@ -7591,7 +7591,7 @@ where
         members_v2: &current.members_v2,
         group_id: current.stable_group_id(),
     };
-    x0x::groups::state_commit::validate_apply(&ctx, commit, action_kind)?;
+    x0x::groups::state_commit::validate_apply_terminal(&ctx, commit, action_kind)?;
     let mut next = current.clone();
     mutate(&mut next);
     next.finalize_applied_terminal_commit(commit)?;
@@ -9081,10 +9081,11 @@ async fn apply_named_group_metadata_event_inner(
             if target.is_removed() || target.is_banned() {
                 return false;
             }
-            // ADR-0016 enforces reserved-role assignment at authoring: the REST API rejects
-            // Owner/Moderator/Guest. On signed gossip apply, reject only Owner because it is
-            // admin-equivalent; Moderator/Guest are below Admin, grant no admin authority, and
-            // must still replay from validly signed legacy/cross-version commits for convergence.
+            // ADR-0016 final-close rationale: the REST authoring API rejects
+            // Owner/Moderator/Guest assignments. Signed gossip apply rejects only
+            // Owner because it is admin-equivalent; Moderator/Guest rank below
+            // Admin, grant no control authority, and remain replayable for
+            // validly signed legacy/cross-version convergence.
             if role == x0x::groups::GroupRole::Owner {
                 return false;
             }

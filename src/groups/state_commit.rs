@@ -28,7 +28,8 @@
 //! 4. **Signature** — the event is signed by the advertised signer's
 //!    ML-DSA-65 key, and the `committed_by` field binds the actor.
 //! 5. **Withdrawal terminality** — once a group is marked withdrawn by a
-//!    higher revision, later stale events are rejected.
+//!    higher revision, later stale events are rejected; live → withdrawn
+//!    commits require explicit terminal-event validation.
 //!
 //! Relays may republish exact signed commits and cards but **cannot mint**
 //! new revisions unless they are also authorised group-state authorities.
@@ -631,9 +632,16 @@ fn validate_live_to_withdrawn_authority(
     commit: &GroupStateCommit,
     signer_role: Option<GroupRole>,
     action_kind: ActionKind,
+    allow_live_withdrawal: bool,
 ) -> Result<(), ApplyError> {
     if current_withdrawn || !commit.withdrawn {
         return Ok(());
+    }
+
+    if !allow_live_withdrawal {
+        return Err(ApplyError::Invariant(
+            "live withdrawal commit requires explicit terminal validation".to_string(),
+        ));
     }
 
     if action_kind == ActionKind::AdminOrHigher
@@ -665,17 +673,11 @@ pub struct ApplyContext<'a> {
     pub group_id: &'a str,
 }
 
-/// Validate a signed commit against the local view **before** mutating any
-/// state. Returns `Ok(())` if the caller should proceed to mutate; returns
-/// `Err` to reject (stale, chain break, unauthorized, bad signature, …).
-///
-/// This function is **read-only** with respect to `GroupInfo`. It enforces
-/// all the checks required by `docs/design/named-groups-full-model.md`
-/// §"Apply-side validation".
-pub fn validate_apply(
+fn validate_apply_with_terminal_mode(
     ctx: &ApplyContext<'_>,
     commit: &GroupStateCommit,
     action_kind: ActionKind,
+    allow_live_withdrawal: bool,
 ) -> Result<(), ApplyError> {
     // 1. group_id match
     if commit.group_id != ctx.group_id {
@@ -720,7 +722,13 @@ pub fn validate_apply(
     // A live -> withdrawn transition is a terminal admin act. Already-withdrawn
     // carry-forward commits are intentionally left to the ordinary action-kind
     // authority below; un-withdrawal was rejected by the terminality check above.
-    validate_live_to_withdrawn_authority(ctx.current_withdrawn, commit, signer_role, action_kind)?;
+    validate_live_to_withdrawn_authority(
+        ctx.current_withdrawn,
+        commit,
+        signer_role,
+        action_kind,
+        allow_live_withdrawal,
+    )?;
 
     let authorized = match action_kind {
         ActionKind::AdminOrHigher => signer_role
@@ -737,6 +745,46 @@ pub fn validate_apply(
     }
 
     Ok(())
+}
+
+/// Validate a signed non-terminal commit against the local view **before**
+/// mutating any state. Returns `Ok(())` if the caller should proceed to mutate;
+/// returns `Err` to reject (stale, chain break, unauthorized, bad signature, …).
+///
+/// This default validator intentionally rejects live → withdrawn commits. Use
+/// [`validate_apply_terminal`] only when the caller is applying an explicit
+/// terminal event (currently `GroupDeleted`) and will perform terminal
+/// finalization/key wiping as one atomic act.
+///
+/// This function is **read-only** with respect to `GroupInfo`. It enforces
+/// all the checks required by `docs/design/named-groups-full-model.md`
+/// §"Apply-side validation".
+pub fn validate_apply(
+    ctx: &ApplyContext<'_>,
+    commit: &GroupStateCommit,
+    action_kind: ActionKind,
+) -> Result<(), ApplyError> {
+    validate_apply_with_terminal_mode(ctx, commit, action_kind, false)
+}
+
+/// Validate a signed commit carried by an explicit terminal metadata event.
+///
+/// This is the only validation entry point that permits a live → withdrawn
+/// transition, and it rejects non-withdrawn commits outright. The commit signer
+/// must still satisfy `AdminOrHigher` authority; the explicit context only
+/// distinguishes a real terminal `GroupDeleted` path from an arbitrary raw
+/// caller or non-terminal metadata event carrying `withdrawn = true`.
+pub fn validate_apply_terminal(
+    ctx: &ApplyContext<'_>,
+    commit: &GroupStateCommit,
+    action_kind: ActionKind,
+) -> Result<(), ApplyError> {
+    if !commit.withdrawn {
+        return Err(ApplyError::Invariant(
+            "terminal validation requires withdrawn commit".to_string(),
+        ));
+    }
+    validate_apply_with_terminal_mode(ctx, commit, action_kind, true)
 }
 
 // ─────────────────────────────── Tests ──────────────────────────────────
@@ -1410,6 +1458,121 @@ mod tests {
             group_id: "g1",
         };
         validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap();
+    }
+
+    #[test]
+    fn validate_apply_rejects_live_withdrawal_without_terminal_context() {
+        let kp = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(kp.agent_id().as_bytes());
+        let mut members = BTreeMap::new();
+        members.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Admin),
+        );
+
+        let commit = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            true,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: &members,
+            group_id: "g1",
+        };
+
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Invariant(ref msg) if msg == "live withdrawal commit requires explicit terminal validation"),
+            "raw validate_apply must not authorize live withdrawal: {err}"
+        );
+
+        validate_apply_terminal(&ctx, &commit, ActionKind::AdminOrHigher).unwrap();
+    }
+
+    #[test]
+    fn validate_apply_terminal_rejects_non_admin_withdrawal() {
+        let kp = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(kp.agent_id().as_bytes());
+        let admin_hex = "ff".repeat(32);
+        let mut members = BTreeMap::new();
+        members.insert(admin_hex.clone(), make_member(&admin_hex, GroupRole::Admin));
+        members.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Member),
+        );
+
+        let commit = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            true,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: &members,
+            group_id: "g1",
+        };
+
+        let err = validate_apply_terminal(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
+        assert!(matches!(err, ApplyError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn validate_apply_terminal_rejects_non_withdrawn_commit() {
+        let kp = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(kp.agent_id().as_bytes());
+        let mut members = BTreeMap::new();
+        members.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Admin),
+        );
+
+        let commit = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            false,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: &members,
+            group_id: "g1",
+        };
+
+        let err = validate_apply_terminal(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Invariant(ref msg) if msg == "terminal validation requires withdrawn commit"),
+            "terminal validator must accept only withdrawn commits: {err}"
+        );
     }
 
     #[test]

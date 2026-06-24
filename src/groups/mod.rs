@@ -580,7 +580,9 @@ impl GroupInfo {
     /// Mark the group as withdrawn and seal the terminal higher-revision
     /// commit. A withdrawn group is superseded immediately for public
     /// discovery purposes — peers holding stale public cards must drop them
-    /// on receipt of this commit regardless of TTL.
+    /// on receipt of this commit regardless of TTL. Successful withdrawal also
+    /// clears local GSS key material; `GroupDeleted` carries the signed commit,
+    /// not encrypted group content.
     ///
     /// Withdrawal is admin-authored; authorization is checked before the local
     /// state is marked withdrawn so rejected calls leave the group untouched.
@@ -600,7 +602,10 @@ impl GroupInfo {
         let original = self.clone();
         self.withdrawn = true;
         match self.seal_commit(keypair, now_ms) {
-            Ok(commit) => Ok(commit),
+            Ok(commit) => {
+                self.shared_secret = None;
+                Ok(commit)
+            }
             Err(err) => {
                 *self = original;
                 Err(err)
@@ -698,7 +703,7 @@ impl GroupInfo {
     /// Finalize an explicitly terminal, already-authorized withdrawal commit.
     ///
     /// This is the terminal counterpart to [`GroupInfo::finalize_applied_commit`]:
-    /// callers must first run [`state_commit::validate_apply`] with the
+    /// callers must first run [`state_commit::validate_apply_terminal`] from the
     /// appropriate terminal event context (currently server `GroupDeleted`) and
     /// mirror any terminal metadata fields into `self`. On a live -> withdrawn
     /// transition this method clears GSS key material before retaining the
@@ -1237,6 +1242,33 @@ mod tests {
             "failed withdrawal authorization must leave local group state untouched"
         );
         assert!(!info.withdrawn);
+    }
+
+    #[test]
+    fn seal_withdrawal_success_clears_shared_secret() {
+        let admin = crate::identity::AgentKeypair::generate().unwrap();
+        let mut info = GroupInfo::with_policy(
+            "Test".into(),
+            String::new(),
+            admin.agent_id(),
+            "aabb".repeat(8),
+            GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        assert!(
+            info.shared_secret.is_some(),
+            "secure group starts with GSS key material"
+        );
+
+        let commit = info.seal_withdrawal(&admin, 1_000).unwrap();
+
+        assert!(commit.withdrawn);
+        assert!(info.withdrawn);
+        assert_eq!(info.state_hash, commit.state_hash);
+        assert!(
+            info.shared_secret.is_none(),
+            "successful withdrawal must leave the terminal GroupInfo keyless"
+        );
+        assert!(info.secure_message_key().is_none());
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! and clone-first authoring shape; the gossip-apply helper mirrors the signed
 //! state-commit validation path used by `x0xd` receivers.
 
-use x0x::groups::state_commit::validate_apply;
+use x0x::groups::state_commit::{validate_apply, validate_apply_terminal};
 use x0x::groups::{
     compute_policy_hash, compute_public_meta_hash, compute_roster_root, last_admin_precheck_error,
     last_admin_self_leave_precheck_error, ActionKind, ApplyContext, ApplyError, GroupInfo,
@@ -264,7 +264,7 @@ fn apply_group_deleted_event(
         members_v2: &replica.members_v2,
         group_id: replica.stable_group_id(),
     };
-    validate_apply(&ctx, commit, ActionKind::AdminOrHigher)
+    validate_apply_terminal(&ctx, commit, ActionKind::AdminOrHigher)
         .map_err(GroupDeletedEventApplyError::Commit)?;
     let mut next = replica.clone();
     next.roster_revision = revision.max(next.roster_revision);
@@ -618,8 +618,8 @@ fn membership_authority_non_admin_self_leave_with_withdrawn_true_rejected_at_app
 
     assert!(matches!(
         err,
-        ApplyError::Unauthorized { action, .. }
-            if action == ActionKind::AdminOrHigher.name()
+        ApplyError::Invariant(ref msg)
+            if msg == "live withdrawal commit requires explicit terminal validation"
     ));
 }
 
@@ -733,7 +733,10 @@ fn membership_authority_promoted_admin_bans_legacy_owner_not_last_admin() {
 
 #[test]
 fn membership_authority_signed_role_update_apply_accepts_current_and_legacy_labels() {
-    // ADR-0016: authoring enforces reserved role assignment; signed apply accepts Moderator/Guest for legacy/cross-version convergence while Owner stays rejected as admin-equivalent.
+    // ADR-0016 final-close rationale: the authoring API enforces reserved-role
+    // non-assignability. Signed apply still accepts validly signed Moderator/Guest
+    // labels for convergence/legacy replay; both rank below Admin and grant no
+    // group-control authority. Owner stays rejected because it is admin-equivalent.
     assert_signed_role_update_applies(GroupRole::Admin);
     assert_signed_role_update_applies(GroupRole::Member);
     assert_signed_role_update_applies(GroupRole::Moderator);

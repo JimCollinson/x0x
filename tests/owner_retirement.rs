@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use x0x::groups::state_commit::{compute_roster_root, validate_apply};
+use x0x::groups::state_commit::{compute_roster_root, validate_apply, validate_apply_terminal};
 use x0x::groups::{
     ActionKind, ApplyContext, ApplyError, GroupInfo, GroupMember, GroupPolicyPreset, GroupRole,
     GroupStateCommit,
@@ -145,7 +145,7 @@ fn gossip_apply_terminal(
         members_v2: &replica.members_v2,
         group_id: replica.stable_group_id(),
     };
-    validate_apply(&ctx, commit, action_kind)?;
+    validate_apply_terminal(&ctx, commit, action_kind)?;
     let mut next = replica.clone();
     mutate(&mut next);
     next.finalize_applied_terminal_commit(commit)?;

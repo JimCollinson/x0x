@@ -18,7 +18,7 @@
 //! 4. Withdrawal (group-ending) commits are exempt — the last admin's
 //!    exit valve stays open.
 
-use x0x::groups::state_commit::validate_apply;
+use x0x::groups::state_commit::{validate_apply, validate_apply_terminal};
 use x0x::groups::{
     compute_policy_hash, compute_public_meta_hash, compute_roster_root, ActionKind, ApplyContext,
     ApplyError, GroupInfo, GroupPolicyPreset, GroupRole, GroupStateCommit,
@@ -113,7 +113,7 @@ fn gossip_apply_terminal(
         members_v2: &replica.members_v2,
         group_id: replica.stable_group_id(),
     };
-    validate_apply(&ctx, commit, action_kind)?;
+    validate_apply_terminal(&ctx, commit, action_kind)?;
     let mut next = replica.clone();
     mutate(&mut next);
     next.finalize_applied_terminal_commit(commit)?;

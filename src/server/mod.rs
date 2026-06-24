@@ -6155,6 +6155,35 @@ fn withdrawn_group_allows_metadata_event(event: &NamedGroupMetadataEvent) -> boo
     )
 }
 
+fn named_group_metadata_event_commit(
+    event: &NamedGroupMetadataEvent,
+) -> Option<&x0x::groups::GroupStateCommit> {
+    match event {
+        NamedGroupMetadataEvent::MemberAdded { commit, .. }
+        | NamedGroupMetadataEvent::MemberRemoved { commit, .. }
+        | NamedGroupMetadataEvent::GroupDeleted { commit, .. }
+        | NamedGroupMetadataEvent::PolicyUpdated { commit, .. }
+        | NamedGroupMetadataEvent::MemberRoleUpdated { commit, .. }
+        | NamedGroupMetadataEvent::MemberBanned { commit, .. }
+        | NamedGroupMetadataEvent::MemberUnbanned { commit, .. }
+        | NamedGroupMetadataEvent::JoinRequestCreated { commit, .. }
+        | NamedGroupMetadataEvent::JoinRequestApproved { commit, .. }
+        | NamedGroupMetadataEvent::JoinRequestRejected { commit, .. }
+        | NamedGroupMetadataEvent::JoinRequestCancelled { commit, .. }
+        | NamedGroupMetadataEvent::GroupMetadataUpdated { commit, .. } => commit.as_ref(),
+        NamedGroupMetadataEvent::GroupCardPublished { .. }
+        | NamedGroupMetadataEvent::MemberJoined { .. }
+        | NamedGroupMetadataEvent::SecureShareDelivered { .. } => None,
+    }
+}
+
+fn live_group_allows_metadata_withdrawal_commit(event: &NamedGroupMetadataEvent) -> bool {
+    match named_group_metadata_event_commit(event) {
+        Some(commit) if commit.withdrawn => withdrawn_group_allows_metadata_event(event),
+        _ => true,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WelcomeBlobMessage {
@@ -8507,6 +8536,17 @@ async fn apply_named_group_metadata_event_inner(
             target: "treekem.trace",
             stage = "apply_metadata_event_reject",
             reason = "withdrawn_group",
+            event = event_kind,
+            group_id = %resolved_group_key,
+            sender = %sender_hex,
+        );
+        return false;
+    }
+    if !info.withdrawn && !live_group_allows_metadata_withdrawal_commit(&event) {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "apply_metadata_event_reject",
+            reason = "withdrawn_commit_requires_group_deleted",
             event = event_kind,
             group_id = %resolved_group_key,
             sender = %sender_hex,
@@ -21566,6 +21606,196 @@ mod tests {
             .write()
             .await
             .insert(group_id.to_string(), info);
+    }
+
+    fn metadata_terminality_test_group(
+        state: &Arc<AppState>,
+        group_id: &str,
+    ) -> (x0x::groups::GroupInfo, String, String) {
+        let admin_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let member_hex = "22".repeat(32);
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "metadata terminality".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        info.shared_secret = Some(vec![9; 32]);
+        info.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.recompute_state_hash();
+        (info, admin_hex, member_hex)
+    }
+
+    fn sign_metadata_terminality_commit(
+        parent: &x0x::groups::GroupInfo,
+        scratch: &x0x::groups::GroupInfo,
+        state: &Arc<AppState>,
+        now_ms: u64,
+    ) -> x0x::groups::GroupStateCommit {
+        x0x::groups::GroupStateCommit::sign(
+            parent.stable_group_id().to_string(),
+            parent.state_revision.saturating_add(1),
+            Some(parent.state_hash.clone()),
+            x0x::groups::compute_roster_root(&scratch.members_v2),
+            x0x::groups::compute_policy_hash(&scratch.policy),
+            x0x::groups::compute_public_meta_hash(&scratch.public_meta()),
+            scratch.security_binding.clone(),
+            scratch.withdrawn,
+            now_ms,
+            state.agent.identity().agent_keypair(),
+        )
+        .expect("signed terminality commit")
+    }
+
+    async fn install_metadata_terminality_group(
+        state: &Arc<AppState>,
+        group_id: &str,
+    ) -> (String, String) {
+        let (info, admin_hex, member_hex) = metadata_terminality_test_group(state, group_id);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), info);
+        (admin_hex, member_hex)
+    }
+
+    #[tokio::test]
+    async fn metadata_member_removed_withdrawn_commit_rejected_for_live_group() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "metadata-member-removed-terminality";
+        let (admin_hex, member_hex) = install_metadata_terminality_group(&state, group_id).await;
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+        let mut scratch = parent.clone();
+        scratch.remove_member(&member_hex, Some(admin_hex.clone()));
+        scratch.withdrawn = true;
+        let commit = sign_metadata_terminality_commit(&parent, &scratch, &state, 1_000);
+        assert!(commit.withdrawn);
+
+        let event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: parent.stable_group_id().to_string(),
+            revision: 1,
+            actor: admin_hex.clone(),
+            agent_id: member_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            commit: Some(commit),
+        };
+
+        let applied = apply_named_group_metadata_event_inner(
+            &state,
+            event,
+            state.agent.agent_id(),
+            true,
+            true,
+        )
+        .await;
+        assert!(!applied, "non-GroupDeleted withdrawal commit must reject");
+        let groups = state.named_groups.read().await;
+        let stored = groups.get(group_id).expect("group retained");
+        assert!(!stored.withdrawn);
+        assert!(stored.has_active_member(&member_hex));
+        assert_eq!(stored.shared_secret, Some(vec![9; 32]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_role_update_withdrawn_commit_rejected_for_live_group() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "metadata-role-update-terminality";
+        let (admin_hex, member_hex) = install_metadata_terminality_group(&state, group_id).await;
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+        let mut scratch = parent.clone();
+        scratch.set_member_role(&member_hex, x0x::groups::GroupRole::Admin);
+        scratch.withdrawn = true;
+        let commit = sign_metadata_terminality_commit(&parent, &scratch, &state, 1_000);
+        assert!(commit.withdrawn);
+
+        let event = NamedGroupMetadataEvent::MemberRoleUpdated {
+            group_id: parent.stable_group_id().to_string(),
+            revision: 1,
+            actor: admin_hex.clone(),
+            agent_id: member_hex.clone(),
+            role: x0x::groups::GroupRole::Admin,
+            commit: Some(commit),
+        };
+
+        let applied = apply_named_group_metadata_event_inner(
+            &state,
+            event,
+            state.agent.agent_id(),
+            true,
+            true,
+        )
+        .await;
+        assert!(!applied, "only GroupDeleted may terminalize a live group");
+        let groups = state.named_groups.read().await;
+        let stored = groups.get(group_id).expect("group retained");
+        assert!(!stored.withdrawn);
+        assert_eq!(
+            stored.members_v2[&member_hex].role,
+            x0x::groups::GroupRole::Member
+        );
+        assert_eq!(stored.shared_secret, Some(vec![9; 32]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_group_deleted_withdraws_and_wipes_key_material() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "metadata-group-deleted-terminality";
+        let (admin_hex, _member_hex) = install_metadata_terminality_group(&state, group_id).await;
+        let parent = state
+            .named_groups
+            .read()
+            .await
+            .get(group_id)
+            .expect("group installed")
+            .clone();
+        let mut scratch = parent.clone();
+        scratch.withdrawn = true;
+        let commit = sign_metadata_terminality_commit(&parent, &scratch, &state, 1_000);
+        assert!(commit.withdrawn);
+
+        let event = NamedGroupMetadataEvent::GroupDeleted {
+            group_id: parent.stable_group_id().to_string(),
+            revision: 1,
+            actor: admin_hex,
+            commit: Some(commit),
+        };
+
+        let applied = apply_named_group_metadata_event_inner(
+            &state,
+            event,
+            state.agent.agent_id(),
+            true,
+            true,
+        )
+        .await;
+        assert!(applied, "GroupDeleted is the terminal withdrawal path");
+        let groups = state.named_groups.read().await;
+        let stored = groups.get(group_id).expect("terminal tombstone retained");
+        assert!(stored.withdrawn);
+        assert_eq!(stored.shared_secret, None);
+        Ok(())
     }
 
     fn assert_lost_race_conflict_drops_fields(

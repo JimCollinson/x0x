@@ -580,14 +580,30 @@ impl GroupInfo {
     /// discovery purposes — peers holding stale public cards must drop them
     /// on receipt of this commit regardless of TTL.
     ///
-    /// Withdrawal is admin-authored; callers must check role before calling.
+    /// Withdrawal is admin-authored; authorization is checked before the local
+    /// state is marked withdrawn so rejected calls leave the group untouched.
     pub fn seal_withdrawal(
         &mut self,
         keypair: &AgentKeypair,
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        if !state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex) {
+            return Err(state_commit::ApplyError::Unauthorized {
+                signer: signer_hex,
+                action: state_commit::ActionKind::AdminOrHigher.name(),
+            });
+        }
+
+        let original = self.clone();
         self.withdrawn = true;
-        self.seal_commit(keypair, now_ms)
+        match self.seal_commit(keypair, now_ms) {
+            Ok(commit) => Ok(commit),
+            Err(err) => {
+                *self = original;
+                Err(err)
+            }
+        }
     }
 
     /// Accept a peer-authored signed commit on the apply-side.
@@ -1146,6 +1162,30 @@ mod tests {
                 .contains_key(&hex::encode([2u8; 32])),
             "newly added member must appear in the latest retained projection"
         );
+    }
+
+    #[test]
+    fn seal_withdrawal_rejects_non_admin_without_mutating_local_state() {
+        let admin = crate::identity::AgentKeypair::generate().unwrap();
+        let outsider = crate::identity::AgentKeypair::generate().unwrap();
+        let mut info = GroupInfo::with_policy(
+            "Test".into(),
+            String::new(),
+            admin.agent_id(),
+            "aabb".repeat(8),
+            GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        let before = serde_json::to_string(&info).expect("snapshot serializes");
+
+        let err = info.seal_withdrawal(&outsider, 1_000).unwrap_err();
+
+        assert!(matches!(err, state_commit::ApplyError::Unauthorized { .. }));
+        assert_eq!(
+            serde_json::to_string(&info).expect("snapshot serializes"),
+            before,
+            "failed withdrawal authorization must leave local group state untouched"
+        );
+        assert!(!info.withdrawn);
     }
 
     #[test]

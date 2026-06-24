@@ -182,6 +182,28 @@ enum LastAdminActionKind {
     Withdraw,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataEventKind {
+    MemberAdded,
+    MemberRemoved,
+    GroupDeleted,
+    PolicyUpdated,
+    MemberRoleUpdated,
+    MemberBanned,
+    MemberUnbanned,
+    JoinRequestCreated,
+    JoinRequestApproved,
+    JoinRequestRejected,
+    JoinRequestCancelled,
+    GroupMetadataUpdated,
+}
+
+impl MetadataEventKind {
+    fn allows_live_withdrawal(self) -> bool {
+        matches!(self, Self::GroupDeleted)
+    }
+}
+
 impl LastAdminAction {
     fn kind(&self) -> LastAdminActionKind {
         match self {
@@ -370,6 +392,23 @@ fn arb_action_kind() -> impl Strategy<Value = ActionKind> {
         Just(ActionKind::AdminOrHigher),
         Just(ActionKind::MemberSelf),
         Just(ActionKind::NonMemberRequest),
+    ]
+}
+
+fn arb_metadata_event_kind() -> impl Strategy<Value = MetadataEventKind> {
+    prop_oneof![
+        Just(MetadataEventKind::MemberAdded),
+        Just(MetadataEventKind::MemberRemoved),
+        Just(MetadataEventKind::GroupDeleted),
+        Just(MetadataEventKind::PolicyUpdated),
+        Just(MetadataEventKind::MemberRoleUpdated),
+        Just(MetadataEventKind::MemberBanned),
+        Just(MetadataEventKind::MemberUnbanned),
+        Just(MetadataEventKind::JoinRequestCreated),
+        Just(MetadataEventKind::JoinRequestApproved),
+        Just(MetadataEventKind::JoinRequestRejected),
+        Just(MetadataEventKind::JoinRequestCancelled),
+        Just(MetadataEventKind::GroupMetadataUpdated),
     ]
 }
 
@@ -607,12 +646,15 @@ fn expected_withdrawn_apply_authorized(
     commit_withdrawn: bool,
     signer_spec: Option<&RosterMemberSpec>,
     action_kind: ActionKind,
+    event_kind: MetadataEventKind,
 ) -> bool {
     if current_withdrawn && !commit_withdrawn {
         return false;
     }
     if !current_withdrawn && commit_withdrawn {
-        return action_kind == ActionKind::AdminOrHigher && signer_is_active_admin(signer_spec);
+        return event_kind.allows_live_withdrawal()
+            && action_kind == ActionKind::AdminOrHigher
+            && signer_is_active_admin(signer_spec);
     }
     normal_action_authorized_by_spec(signer_spec, action_kind)
 }
@@ -641,7 +683,14 @@ fn apply_withdrawn_flag_commit(
     info: &mut GroupInfo,
     commit: &GroupStateCommit,
     action_kind: ActionKind,
+    event_kind: MetadataEventKind,
 ) -> Result<(), ApplyError> {
+    if !info.withdrawn && commit.withdrawn && !event_kind.allows_live_withdrawal() {
+        return Err(ApplyError::Invariant(
+            "live withdrawal commit must be carried by GroupDeleted".to_string(),
+        ));
+    }
+
     let ctx = ApplyContext {
         current_state_hash: &info.state_hash,
         current_revision: info.state_revision,
@@ -816,8 +865,16 @@ fn apply_rest_action(
                 return reject_without_mutation(info, &before);
             }
             let mut next = info.clone();
-            next.withdrawn = true;
-            seal_rest_state(info, next, &keypairs[*actor], now_ms, &before)
+            match next.seal_withdrawal(&keypairs[*actor], now_ms) {
+                Ok(commit) => {
+                    commit.verify_structure().unwrap();
+                    assert!(next.withdrawn);
+                    assert_ne!(state_snapshot(&next), before);
+                    *info = next;
+                    SequenceOutcome::Accepted
+                }
+                Err(_) => reject_without_mutation(info, &before),
+            }
         }
     }
 }
@@ -1182,6 +1239,7 @@ proptest! {
     fn withdrawal_flag_authority_matches_transition_oracle(
         signer_spec in arb_optional_signer_spec(),
         action_kind in arb_action_kind(),
+        event_kind in arb_metadata_event_kind(),
         current_withdrawn in any::<bool>(),
         commit_withdrawn in any::<bool>(),
     ) {
@@ -1201,12 +1259,13 @@ proptest! {
         )
         .expect("sign withdrawal flag commit");
 
-        let result = apply_withdrawn_flag_commit(&mut apply_group, &commit, action_kind);
+        let result = apply_withdrawn_flag_commit(&mut apply_group, &commit, action_kind, event_kind);
         let expected_ok = expected_withdrawn_apply_authorized(
             current_withdrawn,
             commit_withdrawn,
             signer_spec.as_ref(),
             action_kind,
+            event_kind,
         );
         prop_assert_eq!(result.is_ok(), expected_ok);
         if expected_ok {
@@ -1217,12 +1276,16 @@ proptest! {
                 prop_assert!(matches!(result, Err(ApplyError::Withdrawn)));
             }
             if !current_withdrawn && commit_withdrawn {
-                let rejected_by_withdrawal_authority = matches!(
-                    result,
-                    Err(ApplyError::Unauthorized { action, .. })
-                        if action == ActionKind::AdminOrHigher.name()
-                );
-                prop_assert!(rejected_by_withdrawal_authority);
+                if event_kind.allows_live_withdrawal() {
+                    let rejected_by_withdrawal_authority = matches!(
+                        result,
+                        Err(ApplyError::Unauthorized { action, .. })
+                            if action == ActionKind::AdminOrHigher.name()
+                    );
+                    prop_assert!(rejected_by_withdrawal_authority);
+                } else {
+                    prop_assert!(matches!(result, Err(ApplyError::Invariant(_))));
+                }
             }
         }
 
@@ -1231,16 +1294,17 @@ proptest! {
             signer_spec.as_ref(),
             current_withdrawn,
         );
-        seal_group.withdrawn = true;
+        let before_snapshot = state_snapshot(&seal_group);
         let before_revision = seal_group.state_revision;
         let before_state_hash = seal_group.state_hash.clone();
-        let seal_result = seal_group.seal_commit(signer, 12_000);
+        let seal_result = seal_group.seal_withdrawal(signer, 12_000);
         let expected_seal_ok = signer_is_active_admin(signer_spec.as_ref());
         prop_assert_eq!(seal_result.is_ok(), expected_seal_ok);
         if let Ok(commit) = seal_result {
             prop_assert!(commit.withdrawn);
             prop_assert!(seal_group.withdrawn);
         } else {
+            prop_assert_eq!(state_snapshot(&seal_group), before_snapshot);
             prop_assert_eq!(seal_group.state_revision, before_revision);
             prop_assert_eq!(seal_group.state_hash, before_state_hash);
         }

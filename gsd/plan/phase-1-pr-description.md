@@ -15,3 +15,9 @@ Role assignment accepts exactly `admin` and `member`. The **role-assignment REST
 - **Apply must accept validly-signed peer commits** — including from older/legacy daemons — or replicas diverge and the group forks across versions. Role-vocabulary restrictions therefore belong at the point of *assignment* (authoring), not *receipt* (apply); enforcing them on apply would break byte-for-byte legacy replay and fork live state, for no security gain.
 
 This matches the "Admin is root" model: a non-admin label carries no authority. The membership tests assert this accept-on-apply behaviour intentionally.
+
+### Delete/terminal withdrawal is admin-only at the authority choke-point
+
+`x0x group delete` / `POST /groups/:id/state/withdraw` is the explicit group-ending action. It is admin-only both at the REST authoring path and at signed-commit apply: a commit that transitions a live group to `withdrawn=true` is rejected unless it is Admin-authorized (`ActionKind::AdminOrHigher` with an active Admin or legacy Owner signer). A non-admin self-leave — or any other non-admin action — carrying `withdrawn=true` is rejected at the state-commit authority choke-point, so an ordinary member cannot terminally withdraw/delete the group by smuggling the withdrawal flag through `MemberRemoved`.
+
+This is validation-only: no wire, hash, signing, role serialization, storage, or dependency shape changes. Already-withdrawn state remains terminal (un-withdrawing is rejected), and legacy Owner/Admin-authored withdrawal chains still replay because legacy `Owner` remains Admin-equivalent.

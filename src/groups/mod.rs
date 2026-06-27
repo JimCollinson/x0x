@@ -50,9 +50,10 @@ pub use self::public_message::{
 pub use self::request::{JoinRequest, JoinRequestStatus};
 pub use self::state_commit::{
     compute_policy_hash, compute_public_meta_hash, compute_roster_root, compute_state_hash,
-    roster_projection, roster_root_of_projection, ActionKind, ApplyContext, ApplyError,
-    GroupGenesis, GroupPublicMeta, GroupStateCommit, RetainedCommit, RosterMemberSnapshot,
-    CARD_SIGNATURE_DOMAIN, DEFAULT_CARD_TTL_SECS, EVENT_SIGNATURE_DOMAIN, STATE_COMMIT_DOMAIN,
+    enforce_last_admin_invariant, roster_projection, roster_root_of_projection, ActionKind,
+    ApplyContext, ApplyError, GroupGenesis, GroupPublicMeta, GroupStateCommit, RetainedCommit,
+    RosterMemberSnapshot, CARD_SIGNATURE_DOMAIN, DEFAULT_CARD_TTL_SECS, EVENT_SIGNATURE_DOMAIN,
+    STATE_COMMIT_DOMAIN,
 };
 
 fn now_millis() -> u64 {
@@ -202,11 +203,13 @@ pub struct GroupInfo {
     /// effected, so "what did the signed roster say at revision N" is
     /// answerable and independently verifiable long after the fact — the
     /// head-only chain fields above cannot do this. Appended by
-    /// [`GroupInfo::seal_commit`] (local authorship) and
-    /// [`GroupInfo::finalize_applied_commit`] (peer commits); it therefore
-    /// captures every commit this daemon applied, from either path, with no
-    /// per-call-site wiring. Bounded by [`COMMIT_LOG_CAP`]: past the cap the
-    /// oldest entries are dropped and the loss is logged (never silent).
+    /// [`GroupInfo::seal_commit`] (local authorship),
+    /// [`GroupInfo::finalize_applied_commit`] (peer non-terminal commits), and
+    /// [`GroupInfo::finalize_applied_terminal_commit`] (peer terminal commits);
+    /// it therefore captures every commit this daemon applied, from either
+    /// path, with no per-call-site wiring. Bounded by [`COMMIT_LOG_CAP`]: past
+    /// the cap the oldest entries are dropped and the loss is logged (never
+    /// silent).
     /// History begins at the first retaining release and each daemon retains
     /// only the suffix it witnessed.
     #[serde(default)]
@@ -242,6 +245,55 @@ fn secure_plane_legacy_default() -> SecureGroupPlane {
 /// (checkpoint-and-truncate is deferred — see issue #111); the drop is logged
 /// so history loss can never be silent.
 pub const COMMIT_LOG_CAP: usize = 4096;
+
+/// Exact ADR-0016 §3 REST error string for acts that would leave a live
+/// group with zero active admins. Fixed verbatim by the Phase 1 spec.
+pub const LAST_ADMIN_PRECHECK_ERROR: &str =
+    "a group must always have at least one admin; make another member an admin first";
+
+/// Exact ADR-0016 §3 REST error string for last-admin self-leave attempts.
+/// Fixed verbatim by the Phase 1 spec.
+pub const LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR: &str =
+    "a group must always have at least one admin; make another member an admin before leaving";
+
+/// Return the ADR-0016 last-admin REST pre-check error for a proposed
+/// post-mutation group state.
+///
+/// Callers provide the same mutation they are about to author/apply; this
+/// helper runs it on a clone and maps the shared invariant to the exact §3
+/// user-facing string. It is a UX pre-check only — the authoritative guard
+/// remains [`state_commit::enforce_last_admin_invariant`] at the commit
+/// authoring/apply choke-points.
+#[must_use]
+pub fn last_admin_precheck_error(
+    info: &GroupInfo,
+    apply: impl FnOnce(&mut GroupInfo),
+) -> Option<&'static str> {
+    let mut proposed = info.clone();
+    apply(&mut proposed);
+    state_commit::enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn)
+        .err()
+        .map(|_| LAST_ADMIN_PRECHECK_ERROR)
+}
+
+/// Return the ADR-0016 last-admin REST pre-check error for a proposed
+/// self-leave by `leaver_hex`.
+///
+/// This is the self-leave variant of [`last_admin_precheck_error`], with the
+/// separate §3 user-facing recovery hint. It deliberately evaluates the removal
+/// on a clone so rejected leaves cannot mutate live group state before the
+/// authoritative commit-time invariant rejects them.
+#[must_use]
+pub fn last_admin_self_leave_precheck_error(
+    info: &GroupInfo,
+    leaver_hex: &str,
+) -> Option<&'static str> {
+    let mut proposed = info.clone();
+    proposed.remove_member(leaver_hex, None);
+    state_commit::enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn)
+        .err()
+        .map(|_| LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
+}
 
 impl GroupInfo {
     /// Create a new `GroupInfo` with the given policy (defaults to `private_secure`).
@@ -287,7 +339,7 @@ impl GroupInfo {
         let mut members_v2 = BTreeMap::new();
         members_v2.insert(
             creator_hex.clone(),
-            GroupMember::new_owner(creator_hex.clone(), None, now),
+            GroupMember::new_admin(creator_hex.clone(), None, now),
         );
 
         // Generate a fresh shared secret for MlsEncrypted groups. SignedPublic
@@ -442,6 +494,20 @@ impl GroupInfo {
         keypair: &AgentKeypair,
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
+        // ADR-0016 R2: never author a commit whose post-mutation,
+        // non-withdrawn state has zero active admins. `self` already holds
+        // the caller's domain mutations, so this evaluates the proposed
+        // post-mutation roster before any chain field is touched.
+        state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
+        if self.withdrawn {
+            let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+            if !state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex) {
+                return Err(state_commit::ApplyError::Unauthorized {
+                    signer: signer_hex,
+                    action: state_commit::ActionKind::AdminOrHigher.name(),
+                });
+            }
+        }
         // Ensure the genesis record is present — callers may reach here via
         // migrated paths that didn't set it yet.
         if self.genesis.is_none() {
@@ -514,27 +580,51 @@ impl GroupInfo {
     /// Mark the group as withdrawn and seal the terminal higher-revision
     /// commit. A withdrawn group is superseded immediately for public
     /// discovery purposes — peers holding stale public cards must drop them
-    /// on receipt of this commit regardless of TTL.
+    /// on receipt of this commit regardless of TTL. Successful withdrawal also
+    /// clears local GSS key material; `GroupDeleted` carries the signed commit,
+    /// not encrypted group content.
     ///
-    /// Withdrawal is owner-authored; callers must check role before calling.
+    /// Withdrawal is admin-authored; authorization is checked before the local
+    /// state is marked withdrawn so rejected calls leave the group untouched.
     pub fn seal_withdrawal(
         &mut self,
         keypair: &AgentKeypair,
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        if !state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex) {
+            return Err(state_commit::ApplyError::Unauthorized {
+                signer: signer_hex,
+                action: state_commit::ActionKind::AdminOrHigher.name(),
+            });
+        }
+
+        let original = self.clone();
         self.withdrawn = true;
-        self.seal_commit(keypair, now_ms)
+        match self.seal_commit(keypair, now_ms) {
+            Ok(commit) => {
+                self.shared_secret = None;
+                Ok(commit)
+            }
+            Err(err) => {
+                *self = original;
+                Err(err)
+            }
+        }
     }
 
-    /// Accept a peer-authored signed commit on the apply-side.
+    /// Accept a peer-authored signed non-terminal commit on the apply-side.
     ///
     /// Performs [`state_commit::validate_apply`] with the given action kind
-    /// and, on success, updates the local chain fields
-    /// (`state_revision`, `state_hash`, `prev_state_hash`, `withdrawn`) to
-    /// mirror the commit. Domain-specific mutations (roster/policy/meta)
-    /// are the caller's responsibility and must be performed **before**
-    /// calling this method, so the post-mutation recomputed hash matches
-    /// `commit.state_hash`.
+    /// and, on success, updates the local chain fields (`state_revision`,
+    /// `state_hash`, `prev_state_hash`) to mirror the commit. Domain-specific
+    /// mutations (roster/policy/meta) are the caller's responsibility and must
+    /// be performed **before** calling this method, so the post-mutation
+    /// recomputed hash matches `commit.state_hash`.
+    ///
+    /// A live -> withdrawn transition is intentionally rejected here: terminal
+    /// withdrawal must arrive through explicit terminal event handling so the
+    /// withdrawn marker and key wipe stay one atomic act.
     pub fn apply_commit(
         &mut self,
         commit: &state_commit::GroupStateCommit,
@@ -551,18 +641,22 @@ impl GroupInfo {
         self.finalize_applied_commit(commit)
     }
 
-    /// Finalize a commit **after** the caller has already performed
-    /// any action-specific pre-validation and mirrored the payload
-    /// mutation into `self`.
-    ///
-    /// This is the second half of D.4 apply-side handling: callers may
-    /// need the pre-mutation roster view to validate signer authority
-    /// (e.g. self-leave), then mutate local state, then verify the
-    /// recomputed post-mutation hash matches the signed commit.
-    pub fn finalize_applied_commit(
+    fn finalize_applied_commit_with_terminal_mode(
         &mut self,
         commit: &state_commit::GroupStateCommit,
+        allow_live_withdrawal: bool,
     ) -> Result<(), state_commit::ApplyError> {
+        if self.withdrawn && !commit.withdrawn {
+            return Err(state_commit::ApplyError::Withdrawn);
+        }
+
+        let live_to_withdrawn = !self.withdrawn && commit.withdrawn;
+        if live_to_withdrawn && !allow_live_withdrawal {
+            return Err(state_commit::ApplyError::Invariant(
+                "live withdrawal commit requires terminal finalization".to_string(),
+            ));
+        }
+
         self.state_revision = commit.revision;
         self.prev_state_hash = commit.prev_state_hash.clone();
         self.withdrawn = commit.withdrawn;
@@ -573,11 +667,58 @@ impl GroupInfo {
                 got: self.state_hash.clone(),
             });
         }
+        // ADR-0016 R2: reject any applied commit whose post-mutation,
+        // non-withdrawn state has zero active admins. Runs after the hash
+        // check so the roster being validated is provably the roster the
+        // signed commit's `roster_root` committed to.
+        state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
+        if live_to_withdrawn {
+            self.shared_secret = None;
+        }
         // issue #111: retain the peer-authored commit only after it has
-        // validated and applied cleanly (post hash-match), so rejected
-        // commits never enter the history.
+        // validated and applied cleanly (post hash-match + invariants), so
+        // rejected commits never enter the history.
         self.retain_commit(commit);
         Ok(())
+    }
+
+    /// Finalize a non-terminal commit **after** the caller has already performed
+    /// any action-specific pre-validation and mirrored the payload
+    /// mutation into `self`.
+    ///
+    /// This is the second half of D.4 apply-side handling: callers may
+    /// need the pre-mutation roster view to validate signer authority
+    /// (e.g. self-leave), then mutate local state, then verify the
+    /// recomputed post-mutation hash matches the signed commit. This default
+    /// finalizer deliberately rejects live -> withdrawn commits; use
+    /// [`GroupInfo::finalize_applied_terminal_commit`] only from explicit
+    /// terminal event handling.
+    pub fn finalize_applied_commit(
+        &mut self,
+        commit: &state_commit::GroupStateCommit,
+    ) -> Result<(), state_commit::ApplyError> {
+        self.finalize_applied_commit_with_terminal_mode(commit, false)
+    }
+
+    /// Finalize an explicitly terminal, already-authorized withdrawal commit.
+    ///
+    /// This is the terminal counterpart to [`GroupInfo::finalize_applied_commit`]:
+    /// callers must first run [`state_commit::validate_apply_terminal`] from the
+    /// appropriate terminal event context (currently server `GroupDeleted`) and
+    /// mirror any terminal metadata fields into `self`. On a live -> withdrawn
+    /// transition this method clears GSS key material before retaining the
+    /// terminal commit; the daemon's `GroupDeleted` path additionally tombstones
+    /// the record and wipes local MLS/TreeKEM material.
+    pub fn finalize_applied_terminal_commit(
+        &mut self,
+        commit: &state_commit::GroupStateCommit,
+    ) -> Result<(), state_commit::ApplyError> {
+        if !commit.withdrawn {
+            return Err(state_commit::ApplyError::Invariant(
+                "terminal finalization requires withdrawn commit".to_string(),
+            ));
+        }
+        self.finalize_applied_commit_with_terminal_mode(commit, true)
     }
 
     /// Derive the per-message AEAD key from the group's current shared secret.
@@ -622,7 +763,7 @@ impl GroupInfo {
             for id in all_ids {
                 let display_name = self.display_names.get(&id).cloned();
                 let member = if id == creator_hex {
-                    GroupMember::new_owner(id.clone(), display_name, now)
+                    GroupMember::new_admin(id.clone(), display_name, now)
                 } else {
                     GroupMember::new_member(
                         id.clone(),
@@ -924,7 +1065,7 @@ impl GroupInfo {
         self.active_members().count()
     }
 
-    /// Count of currently active Admins (including Owner).
+    /// Count of currently active Admins (including legacy Owner).
     #[must_use]
     pub fn active_admin_count(&self) -> usize {
         self.members_v2
@@ -933,7 +1074,7 @@ impl GroupInfo {
             .count()
     }
 
-    /// Owner's agent hex, if one exists.
+    /// Active legacy Owner's agent hex, if one exists.
     #[must_use]
     pub fn owner_agent_id(&self) -> Option<String> {
         self.members_v2
@@ -1021,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn test_group_info_new_seeds_owner() {
+    fn test_group_info_new_seeds_admin() {
         let info = GroupInfo::new(
             "Test Group".to_string(),
             "A test".to_string(),
@@ -1029,9 +1170,9 @@ mod tests {
             "aabb".repeat(8),
         );
         let creator_hex = hex::encode([1u8; 32]);
-        let owner = info.members_v2.get(&creator_hex).unwrap();
-        assert_eq!(owner.role, GroupRole::Owner);
-        assert!(owner.is_active());
+        let admin = info.members_v2.get(&creator_hex).unwrap();
+        assert_eq!(admin.role, GroupRole::Admin);
+        assert!(admin.is_active());
         assert_eq!(info.policy, GroupPolicy::default());
         assert_eq!(info.active_member_count(), 1);
     }
@@ -1077,6 +1218,57 @@ mod tests {
                 .contains_key(&hex::encode([2u8; 32])),
             "newly added member must appear in the latest retained projection"
         );
+    }
+
+    #[test]
+    fn seal_withdrawal_rejects_non_admin_without_mutating_local_state() {
+        let admin = crate::identity::AgentKeypair::generate().unwrap();
+        let outsider = crate::identity::AgentKeypair::generate().unwrap();
+        let mut info = GroupInfo::with_policy(
+            "Test".into(),
+            String::new(),
+            admin.agent_id(),
+            "aabb".repeat(8),
+            GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        let before = serde_json::to_string(&info).expect("snapshot serializes");
+
+        let err = info.seal_withdrawal(&outsider, 1_000).unwrap_err();
+
+        assert!(matches!(err, state_commit::ApplyError::Unauthorized { .. }));
+        assert_eq!(
+            serde_json::to_string(&info).expect("snapshot serializes"),
+            before,
+            "failed withdrawal authorization must leave local group state untouched"
+        );
+        assert!(!info.withdrawn);
+    }
+
+    #[test]
+    fn seal_withdrawal_success_clears_shared_secret() {
+        let admin = crate::identity::AgentKeypair::generate().unwrap();
+        let mut info = GroupInfo::with_policy(
+            "Test".into(),
+            String::new(),
+            admin.agent_id(),
+            "aabb".repeat(8),
+            GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        assert!(
+            info.shared_secret.is_some(),
+            "secure group starts with GSS key material"
+        );
+
+        let commit = info.seal_withdrawal(&admin, 1_000).unwrap();
+
+        assert!(commit.withdrawn);
+        assert!(info.withdrawn);
+        assert_eq!(info.state_hash, commit.state_hash);
+        assert!(
+            info.shared_secret.is_none(),
+            "successful withdrawal must leave the terminal GroupInfo keyless"
+        );
+        assert!(info.secure_message_key().is_none());
     }
 
     #[test]
@@ -1156,7 +1348,7 @@ mod tests {
         assert_eq!(info.members_v2.len(), 3);
         let creator_hex = hex::encode([1u8; 32]);
         let bob_hex = hex::encode([2u8; 32]);
-        assert_eq!(info.members_v2[&creator_hex].role, GroupRole::Owner);
+        assert_eq!(info.members_v2[&creator_hex].role, GroupRole::Admin);
         assert_eq!(info.members_v2[&bob_hex].role, GroupRole::Member);
         assert_eq!(
             info.members_v2[&bob_hex].display_name.as_deref(),
@@ -1238,7 +1430,7 @@ mod tests {
     fn test_caller_role() {
         let info = GroupInfo::new("T".into(), "".into(), agent(1), "aa".repeat(16));
         let creator_hex = hex::encode([1u8; 32]);
-        assert_eq!(info.caller_role(&creator_hex), Some(GroupRole::Owner));
+        assert_eq!(info.caller_role(&creator_hex), Some(GroupRole::Admin));
         let stranger_hex = hex::encode([9u8; 32]);
         assert_eq!(info.caller_role(&stranger_hex), None);
     }

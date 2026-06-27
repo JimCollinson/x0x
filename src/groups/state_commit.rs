@@ -24,11 +24,12 @@
 //! 2. **Prev-hash chain** — `prev_state_hash` must equal the current
 //!    `state_hash` of the local `GroupInfo`.
 //! 3. **Authority** — the signer's role at the local view must permit the
-//!    action (e.g. Owner for policy changes, Admin for member management).
+//!    action (e.g. Admin or legacy Owner for privileged group changes).
 //! 4. **Signature** — the event is signed by the advertised signer's
 //!    ML-DSA-65 key, and the `committed_by` field binds the actor.
 //! 5. **Withdrawal terminality** — once a group is marked withdrawn by a
-//!    higher revision, later stale events are rejected.
+//!    higher revision, later stale events are rejected; live → withdrawn
+//!    commits require explicit terminal-event validation.
 //!
 //! Relays may republish exact signed commits and cards but **cannot mint**
 //! new revisions unless they are also authorised group-state authorities.
@@ -526,11 +527,11 @@ pub enum ApplyError {
     #[error("invalid signature: {0}")]
     InvalidSignature(String),
 
-    /// A structural invariant was violated (e.g. owner removal, duplicate).
+    /// A structural invariant was violated (e.g. zero active admins, duplicate).
     #[error("invariant violation: {0}")]
     Invariant(String),
 
-    /// The group has been withdrawn; no further non-owner actions apply.
+    /// The group has been withdrawn; no further live-state actions apply.
     #[error("group is withdrawn")]
     Withdrawn,
 
@@ -555,10 +556,8 @@ pub enum ApplyError {
 /// apply-time against the signer's current effective role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionKind {
-    /// Owner-only: policy change, role-change-of-admin-or-above, withdrawal.
-    OwnerOnly,
-    /// Admin or higher: add/remove member, approve/reject request, ban, unban,
-    /// role-change-of-member-or-below, metadata edit.
+    /// Admin or higher: privileged group control-plane changes. Legacy Owner
+    /// entries also satisfy this through [`GroupRole::at_least`].
     AdminOrHigher,
     /// Active-member self-action (e.g. leave group).
     MemberSelf,
@@ -571,12 +570,90 @@ impl ActionKind {
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Self::OwnerOnly => "owner-only",
             Self::AdminOrHigher => "admin-or-higher",
             Self::MemberSelf => "member-self",
             Self::NonMemberRequest => "non-member-request",
         }
     }
+}
+
+/// Enforce the ADR-0016 last-admin invariant over a proposed post-mutation
+/// roster: a live (non-withdrawn) group state must always contain at least
+/// one **active** member of rank ≥ Admin. Legacy `Owner` entries count as
+/// Admin (`Owner` rank 4 > `Admin` rank 3, via [`GroupRole::at_least`]).
+/// Withdrawn (group-ending) state is exempt — it is the last admin's exit
+/// valve.
+///
+/// The commit object carries only `roster_root` (a hash of the post-mutation
+/// roster), so the invariant must be evaluated over the proposed roster
+/// computed by the applier. This one helper is the shared check for every
+/// delivery path: commit authoring (`GroupInfo::seal_commit`) and apply-side
+/// validation (`GroupInfo::finalize_applied_commit`, reached from both the
+/// daemon gossip-apply pipeline and `GroupInfo::apply_commit`).
+pub fn enforce_last_admin_invariant(
+    proposed_members: &BTreeMap<String, GroupMember>,
+    withdrawn: bool,
+) -> Result<(), ApplyError> {
+    if withdrawn {
+        return Ok(());
+    }
+    let has_active_admin = proposed_members
+        .values()
+        .any(|m| m.is_active() && m.role.at_least(GroupRole::Admin));
+    if has_active_admin {
+        Ok(())
+    } else {
+        Err(ApplyError::Invariant(
+            "post-mutation state would leave a live group with zero active admins".to_string(),
+        ))
+    }
+}
+
+fn active_signer_role(
+    members_v2: &BTreeMap<String, GroupMember>,
+    signer_hex: &str,
+) -> Option<GroupRole> {
+    members_v2
+        .get(signer_hex)
+        .filter(|m| m.is_active())
+        .map(|m| m.role)
+}
+
+#[must_use]
+pub(crate) fn active_signer_is_admin_or_higher(
+    members_v2: &BTreeMap<String, GroupMember>,
+    signer_hex: &str,
+) -> bool {
+    active_signer_role(members_v2, signer_hex).is_some_and(|role| role.at_least(GroupRole::Admin))
+}
+
+fn validate_live_to_withdrawn_authority(
+    current_withdrawn: bool,
+    commit: &GroupStateCommit,
+    signer_role: Option<GroupRole>,
+    action_kind: ActionKind,
+    allow_live_withdrawal: bool,
+) -> Result<(), ApplyError> {
+    if current_withdrawn || !commit.withdrawn {
+        return Ok(());
+    }
+
+    if !allow_live_withdrawal {
+        return Err(ApplyError::Invariant(
+            "live withdrawal commit requires explicit terminal validation".to_string(),
+        ));
+    }
+
+    if action_kind == ActionKind::AdminOrHigher
+        && signer_role.is_some_and(|role| role.at_least(GroupRole::Admin))
+    {
+        return Ok(());
+    }
+
+    Err(ApplyError::Unauthorized {
+        signer: commit.committed_by.clone(),
+        action: ActionKind::AdminOrHigher.name(),
+    })
 }
 
 /// Input to [`validate_apply`].
@@ -596,17 +673,11 @@ pub struct ApplyContext<'a> {
     pub group_id: &'a str,
 }
 
-/// Validate a signed commit against the local view **before** mutating any
-/// state. Returns `Ok(())` if the caller should proceed to mutate; returns
-/// `Err` to reject (stale, chain break, unauthorized, bad signature, …).
-///
-/// This function is **read-only** with respect to `GroupInfo`. It enforces
-/// all the checks required by `docs/design/named-groups-full-model.md`
-/// §"Apply-side validation".
-pub fn validate_apply(
+fn validate_apply_with_terminal_mode(
     ctx: &ApplyContext<'_>,
     commit: &GroupStateCommit,
     action_kind: ActionKind,
+    allow_live_withdrawal: bool,
 ) -> Result<(), ApplyError> {
     // 1. group_id match
     if commit.group_id != ctx.group_id {
@@ -646,14 +717,20 @@ pub fn validate_apply(
     }
 
     // 6. authority
-    let signer_role = ctx
-        .members_v2
-        .get(&commit.committed_by)
-        .filter(|m| m.is_active())
-        .map(|m| m.role);
+    let signer_role = active_signer_role(ctx.members_v2, &commit.committed_by);
+
+    // A live -> withdrawn transition is a terminal admin act. Already-withdrawn
+    // carry-forward commits are intentionally left to the ordinary action-kind
+    // authority below; un-withdrawal was rejected by the terminality check above.
+    validate_live_to_withdrawn_authority(
+        ctx.current_withdrawn,
+        commit,
+        signer_role,
+        action_kind,
+        allow_live_withdrawal,
+    )?;
 
     let authorized = match action_kind {
-        ActionKind::OwnerOnly => signer_role == Some(GroupRole::Owner),
         ActionKind::AdminOrHigher => signer_role
             .map(|r| r.at_least(GroupRole::Admin))
             .unwrap_or(false),
@@ -668,6 +745,46 @@ pub fn validate_apply(
     }
 
     Ok(())
+}
+
+/// Validate a signed non-terminal commit against the local view **before**
+/// mutating any state. Returns `Ok(())` if the caller should proceed to mutate;
+/// returns `Err` to reject (stale, chain break, unauthorized, bad signature, …).
+///
+/// This default validator intentionally rejects live → withdrawn commits. Use
+/// [`validate_apply_terminal`] only when the caller is applying an explicit
+/// terminal event (currently `GroupDeleted`) and will perform terminal
+/// finalization/key wiping as one atomic act.
+///
+/// This function is **read-only** with respect to `GroupInfo`. It enforces
+/// all the checks required by `docs/design/named-groups-full-model.md`
+/// §"Apply-side validation".
+pub fn validate_apply(
+    ctx: &ApplyContext<'_>,
+    commit: &GroupStateCommit,
+    action_kind: ActionKind,
+) -> Result<(), ApplyError> {
+    validate_apply_with_terminal_mode(ctx, commit, action_kind, false)
+}
+
+/// Validate a signed commit carried by an explicit terminal metadata event.
+///
+/// This is the only validation entry point that permits a live → withdrawn
+/// transition, and it rejects non-withdrawn commits outright. The commit signer
+/// must still satisfy `AdminOrHigher` authority; the explicit context only
+/// distinguishes a real terminal `GroupDeleted` path from an arbitrary raw
+/// caller or non-terminal metadata event carrying `withdrawn = true`.
+pub fn validate_apply_terminal(
+    ctx: &ApplyContext<'_>,
+    commit: &GroupStateCommit,
+    action_kind: ActionKind,
+) -> Result<(), ApplyError> {
+    if !commit.withdrawn {
+        return Err(ApplyError::Invariant(
+            "terminal validation requires withdrawn commit".to_string(),
+        ));
+    }
+    validate_apply_with_terminal_mode(ctx, commit, action_kind, true)
 }
 
 // ─────────────────────────────── Tests ──────────────────────────────────
@@ -698,6 +815,113 @@ mod tests {
         let mut m = make_member(hex_id, GroupRole::Member);
         m.state = GroupMemberState::Removed;
         m
+    }
+
+    // ── ADR-0016 R2: last-admin invariant (choke-point unit tests) ──────
+
+    /// Why: rejecting a demotion that leaves zero admins is the entire point
+    /// of the invariant — a live group must never become unadministrable.
+    #[test]
+    fn last_admin_demote_sole_admin_rejected() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        // Proposed post-mutation roster: the sole admin demoted to member.
+        admin.role = GroupRole::Member;
+        m.insert("aa".repeat(32), admin);
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: a removal that strips the last admin must be rejected; Removed
+    /// entries are not active and must not count toward the admin set.
+    #[test]
+    fn last_admin_remove_sole_admin_rejected() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        admin.state = GroupMemberState::Removed;
+        m.insert("aa".repeat(32), admin);
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: a banned admin is not an active admin — ban of the last admin
+    /// must be rejected like removal.
+    #[test]
+    fn last_admin_ban_sole_admin_rejected() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        admin.state = GroupMemberState::Banned;
+        m.insert("aa".repeat(32), admin);
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: withdrawal is the last admin's exit valve (ADR-0016) — the
+    /// group-ending commit is exempt even when the roster has no admins.
+    #[test]
+    fn last_admin_withdrawal_exempt() {
+        let mut m = BTreeMap::new();
+        let mut admin = make_member(&"aa".repeat(32), GroupRole::Admin);
+        admin.state = GroupMemberState::Removed;
+        m.insert("aa".repeat(32), admin);
+        enforce_last_admin_invariant(&m, true).unwrap();
+        // Even an empty roster is fine once the state is withdrawn.
+        enforce_last_admin_invariant(&BTreeMap::new(), true).unwrap();
+    }
+
+    /// Why: a sole legacy Owner normalising itself to Admin keeps the admin
+    /// count at 1 — this ordinary normalization commit must pass.
+    #[test]
+    fn last_admin_owner_self_demote_to_admin_accepted() {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "aa".repeat(32),
+            make_member(&"aa".repeat(32), GroupRole::Admin),
+        );
+        enforce_last_admin_invariant(&m, false).unwrap();
+    }
+
+    /// Why: a sole legacy Owner demoted to plain member leaves zero
+    /// admin-or-higher actives — Owner gets no special pass.
+    #[test]
+    fn last_admin_owner_demote_to_member_rejected() {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "aa".repeat(32),
+            make_member(&"aa".repeat(32), GroupRole::Member),
+        );
+        let err = enforce_last_admin_invariant(&m, false).unwrap_err();
+        assert!(matches!(err, ApplyError::Invariant(_)));
+    }
+
+    /// Why: legacy `Owner` (rank 4) must count as Admin (rank 3) via
+    /// `at_least`, so a mixed roster whose only privileged active entry is
+    /// an Owner satisfies the invariant.
+    #[test]
+    fn last_admin_legacy_owner_counts_as_admin() {
+        let mut m = BTreeMap::new();
+        m.insert("aa".repeat(32), make_owner(&"aa".repeat(32)));
+        m.insert(
+            "bb".repeat(32),
+            make_member(&"bb".repeat(32), GroupRole::Member),
+        );
+        // A banned Admin alongside must not be needed for the pass.
+        let mut banned_admin = make_member(&"cc".repeat(32), GroupRole::Admin);
+        banned_admin.state = GroupMemberState::Banned;
+        m.insert("cc".repeat(32), banned_admin);
+        enforce_last_admin_invariant(&m, false).unwrap();
     }
 
     #[test]
@@ -1129,7 +1353,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::StaleRevision { got: 1, have: 1 }));
         let _ = owner_hex; // silence unused
     }
@@ -1161,12 +1385,12 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::PrevHashMismatch { .. }));
     }
 
     #[test]
-    fn validate_apply_rejects_unauthorized_owner_action() {
+    fn validate_apply_rejects_unauthorized_admin_action() {
         let kp = AgentKeypair::generate().unwrap();
         let signer_hex = hex::encode(kp.agent_id().as_bytes());
         let owner_hex = "ff".repeat(32);
@@ -1197,7 +1421,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::Unauthorized { .. }));
     }
 
@@ -1237,6 +1461,121 @@ mod tests {
     }
 
     #[test]
+    fn validate_apply_rejects_live_withdrawal_without_terminal_context() {
+        let kp = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(kp.agent_id().as_bytes());
+        let mut members = BTreeMap::new();
+        members.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Admin),
+        );
+
+        let commit = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            true,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: &members,
+            group_id: "g1",
+        };
+
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Invariant(ref msg) if msg == "live withdrawal commit requires explicit terminal validation"),
+            "raw validate_apply must not authorize live withdrawal: {err}"
+        );
+
+        validate_apply_terminal(&ctx, &commit, ActionKind::AdminOrHigher).unwrap();
+    }
+
+    #[test]
+    fn validate_apply_terminal_rejects_non_admin_withdrawal() {
+        let kp = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(kp.agent_id().as_bytes());
+        let admin_hex = "ff".repeat(32);
+        let mut members = BTreeMap::new();
+        members.insert(admin_hex.clone(), make_member(&admin_hex, GroupRole::Admin));
+        members.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Member),
+        );
+
+        let commit = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            true,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: &members,
+            group_id: "g1",
+        };
+
+        let err = validate_apply_terminal(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
+        assert!(matches!(err, ApplyError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn validate_apply_terminal_rejects_non_withdrawn_commit() {
+        let kp = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(kp.agent_id().as_bytes());
+        let mut members = BTreeMap::new();
+        members.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Admin),
+        );
+
+        let commit = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            false,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: &members,
+            group_id: "g1",
+        };
+
+        let err = validate_apply_terminal(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Invariant(ref msg) if msg == "terminal validation requires withdrawn commit"),
+            "terminal validator must accept only withdrawn commits: {err}"
+        );
+    }
+
+    #[test]
     fn validate_apply_rejects_post_withdrawal_non_withdrawal() {
         let kp = AgentKeypair::generate().unwrap();
         let signer_hex = hex::encode(kp.agent_id().as_bytes());
@@ -1263,7 +1602,7 @@ mod tests {
             members_v2: &members,
             group_id: "g1",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::Withdrawn));
     }
 
@@ -1294,7 +1633,7 @@ mod tests {
             members_v2: &members,
             group_id: "g-right",
         };
-        let err = validate_apply(&ctx, &commit, ActionKind::OwnerOnly).unwrap_err();
+        let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::GroupIdMismatch { .. }));
     }
 }

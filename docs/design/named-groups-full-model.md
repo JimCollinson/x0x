@@ -211,7 +211,7 @@ x0x currently has the beginnings of a real named-space model, but it is not yet 
 Today we have:
 - human-friendly named groups via `/groups`
 - invite join flow
-- local + creator-authored roster convergence via metadata events
+- local + authority-authored roster convergence via metadata events
 - low-level MLS helpers via `/mls/groups`
 - per-group chat and metadata gossip topics
 
@@ -425,10 +425,9 @@ pub struct GroupMember {
 
 ### Rules
 
-- Every group has exactly one `Owner` initially.
-- Owners can appoint admins.
-- Admins can manage requests and membership according to policy.
-- Moderators are mainly useful in public groups.
+- New groups seed the creator as an `Admin`; stored legacy `Owner` entries remain parseable and admin-equivalent for replay/compatibility.
+- Admins can appoint other admins and manage requests/membership according to policy.
+- `Moderator` and `Guest` are reserved legacy labels, not assignable by current ADR-0016 APIs.
 - `Banned` is distinct from `Removed`.
 - Pending access belongs in requests, but pending member-state may still be useful for synchronization.
 
@@ -619,27 +618,26 @@ Public should still be accountable.
 
 ## Authorization rules
 
-A minimal first ruleset:
+ADR-0016 defines a flat protocol ruleset:
 
-- `Owner`
-  - change policy
-  - appoint/remove admins
-  - delete group
-  - approve/reject requests
-  - add/remove members
-
-- `Admin`
-  - approve/reject requests
-  - add/remove members except owner
-  - manage moderators/member roles
-  - moderate public spaces
-
-- `Moderator`
-  - remove public posts where applicable
-  - mute/ban in public or moderated spaces
+- `Admin` is group root:
+  - change policy and public metadata
+  - appoint/demote admins and assign members
+  - issue invites and approve/reject requests
+  - add, remove, ban, and unban members
+  - delete/end the group through the terminal `GroupDeleted` commit
+  - moderate public spaces where the application maps moderation to group admin
 
 - `Member`
-  - normal access
+  - normal group access according to policy
+
+- `Owner`
+  - legacy stored label only; parsed and rendered for old rosters
+  - admin-equivalent during validation, but not assignable by current APIs
+
+- `Moderator` / `Guest`
+  - reserved legacy/application vocabulary
+  - not assignable by ADR-0016 APIs and not a protocol authority tier
 
 ### Explicit rejects
 - non-admin cannot approve requests
@@ -813,7 +811,7 @@ Notes:
 ### `public_announce`
 - discoverable
 - public read
-- only owner/admin may publish
+- only admins may publish
 - useful for release channels, project updates, public notices
 
 ## Migration plan from current state
@@ -905,7 +903,7 @@ We should not claim this product is done until all of these are proven.
 ### Authorization negative-path proof
 - non-admin cannot change policy
 - non-admin cannot approve requests
-- non-admin cannot remove owner/admin improperly
+- non-admin cannot remove admins improperly
 - banned peer cannot rejoin improperly
 - stale actions referencing old `state_hash` are rejected
 
@@ -914,7 +912,7 @@ We should not claim this product is done until all of these are proven.
 - request status converges across peers
 - policy changes converge across peers
 - card supersession converges across peers
-- deletion / hidden withdrawal converges across peers
+- delete / internal withdrawal terminality converges across peers
 
 ## Review and signoff requirements
 
@@ -1052,7 +1050,7 @@ This is the critical validity rule.
 
 A discoverable card has two signatures in play:
 1. **Outer transport signature** — the gossip message is signed by the node relaying/publishing it on the mesh.
-2. **Inner authority signature** — the `GroupCard` itself is signed by the owner/admin/canonical state authority over canonical card fields.
+2. **Inner authority signature** — the `GroupCard` itself is signed by an admin/canonical state authority over canonical card fields.
 
 Rules:
 - any node may relay or republish the **exact signed card blob**

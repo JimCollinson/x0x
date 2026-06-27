@@ -18,9 +18,10 @@
 //! 7. A withdrawal card has `withdrawn=true` and a higher revision than
 //!    the previous public card.
 
+use x0x::groups::state_commit::{validate_apply, validate_apply_terminal};
 use x0x::groups::{
-    compute_policy_hash, compute_public_meta_hash, compute_roster_root, ActionKind, ApplyError,
-    GroupDiscoverability, GroupInfo, GroupPolicyPreset, GroupRole, GroupStateCommit,
+    compute_policy_hash, compute_public_meta_hash, compute_roster_root, ActionKind, ApplyContext,
+    ApplyError, GroupDiscoverability, GroupInfo, GroupPolicyPreset, GroupRole, GroupStateCommit,
 };
 use x0x::identity::{AgentId, AgentKeypair};
 
@@ -32,7 +33,17 @@ fn hex_id(kp: &AgentKeypair) -> String {
     hex::encode(kp.agent_id().as_bytes())
 }
 
-/// Build an MlsEncrypted group whose sole Owner is `owner_kp`.
+fn apply_context(info: &GroupInfo) -> ApplyContext<'_> {
+    ApplyContext {
+        current_state_hash: &info.state_hash,
+        current_revision: info.state_revision,
+        current_withdrawn: info.withdrawn,
+        members_v2: &info.members_v2,
+        group_id: info.stable_group_id(),
+    }
+}
+
+/// Build an MlsEncrypted group whose sole Admin is `owner_kp`.
 fn build_owner_group(owner_kp: &AgentKeypair, name: &str) -> GroupInfo {
     GroupInfo::with_policy(
         name.to_string(),
@@ -298,12 +309,12 @@ fn apply_commit_rejects_unauthorized_signer() {
     replica.policy = GroupPolicyPreset::PublicAnnounce.to_policy();
     let forged = replica.seal_commit(&bob, 2_000).unwrap();
 
-    // Authority tries to apply bob's forged commit as OwnerOnly —
+    // Authority tries to apply bob's forged commit as AdminOrHigher —
     // mirrors the mutation locally so chain+hash are consistent;
     // authority is still at revision 1.
     authority.policy = GroupPolicyPreset::PublicAnnounce.to_policy();
     let err = authority
-        .apply_commit(&forged, ActionKind::OwnerOnly)
+        .apply_commit(&forged, ActionKind::AdminOrHigher)
         .unwrap_err();
     assert!(
         matches!(err, ApplyError::Unauthorized { .. }),
@@ -318,7 +329,7 @@ fn apply_commit_rejects_post_withdrawal_non_withdrawal() -> Result<(), Box<dyn s
     let _ = g.seal_withdrawal(&owner, 1_000)?;
     assert!(g.withdrawn);
 
-    // Try to apply a new non-withdrawal owner action from the same owner —
+    // Try to apply a new non-withdrawal admin action from the same signer —
     // must reject because the group is terminated.
     g.policy = GroupPolicyPreset::PublicAnnounce.to_policy();
     let commit = GroupStateCommit::sign(
@@ -336,12 +347,138 @@ fn apply_commit_rejects_post_withdrawal_non_withdrawal() -> Result<(), Box<dyn s
     let commit = commit?;
     assert!(!commit.withdrawn);
 
-    let result = g.apply_commit(&commit, ActionKind::OwnerOnly);
+    let result = g.apply_commit(&commit, ActionKind::AdminOrHigher);
     assert!(
         matches!(&result, Err(ApplyError::Withdrawn)),
         "expected Withdrawn, got: {result:?}"
     );
     Ok(())
+}
+
+#[test]
+fn apply_commit_rejects_live_withdrawal_without_terminal_context() {
+    let owner = AgentKeypair::generate().unwrap();
+    let mut authority = build_owner_group(&owner, "T");
+    let mut replica = authority.clone();
+    let before_secret = replica.shared_secret.clone();
+    let before_hash = replica.state_hash.clone();
+    let before_revision = replica.state_revision;
+    let before_log_len = replica.commit_log.len();
+    assert!(
+        before_secret.is_some(),
+        "secure group starts with GSS key material"
+    );
+
+    let commit = authority.seal_withdrawal(&owner, 2_000).unwrap();
+    assert!(commit.withdrawn);
+
+    let raw_err =
+        validate_apply(&apply_context(&replica), &commit, ActionKind::AdminOrHigher).unwrap_err();
+    assert!(
+        matches!(raw_err, ApplyError::Invariant(ref msg) if msg == "live withdrawal commit requires explicit terminal validation"),
+        "raw validate_apply must reject live withdrawal without GroupDeleted context, got: {raw_err}"
+    );
+
+    let err = replica
+        .apply_commit(&commit, ActionKind::AdminOrHigher)
+        .unwrap_err();
+
+    assert!(
+        matches!(err, ApplyError::Invariant(ref msg) if msg == "live withdrawal commit requires explicit terminal validation"),
+        "expected terminal-validation invariant, got: {err}"
+    );
+    assert!(!replica.withdrawn);
+    assert_eq!(replica.shared_secret, before_secret);
+    assert_eq!(replica.state_hash, before_hash);
+    assert_eq!(replica.state_revision, before_revision);
+    assert_eq!(replica.commit_log.len(), before_log_len);
+}
+
+#[test]
+fn explicit_terminal_context_applies_admin_withdrawal_and_clears_keys() {
+    let owner = AgentKeypair::generate().unwrap();
+    let mut authority = build_owner_group(&owner, "T");
+    let mut replica = authority.clone();
+    assert!(
+        replica.shared_secret.is_some(),
+        "secure group starts with GSS key material"
+    );
+
+    let commit = authority.seal_withdrawal(&owner, 2_000).unwrap();
+    assert!(commit.withdrawn);
+    assert!(authority.shared_secret.is_none());
+
+    validate_apply_terminal(&apply_context(&replica), &commit, ActionKind::AdminOrHigher).unwrap();
+    replica.finalize_applied_terminal_commit(&commit).unwrap();
+
+    assert!(replica.withdrawn);
+    assert_eq!(replica.state_hash, authority.state_hash);
+    assert!(
+        replica.shared_secret.is_none(),
+        "terminal GroupDeleted apply leaves the retained GroupInfo keyless"
+    );
+}
+
+#[test]
+fn explicit_terminal_context_rejects_non_admin_withdrawal() {
+    let owner = AgentKeypair::generate().unwrap();
+    let member = AgentKeypair::generate().unwrap();
+    let mut group = build_owner_group(&owner, "T");
+    group.add_member(
+        hex_id(&member),
+        GroupRole::Member,
+        Some(hex_id(&owner)),
+        None,
+    );
+    let _ = group.seal_commit(&owner, 1_000).unwrap();
+
+    let forged = GroupStateCommit::sign(
+        group.stable_group_id().to_string(),
+        group.state_revision.saturating_add(1),
+        Some(group.state_hash.clone()),
+        compute_roster_root(&group.members_v2),
+        compute_policy_hash(&group.policy),
+        compute_public_meta_hash(&group.public_meta()),
+        group.security_binding.clone(),
+        true,
+        2_000,
+        &member,
+    )
+    .unwrap();
+
+    let err = validate_apply_terminal(&apply_context(&group), &forged, ActionKind::AdminOrHigher)
+        .unwrap_err();
+    assert!(matches!(err, ApplyError::Unauthorized { .. }));
+}
+
+#[test]
+fn finalize_applied_commit_rejects_live_withdrawal_without_terminal_context() {
+    let owner = AgentKeypair::generate().unwrap();
+    let mut authority = build_owner_group(&owner, "T");
+    let mut replica = authority.clone();
+    let before_secret = replica.shared_secret.clone();
+    let before_hash = replica.state_hash.clone();
+    let before_revision = replica.state_revision;
+    let before_log_len = replica.commit_log.len();
+    assert!(
+        before_secret.is_some(),
+        "secure group starts with GSS key material"
+    );
+
+    let commit = authority.seal_withdrawal(&owner, 2_000).unwrap();
+    assert!(commit.withdrawn);
+
+    let err = replica.finalize_applied_commit(&commit).unwrap_err();
+
+    assert!(
+        matches!(err, ApplyError::Invariant(ref msg) if msg == "live withdrawal commit requires terminal finalization"),
+        "expected terminal-finalization invariant, got: {err}"
+    );
+    assert!(!replica.withdrawn);
+    assert_eq!(replica.shared_secret, before_secret);
+    assert_eq!(replica.state_hash, before_hash);
+    assert_eq!(replica.state_revision, before_revision);
+    assert_eq!(replica.commit_log.len(), before_log_len);
 }
 
 #[test]

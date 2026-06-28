@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.27.0] - 2026-06-28
+
+### Added
+
+- **Role-based group authority — flat Admin/Member model ([#121](https://github.com/saorsa-labs/x0x/pull/121), [ADR-0016](docs/adr/0016-role-based-group-authority-flat-admin.md), proposed by @JimCollinson).** Group authority is now decided purely on committed-roster role (`AdminOrHigher`), never on creator identity. The last-admin invariant — no commit may leave a live group with zero active admins — is enforced at both choke-points (authoring in `seal_commit` and apply in `finalize_applied_commit`), covering REST, gossip, and TreeKEM paths. Terminal withdrawal is double-gated (terminal mode **and** an active Admin signer) and the MLS/TreeKEM/GSS key wipe is coupled to the withdrawn marker as one atomic act. Agent-card invites (`GET /agent/card?include_groups=true`) now carry full base-state provenance so they are joinable, and never export withdrawn-group tombstones. The GUI roster gains an admin-demote control and hides management actions on the caller's own row. Legacy `Owner`/`Moderator`/`Guest` roles remain parseable for deserialization and signed-apply convergence but are no longer assignable. Validated by 69 group/authority unit + integration tests and a live 6-node cross-region testnet (group create/invite/join, roster convergence, retained state-commits, and the TreeKEM applied path).
+
+### Changed
+
+- **BREAKING (group authority semantics):** `Owner` is no longer a privileged authority role. Consequently: **any admin** can now delete/withdraw a group (the creator no longer holds an exclusive veto) and remove the original creator via the member API; `DELETE /groups/:id` is now an ordinary **self-leave**, not a group-terminating delete (use `POST /groups/:id/state/withdraw` to end a group); and a creator leaving a TreeKEM group is an ordinary self-leave (the `CreatorMustDelete` special case is gone). Existing rosters with stored `Owner` entries continue to validate — `Owner` still satisfies `AdminOrHigher` for legacy evaluation and chains replay byte-for-byte — but new assignments accept only `admin`/`member`.
+
+### Fixed
+
+- **TreeKEM key-residency TOCTOU on join.** `install_joined_treekem_group_after_crypto_recheck` now re-checks the withdrawn tombstone while holding the `treekem_groups` write lock, closing the window where a concurrent withdrawal could leave live key material resident in memory after the persisted snapshot was already wiped.
+
 ## [v0.26.0] - 2026-06-21
 
 ### Added

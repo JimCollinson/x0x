@@ -20,14 +20,16 @@ use crate as x0x;
 use crate::contacts::ContactStore;
 use crate::{Agent, KvStoreHandle, TaskListHandle};
 
-// Local types that stay in `mod.rs` (WS/SSE/groups/files domain). A child
-// module can name private items of its parent, so no `pub(super)` is needed
-// on them — they are imported here and claimed by their own submodules later.
+// Local types that stay in `mod.rs` (groups/files domain). A child module can
+// name private items of its parent, so no `pub(super)` is needed on them —
+// they are imported here and claimed by their own submodules later.
 use super::auth::SessionStore;
+use super::sse::SseEvent;
+use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
 use super::{
     ExpectedJoinResultInviter, FileChunkAckSlot, NamedGroupMetadataEvent, PendingJoinResult,
     PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive, RestSubscription,
-    SharedTopicState, SseEvent, WelcomeFetchWaiter, WsOutboundStats, WsSession,
+    WelcomeFetchWaiter,
 };
 
 /// Carries the CLI-derived flags that the server-bringup path consumes.

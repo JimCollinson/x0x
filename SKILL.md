@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.29.0
+version: 0.30.0
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
@@ -87,7 +87,7 @@ For security details (algorithms, RFCs, key pinning), see [docs/security.md](htt
 x0x is a foundation you build on:
 
 - **Agent work orchestration (Symphony)** — replicated **TaskList CRDTs** (`/task-lists`, `/stores`), MLS group encryption, and a built-in **GUI board view** (state columns, badges, approve/deny actions) make x0x the decentralized backbone for agent work orchestration. The [x0x-symphony](https://github.com/saorsa-labs) runner rides these existing primitives over x0xd's local REST/WebSocket API — no extra services, no new crates. See [docs/symphony-integration.md](https://github.com/saorsa-labs/x0x/blob/main/docs/symphony-integration.md).
-- **Direct machine-to-machine connectivity (Tailnet)** — _available (Phase 1):_ connect your own computers over any network (home, mobile, hotel) and forward a local TCP port to a loopback service on a peer machine, Tailscale-style, over the same post-quantum QUIC transport. Default-deny and loopback-scoped, gated by a per-connection access policy plus the identity key-lifecycle (expiry + revocation). SOCKS5 forwarding is planned for a later phase. Manage forwards via `/forwards` (`x0x forward add|list|rm`). Tracked in [#132](https://github.com/saorsa-labs/x0x/issues/132).
+- **Direct machine-to-machine connectivity (Tailnet)** — _available now (Phase 1):_ connect your own computers over any network (home, mobile, hotel) and forward a local TCP port to a loopback service on a peer machine, Tailscale-style, over the same post-quantum QUIC transport — proven real-WAN across continents. Per-peer byte streams ride ant-quic's `open_bi`/`accept_bi`; a local TCP forwarder tunnels a loopback port to a loopback service on a trusted peer. Every inbound forward is fail-closed through the full chain (sender verified → not revoked → trust `Accept` → connect enabled → target loopback → `(agent, machine)` pair in the connect ACL → target in the entry); denied opens reach **zero bytes** to the target. Relayed stream opens additionally carry a signed agent attestation (opener self-attests its ML-DSA-65 identity, recipient-scoped and TTL-bound). Manage forwards via `/forwards` (`x0x forward add|list|rm`). SOCKS5 dynamic forwarding is the one piece deferred to a later phase. Tracked in [#132](https://github.com/saorsa-labs/x0x/issues/132).
 
 ## Identity: Three Layers
 

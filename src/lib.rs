@@ -12640,6 +12640,7 @@ fn signed_identity_announcement_fixture(
         is_coordinator: None,
         reachable_via: Vec::new(),
         relay_candidates: Vec::new(),
+        agent_public_key: Vec::new(),
     }
 }
 

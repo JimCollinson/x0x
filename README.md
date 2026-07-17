@@ -858,3 +858,7 @@ MIT OR Apache-2.0
 [Saorsa Labs](https://saorsalabs.com) — *Saorsa: Freedom*
 
 From Barr, Scotland. For every agent, everywhere.
+
+## Download History
+
+[![Download History](https://skill-history.com/chart/jimcollinson/x0x.svg)](https://skill-history.com/jimcollinson/x0x)

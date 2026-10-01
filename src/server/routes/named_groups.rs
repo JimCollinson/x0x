@@ -36593,6 +36593,7 @@ pub(in crate::server) mod tests {
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
     mod issue1139_back_to_back_join;
+    mod issue1146_pending_join;
     mod issue492_queue_admission;
     mod issue506_public_broadcast_control;
     mod issue821_read_auth;

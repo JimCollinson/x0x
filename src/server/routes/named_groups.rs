@@ -5973,14 +5973,18 @@ async fn persist_named_group_info_inner(
     let snapshot = {
         let mut groups = state.named_groups.write().await;
         let snapshot = groups.clone();
+        let local_is_seated =
+            info.has_active_member(&hex::encode(state.agent.agent_id().as_bytes()));
         if !store_named_group_info_locked(&mut groups, group_id, info) {
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
-        if state
-            .pending_join_stubs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(group_id)
+        // Other members' pre-Welcome commits advance the roster, not our admission.
+        if local_is_seated
+            && state
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(group_id)
         {
             confirmed_stub = true;
         }
